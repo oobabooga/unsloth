@@ -1,0 +1,230 @@
+diff --git a/studio/backend/core/inference/diffusion_int8_attention.py b/studio/backend/core/inference/diffusion_int8_attention.py
+index 4316f79fe..ebb23ecbb 100644
+--- a/studio/backend/core/inference/diffusion_int8_attention.py
++++ b/studio/backend/core/inference/diffusion_int8_attention.py
+@@ -1900,7 +1900,8 @@ def install_auto(
+ ) -> int:
+     """For ``apply_attention_backend`` with the switch unset: the strided processors of a DiT in the dispatch route's
+     ``AUTO_DITS`` race their incumbent the way that route does (accuracy check, card race, the 2048 / long races,
+-    ``MIN_TOKENS`` floor). Off with speed off (bit-identical), on ROCm, and off CUDA. Returns the count."""
++    ``MIN_TOKENS`` floor; on ROCm ``ROCM_AUTO_DITS`` on a ``ROCM_AUTO_ARCHS`` card). Off with speed off
++    (bit-identical) and off CUDA. Returns the count."""
+     import torch
+ 
+     if mode() != "auto" or not speed_active:
+@@ -1912,12 +1913,17 @@ def install_auto(
+         from . import diffusion_int8_attention_dispatch as dispatch
+     except Exception:  # noqa: BLE001
+         return 0
+-    if not dispatch.enabled() or type(transformer).__name__ not in dispatch.AUTO_DITS:
++    if not dispatch.enabled():
+         return 0
+     if speed_unset_only and type(transformer).__name__ not in dispatch.SPEED_UNSET_DITS:
+         return 0
+     device = str(getattr(target, "torch_device", None) or getattr(target, "device", "") or "")
+-    if not device.startswith("cuda") or not torch.cuda.is_available() or _is_rocm():
++    if not device.startswith("cuda") or not torch.cuda.is_available():
++        return 0
++    rocm = _is_rocm()
++    if type(transformer).__name__ not in (dispatch.ROCM_AUTO_DITS if rocm else dispatch.AUTO_DITS):
++        return 0
++    if rocm and not dispatch.rocm_auto(_device_index(torch.device(device))):
+         return 0
+     dtype = getattr(target, "dtype", None)
+     if str(dtype) not in ("torch.float16", "torch.bfloat16"):
+@@ -1931,7 +1937,7 @@ def install_auto(
+     except Exception:  # noqa: BLE001 -- other families bring their own strided processors
+         pass
+ 
+-    cuda_only = type(transformer).__name__ in dispatch.AUTO_CUDA_ONLY
++    cuda_only = not rocm and type(transformer).__name__ in dispatch.AUTO_CUDA_ONLY
+ 
+     def floor(dev: Any, dt: Any, heads: int, head_dim: int, fn: Any, name: str) -> tuple:
+         if cuda_only and implementation(_device_index(dev), head_dim) != "cuda":
+diff --git a/studio/backend/core/inference/diffusion_int8_attention_dispatch.py b/studio/backend/core/inference/diffusion_int8_attention_dispatch.py
+index 1cab02e6e..0c9794f69 100644
+--- a/studio/backend/core/inference/diffusion_int8_attention_dispatch.py
++++ b/studio/backend/core/inference/diffusion_int8_attention_dispatch.py
+@@ -20,7 +20,8 @@ Switch (``UNSLOTH_DIFFUSION_INT8_ATTENTION_KERNEL``, read by ``diffusion_int8_at
+ * ``0``: never; ``UNSLOTH_DIFFUSION_INT8_ATTENTION_DISPATCH=0`` turns off only this route.
+ * ``1`` or ``unsloth_int8`` by name: every dispatch DiT where the kernel passes its accuracy check (no race, except
+   the Triton stand-in), from ``MIN_TOKENS``.
+-* unset: ``AUTO_DITS`` on NVIDIA where the kernel passes the check and beats the incumbent by ``RACE_MARGIN``. Won at
++* unset: ``AUTO_DITS`` on NVIDIA (``ROCM_AUTO_DITS`` on a ``ROCM_AUTO_ARCHS`` card) where the kernel passes the check
++  and beats the incumbent by ``RACE_MARGIN``. Won at
+   both race sizes: floor ``MIN_TOKENS``; at 4096 only: a ``MID_RACE_TOKENS`` race sets it. Lost at both: a second race
+   at ``LONG_RACE_TOKENS`` can still route video lengths, since int8 gains grow with length (A100: 0.96x at 4096
+   tokens, 1.37x at 27k).
+@@ -54,6 +55,16 @@ SPEED_UNSET_DITS = frozenset(
+ )
+ # Accuracy measured on the CUDA kernel only: with the switch unset a Triton stand-in keeps the incumbent.
+ AUTO_CUDA_ONLY = frozenset({"Flux3Transformer2DModel", "ZImageTransformer2DModel"})
++# ROCm runs the Triton kernel (no attention-sink path): the unset switch races only these DiTs, on these gfx archs.
++ROCM_AUTO_DITS = frozenset(
++    {
++        "Flux3Transformer2DModel",
++        "QwenImage21Transformer2DModel",
++        "WanTransformer3DModel",
++        "ZImageTransformer2DModel",
++    }
++)
++ROCM_AUTO_ARCHS = frozenset({"gfx1151"})
+ # processors that already run the kernel themselves
+ _STRIDED_FLAG = "_unsloth_int8"
+ 
+@@ -605,6 +616,16 @@ def _card_floor(
+     return found, max(minimum, MIN_TOKENS)
+ 
+ 
++def rocm_auto(index: int) -> bool:
++    """Whether the unset switch may race the kernel on this ROCm card (its gfx arch is in ``ROCM_AUTO_ARCHS``)."""
++    from . import diffusion_int8_attention as I8
++
++    try:
++        return I8._gfx_arch(index) in ROCM_AUTO_ARCHS
++    except Exception:  # noqa: BLE001 -- an unreadable arch keeps the incumbent
++        return False
++
++
+ def _target_device(target: Any) -> str:
+     return str(getattr(target, "torch_device", None) or getattr(target, "device", "") or "")
+ 
+@@ -631,11 +652,12 @@ def _install(
+     device = _target_device(target)
+     if not device.startswith("cuda") or not torch.cuda.is_available():
+         return 0
+-    if not forced and I8._is_rocm():
+-        return 0
+     dev = torch.device(device)
+     index = I8._device_index(dev)
+     dev = torch.device("cuda", index)
++    rocm = I8._is_rocm()
++    if not forced and rocm and not rocm_auto(index):
++        return 0
+     dtype = getattr(target, "dtype", None)
+     if str(dtype) not in ("torch.float16", "torch.bfloat16"):
+         dtype = (
+@@ -644,9 +666,10 @@ def _install(
+     candidates = []
+     cuda_only = set()
+     family: dict = {}
++    auto_dits = ROCM_AUTO_DITS if rocm else AUTO_DITS
+     for dit in _dits(pipe):
+         if not forced and (
+-            type(dit).__name__ not in AUTO_DITS
++            type(dit).__name__ not in auto_dits
+             or (speed_unset_only and type(dit).__name__ not in SPEED_UNSET_DITS)
+         ):
+             continue
+@@ -658,7 +681,7 @@ def _install(
+         ]
+         candidates.extend(mods)
+         family.update((id(m), type(dit).__name__) for m in mods)
+-        if not forced and type(dit).__name__ in AUTO_CUDA_ONLY:
++        if not forced and not rocm and type(dit).__name__ in AUTO_CUDA_ONLY:
+             cuda_only.update(id(m) for m in mods)
+     if not candidates or install_dispatch_route() == 0:
+         return 0
+diff --git a/studio/backend/tests/test_diffusion_int8_attention_auto.py b/studio/backend/tests/test_diffusion_int8_attention_auto.py
+index bbc6dbd5e..0db37155c 100644
+--- a/studio/backend/tests/test_diffusion_int8_attention_auto.py
++++ b/studio/backend/tests/test_diffusion_int8_attention_auto.py
+@@ -169,7 +169,11 @@ def test_auto_route_stays_off(card, monkeypatch, case):
+     elif case == "dispatch_off":
+         monkeypatch.setenv(D.DISPATCH_ENV, "0")
+     elif case == "rocm":
++        # a gfx arch outside ROCM_AUTO_ARCHS
+         monkeypatch.setattr(rocm_bf16, "is_rocm_torch", lambda *a, **k: True)
++        monkeypatch.setattr(
++            torch.cuda, "get_device_properties", lambda *a, **k: types.SimpleNamespace(gcnArchName = "gfx1100")
++        )
+     elif case == "cpu":
+         target = types.SimpleNamespace(device = "cpu", dtype = torch.bfloat16)
+     elif case == "no_transformer":
+@@ -180,6 +184,30 @@ def test_auto_route_stays_off(card, monkeypatch, case):
+         assert _flags(pipe) == [(False, 0)] * 4
+ 
+ 
++def test_rocm_listed_arch_races_the_triton_kernel(card, monkeypatch):
++    """ROCm runs only the Triton kernel, so the CUDA-only rule does not apply there: on a ROCM_AUTO_ARCHS card a
++    ROCM_AUTO_DITS family races it with the switch unset (timed, never forced); an unlisted family does not."""
++    from core.inference import rocm_bf16
++
++    monkeypatch.setattr(rocm_bf16, "is_rocm_torch", lambda *a, **k: True)
++    monkeypatch.setattr(
++        torch.cuda, "get_device_properties", lambda *a, **k: types.SimpleNamespace(gcnArchName = "gfx1151")
++    )
++    monkeypatch.setattr(
++        I, "implementation", lambda index, head_dim: "triton" if head_dim in (64, 128) else None
++    )
++    card.found = {"ok": True, "min_tokens": 0, "impl": "triton"}
++    pipe = _pipe()
++    assert I.install_auto(pipe, _TARGET) == 3
++    assert _flags(pipe) == [(True, D.MIN_TOKENS)] * 3 + [(False, 0)]
++    assert card.seen and all(timed for *_, timed in card.seen)
++    card.seen.clear()
++    monkeypatch.setattr(D, "ROCM_AUTO_DITS", D.ROCM_AUTO_DITS - {"Flux3Transformer2DModel"})
++    pipe = _pipe()
++    assert I.install_auto(pipe, _TARGET) == 0 and not card.seen
++    assert _flags(pipe) == [(False, 0)] * 4
++
++
+ def test_apply_attention_backend_races_only_an_automatic_pick(card, monkeypatch):
+     """No request / "auto": the strided auto install runs over a native pick and its name is returned. An explicit
+     backend request, or a non-native pick, never races."""
+diff --git a/studio/backend/tests/test_diffusion_int8_attention_dispatch.py b/studio/backend/tests/test_diffusion_int8_attention_dispatch.py
+index 8b0ef0b65..db6bed1d5 100644
+--- a/studio/backend/tests/test_diffusion_int8_attention_dispatch.py
++++ b/studio/backend/tests/test_diffusion_int8_attention_dispatch.py
+@@ -731,12 +731,48 @@ def test_triton_stand_in_races_even_by_name(monkeypatch):
+     } == {3072}
+ 
+ 
+-def test_rocm_auto_stays_off(monkeypatch):
++def _rocm_arch(monkeypatch, arch):
+     from core.inference import rocm_bf16
+ 
+-    seen = _fake_cuda(monkeypatch)
+     monkeypatch.setattr(rocm_bf16, "is_rocm_torch", lambda *a, **k: True)
+-    assert D.install(_Pipe(_wan_dit()), _TARGET) == 0 and not seen
++    monkeypatch.setattr(
++        torch.cuda, "get_device_properties", lambda *a, **k: types.SimpleNamespace(gcnArchName = arch)
++    )
++
++
++def test_rocm_auto_races_on_a_listed_arch(monkeypatch):
++    """With the switch unset, a ROCM_AUTO_ARCHS card races the ROCM_AUTO_DITS (Triton kernel): timed, never forced,
++    and the race's floor is kept."""
++    pipe = _Pipe(_wan_dit())  # built before the card is faked (diffusers' lazy imports probe Triton)
++    seen = _fake_cuda(monkeypatch, found = {"ok": True, "min_tokens": 0}, impl = "triton")
++    monkeypatch.setattr(D, "MIN_TOKENS", 1024)
++    _rocm_arch(monkeypatch, "gfx1151:sramecc-:xnack-")
++    assert D.install(pipe, _TARGET) == 4
++    assert seen and all(s["timed"] for s in seen)
++    assert {m.processor._attention_backend.min_tokens for m in D.routable_modules(pipe.transformer)} == {
++        1024
++    }
++
++
++def test_rocm_auto_stays_off_elsewhere(monkeypatch):
++    """Another gfx arch, an unreadable one, an unlisted DiT or a lost race keep the incumbent; the switch 1 still
++    routes there."""
++    pipes = [_Pipe(_wan_dit()) for _ in range(6)]  # built before the card is faked
++    seen = _fake_cuda(monkeypatch, impl = "triton")
++    for arch, pipe in zip(("gfx1100", "gfx942:sramecc+:xnack-", ""), pipes):
++        _rocm_arch(monkeypatch, arch)
++        assert D.install(pipe, _TARGET) == 0 and not seen, arch
++    _rocm_arch(monkeypatch, "gfx1151")
++    monkeypatch.setattr(D, "ROCM_AUTO_DITS", frozenset())
++    assert D.install(pipes[3], _TARGET) == 0 and not seen
++    monkeypatch.setattr(D, "ROCM_AUTO_DITS", frozenset({"WanTransformer3DModel"}))
++    _fake_cuda(monkeypatch, found = {"ok": True, "min_tokens": None}, impl = "triton")
++    _rocm_arch(monkeypatch, "gfx1151")
++    monkeypatch.setattr(D, "long_verdict", lambda *a, **k: None)
++    assert D.install(pipes[4], _TARGET) == 0
++    _rocm_arch(monkeypatch, "gfx1100")
++    monkeypatch.setenv(I.INT8_ATTENTION_ENV, "1")
++    assert D.install(pipes[5], _TARGET) == 4
+ 
+ 
+ def test_install_never_raises(monkeypatch):
