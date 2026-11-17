@@ -1,0 +1,3483 @@
+{
+ "name": "prio8_img",
+ "description": "Generate specs/prio8_img.json: Studio (main) vs the baseline v0.44.0 on gfx1151, image priority families x formats.\n\nFamilies (template settings): q21 Qwen-Image-2.1 (25 steps, CFG 1), q21t Qwen-Image-2.1-Turbo (8, the template's\nsigma list), f3 FLUX.3 klein distilled (16, CFG 1), f3b FLUX.3 klein-base (50, CFG 3.5, empty negative). 1024^2.\nBaseline files are built on the runner by amd/q5/build_q5.py from the official repos (FLUX.3 via the ungated\nsha256-checked unsloth mirrors), GGUF from the public unsloth/*-GGUF repos (the same file Studio loads).\n\nArms (tag = <fam>_<arm>), each stack's LPIPS reference = its own bf16 arm:\n  s_bf16 / c_bf16     bf16 DiT + bf16 text encoder (Studio: transformer_quant / text_encoder_quant none)\n  c_bf16d             the baseline on its README ROCm torch (download.pytorch.org rocm7.2)\n  s_int8 / c_int8     INT8: Studio W8A8 (transformer + text encoder int8); baseline int8 ConvRot DiT + int8 TE\n  s_q4 / c_q4         GGUF Q4_K_M DiT (no int8 substitution on Studio), bf16 text encoder on both\n  s_def               Studio defaults (Auto: what a user gets)\n  s_fp8 / c_fp8       FP8 file (P2)       s_nvfp4 / c_nvfp4  NVFP4 (P2)       s_q8 / c_q8  GGUF Q8_0 (P2)\n  *_r                 A/A repeat\n",
+ "models": {},
+ "defaults": {
+  "backend": "studio",
+  "kind": "image",
+  "prompts": "image_24",
+  "n": 3,
+  "warmup": 1,
+  "short_n": 0,
+  "options": {
+   "local_files_only": false
+  }
+ },
+ "gate": {
+  "max_util": 15,
+  "min_free_mib": 0,
+  "timeout_s": 600
+ },
+ "cells": [
+  {
+   "tag": "q21_s_bf16",
+   "backend": "studio",
+   "model": "Qwen/Qwen-Image-2.1",
+   "ref": "q21_s_bf16",
+   "kind": "image",
+   "prompts": "image_24",
+   "width": 1024,
+   "height": 1024,
+   "steps": 25,
+   "short_steps": 5,
+   "short_n": 1,
+   "n": 3,
+   "warmup": 1,
+   "guidance": 1.0,
+   "options": {
+    "local_files_only": false,
+    "load_timeout_s": 3600,
+    "model_kind": "pipeline",
+    "transformer_quant": "none",
+    "text_encoder_quant": "none"
+   },
+   "env": {
+    "TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL": "1"
+   }
+  },
+  {
+   "tag": "q21_c_bf16",
+   "backend": "comfyui",
+   "ref": "q21_c_bf16",
+   "kind": "image",
+   "prompts": "image_24",
+   "width": 1024,
+   "height": 1024,
+   "steps": 25,
+   "short_steps": 5,
+   "short_n": 1,
+   "n": 3,
+   "warmup": 1,
+   "guidance": 1.0,
+   "options": {
+    "family": "qwen-image-2.1",
+    "files": {
+     "dit": "$AMD_CI_WORK/cm/q21_dit_bf16.safetensors",
+     "te": "$AMD_CI_WORK/cm/q21_te_bf16.safetensors",
+     "vae": "$AMD_CI_WORK/cm/q21_vae.safetensors"
+    },
+    "cache_bust": "sampler",
+    "graph_extra": {
+     "prefix_cache": "auto"
+    }
+   },
+   "env": {
+    "DIFFUSION_BENCH_COMFY_PYTHON": "$AMD_CI_WORK/comfy_venv_rock/bin/python",
+    "DIFFUSION_BENCH_COMFY_DIR": "$AMD_CI_WORK/ComfyUI"
+   }
+  },
+  {
+   "tag": "q21_s_int8",
+   "backend": "studio",
+   "model": "Qwen/Qwen-Image-2.1",
+   "ref": "q21_s_bf16",
+   "kind": "image",
+   "prompts": "image_24",
+   "width": 1024,
+   "height": 1024,
+   "steps": 25,
+   "short_steps": 5,
+   "short_n": 1,
+   "n": 3,
+   "warmup": 1,
+   "guidance": 1.0,
+   "options": {
+    "local_files_only": false,
+    "load_timeout_s": 3600,
+    "model_kind": "pipeline",
+    "transformer_quant": "int8",
+    "text_encoder_quant": "int8"
+   },
+   "env": {
+    "TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL": "1"
+   }
+  },
+  {
+   "tag": "q21_c_int8",
+   "backend": "comfyui",
+   "ref": "q21_c_bf16",
+   "kind": "image",
+   "prompts": "image_24",
+   "width": 1024,
+   "height": 1024,
+   "steps": 25,
+   "short_steps": 5,
+   "short_n": 1,
+   "n": 3,
+   "warmup": 1,
+   "guidance": 1.0,
+   "options": {
+    "family": "qwen-image-2.1",
+    "files": {
+     "dit": "$AMD_CI_WORK/cm/q21_dit_int8_convrot.safetensors",
+     "te": "$AMD_CI_WORK/cm/q21_te_int8_convrot.safetensors",
+     "vae": "$AMD_CI_WORK/cm/q21_vae.safetensors"
+    },
+    "cache_bust": "sampler",
+    "graph_extra": {
+     "prefix_cache": "auto"
+    }
+   },
+   "env": {
+    "DIFFUSION_BENCH_COMFY_PYTHON": "$AMD_CI_WORK/comfy_venv_rock/bin/python",
+    "DIFFUSION_BENCH_COMFY_DIR": "$AMD_CI_WORK/ComfyUI"
+   }
+  },
+  {
+   "tag": "q21_s_int8d",
+   "backend": "studio",
+   "model": "Qwen/Qwen-Image-2.1",
+   "ref": "q21_s_bf16",
+   "kind": "image",
+   "prompts": "image_24",
+   "width": 1024,
+   "height": 1024,
+   "steps": 25,
+   "short_steps": 5,
+   "short_n": 1,
+   "n": 3,
+   "warmup": 1,
+   "guidance": 1.0,
+   "options": {
+    "local_files_only": false,
+    "load_timeout_s": 3600,
+    "model_kind": "pipeline",
+    "transformer_quant": "int8",
+    "text_encoder_quant": "none"
+   },
+   "env": {
+    "TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL": "1"
+   }
+  },
+  {
+   "tag": "q21_c_int8d",
+   "backend": "comfyui",
+   "ref": "q21_c_bf16",
+   "kind": "image",
+   "prompts": "image_24",
+   "width": 1024,
+   "height": 1024,
+   "steps": 25,
+   "short_steps": 5,
+   "short_n": 1,
+   "n": 3,
+   "warmup": 1,
+   "guidance": 1.0,
+   "options": {
+    "family": "qwen-image-2.1",
+    "files": {
+     "dit": "$AMD_CI_WORK/cm/q21_dit_int8_convrot.safetensors",
+     "te": "$AMD_CI_WORK/cm/q21_te_bf16.safetensors",
+     "vae": "$AMD_CI_WORK/cm/q21_vae.safetensors"
+    },
+    "cache_bust": "sampler",
+    "graph_extra": {
+     "prefix_cache": "auto"
+    }
+   },
+   "env": {
+    "DIFFUSION_BENCH_COMFY_PYTHON": "$AMD_CI_WORK/comfy_venv_rock/bin/python",
+    "DIFFUSION_BENCH_COMFY_DIR": "$AMD_CI_WORK/ComfyUI"
+   }
+  },
+  {
+   "tag": "q21_s_int8adc",
+   "backend": "studio",
+   "model": "Qwen/Qwen-Image-2.1",
+   "ref": "q21_s_bf16",
+   "kind": "image",
+   "prompts": "image_24",
+   "width": 1024,
+   "height": 1024,
+   "steps": 25,
+   "short_steps": 5,
+   "short_n": 1,
+   "n": 3,
+   "warmup": 1,
+   "guidance": 1.0,
+   "options": {
+    "local_files_only": false,
+    "load_timeout_s": 3600,
+    "model_kind": "pipeline",
+    "transformer_quant": "int8",
+    "text_encoder_quant": "none",
+    "speed_mode": "default"
+   },
+   "env": {
+    "TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL": "1",
+    "UNSLOTH_NATIVE_INT8_ACT": "1"
+   }
+  },
+  {
+   "tag": "q21_s_int8dc",
+   "backend": "studio",
+   "model": "Qwen/Qwen-Image-2.1",
+   "ref": "q21_s_bf16",
+   "kind": "image",
+   "prompts": "image_24",
+   "width": 1024,
+   "height": 1024,
+   "steps": 25,
+   "short_steps": 5,
+   "short_n": 1,
+   "n": 3,
+   "warmup": 1,
+   "guidance": 1.0,
+   "options": {
+    "local_files_only": false,
+    "load_timeout_s": 3600,
+    "model_kind": "pipeline",
+    "transformer_quant": "int8",
+    "text_encoder_quant": "none",
+    "speed_mode": "default"
+   },
+   "env": {
+    "TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL": "1"
+   }
+  },
+  {
+   "tag": "q21_s_int8ad",
+   "backend": "studio",
+   "model": "Qwen/Qwen-Image-2.1",
+   "ref": "q21_s_bf16",
+   "kind": "image",
+   "prompts": "image_24",
+   "width": 1024,
+   "height": 1024,
+   "steps": 25,
+   "short_steps": 5,
+   "short_n": 1,
+   "n": 3,
+   "warmup": 1,
+   "guidance": 1.0,
+   "options": {
+    "local_files_only": false,
+    "load_timeout_s": 3600,
+    "model_kind": "pipeline",
+    "transformer_quant": "int8",
+    "text_encoder_quant": "none"
+   },
+   "env": {
+    "TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL": "1",
+    "UNSLOTH_NATIVE_INT8_ACT": "1"
+   }
+  },
+  {
+   "tag": "q21_s_q4",
+   "backend": "studio",
+   "model": "unsloth/Qwen-Image-2.1-GGUF",
+   "ref": "q21_s_bf16",
+   "kind": "image",
+   "prompts": "image_24",
+   "width": 1024,
+   "height": 1024,
+   "steps": 25,
+   "short_steps": 5,
+   "short_n": 1,
+   "n": 3,
+   "warmup": 1,
+   "guidance": 1.0,
+   "options": {
+    "local_files_only": false,
+    "load_timeout_s": 3600,
+    "model_kind": "gguf",
+    "gguf_filename": "qwen-image-2.1-Q4_K_M.gguf",
+    "transformer_quant": "none",
+    "text_encoder_quant": "none"
+   },
+   "env": {
+    "TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL": "1"
+   }
+  },
+  {
+   "tag": "q21_c_q4",
+   "backend": "comfyui",
+   "ref": "q21_c_bf16",
+   "kind": "image",
+   "prompts": "image_24",
+   "width": 1024,
+   "height": 1024,
+   "steps": 25,
+   "short_steps": 5,
+   "short_n": 1,
+   "n": 3,
+   "warmup": 1,
+   "guidance": 1.0,
+   "options": {
+    "family": "qwen-image-2.1",
+    "files": {
+     "dit": "$AMD_CI_WORK/cm/q21_dit_Q4_K_M.gguf",
+     "te": "$AMD_CI_WORK/cm/q21_te_bf16.safetensors",
+     "vae": "$AMD_CI_WORK/cm/q21_vae.safetensors"
+    },
+    "cache_bust": "sampler",
+    "graph_extra": {
+     "prefix_cache": "auto"
+    }
+   },
+   "env": {
+    "DIFFUSION_BENCH_COMFY_PYTHON": "$AMD_CI_WORK/comfy_venv_rock/bin/python",
+    "DIFFUSION_BENCH_COMFY_DIR": "$AMD_CI_WORK/ComfyUI"
+   }
+  },
+  {
+   "tag": "q21_s_def",
+   "backend": "studio",
+   "model": "Qwen/Qwen-Image-2.1",
+   "ref": "q21_s_bf16",
+   "kind": "image",
+   "prompts": "image_24",
+   "width": 1024,
+   "height": 1024,
+   "steps": 25,
+   "short_steps": 5,
+   "short_n": 1,
+   "n": 3,
+   "warmup": 1,
+   "guidance": 1.0,
+   "options": {
+    "local_files_only": false,
+    "load_timeout_s": 3600,
+    "model_kind": "pipeline"
+   },
+   "env": {
+    "TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL": "1"
+   }
+  },
+  {
+   "tag": "q21_c_bf16d",
+   "backend": "comfyui",
+   "ref": "q21_c_bf16",
+   "kind": "image",
+   "prompts": "image_24",
+   "width": 1024,
+   "height": 1024,
+   "steps": 25,
+   "short_steps": 5,
+   "short_n": 1,
+   "n": 3,
+   "warmup": 1,
+   "guidance": 1.0,
+   "options": {
+    "family": "qwen-image-2.1",
+    "files": {
+     "dit": "$AMD_CI_WORK/cm/q21_dit_bf16.safetensors",
+     "te": "$AMD_CI_WORK/cm/q21_te_bf16.safetensors",
+     "vae": "$AMD_CI_WORK/cm/q21_vae.safetensors"
+    },
+    "cache_bust": "sampler",
+    "graph_extra": {
+     "prefix_cache": "auto"
+    }
+   },
+   "env": {
+    "DIFFUSION_BENCH_COMFY_PYTHON": "$AMD_CI_WORK/comfy_venv_default/bin/python",
+    "DIFFUSION_BENCH_COMFY_DIR": "$AMD_CI_WORK/ComfyUI"
+   }
+  },
+  {
+   "tag": "q21_s_bf16_r",
+   "backend": "studio",
+   "model": "Qwen/Qwen-Image-2.1",
+   "ref": "q21_s_bf16",
+   "kind": "image",
+   "prompts": "image_24",
+   "width": 1024,
+   "height": 1024,
+   "steps": 25,
+   "short_steps": 5,
+   "short_n": 1,
+   "n": 3,
+   "warmup": 1,
+   "guidance": 1.0,
+   "options": {
+    "local_files_only": false,
+    "load_timeout_s": 3600,
+    "model_kind": "pipeline",
+    "transformer_quant": "none",
+    "text_encoder_quant": "none"
+   },
+   "env": {
+    "TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL": "1"
+   }
+  },
+  {
+   "tag": "q21_s_bf16mf",
+   "backend": "studio",
+   "model": "Qwen/Qwen-Image-2.1",
+   "ref": "q21_s_bf16",
+   "kind": "image",
+   "prompts": "image_24",
+   "width": 1024,
+   "height": 1024,
+   "steps": 25,
+   "short_steps": 5,
+   "short_n": 1,
+   "n": 3,
+   "warmup": 1,
+   "guidance": 1.0,
+   "options": {
+    "local_files_only": false,
+    "load_timeout_s": 3600,
+    "model_kind": "pipeline",
+    "transformer_quant": "none",
+    "text_encoder_quant": "none"
+   },
+   "env": {
+    "TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL": "1",
+    "MIOPEN_FIND_MODE": "NORMAL"
+   }
+  },
+  {
+   "tag": "q21_s_bf16mff",
+   "backend": "studio",
+   "model": "Qwen/Qwen-Image-2.1",
+   "ref": "q21_s_bf16",
+   "kind": "image",
+   "prompts": "image_24",
+   "width": 1024,
+   "height": 1024,
+   "steps": 25,
+   "short_steps": 5,
+   "short_n": 1,
+   "n": 3,
+   "warmup": 1,
+   "guidance": 1.0,
+   "options": {
+    "local_files_only": false,
+    "load_timeout_s": 3600,
+    "model_kind": "pipeline",
+    "transformer_quant": "none",
+    "text_encoder_quant": "none"
+   },
+   "env": {
+    "TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL": "1",
+    "MIOPEN_FIND_MODE": "FAST"
+   }
+  },
+  {
+   "tag": "q21_s_bf16t",
+   "backend": "studio",
+   "model": "Qwen/Qwen-Image-2.1",
+   "ref": "q21_s_bf16",
+   "kind": "image",
+   "prompts": "image_24",
+   "width": 1024,
+   "height": 1024,
+   "steps": 25,
+   "short_steps": 5,
+   "short_n": 1,
+   "n": 3,
+   "warmup": 1,
+   "guidance": 1.0,
+   "options": {
+    "local_files_only": false,
+    "load_timeout_s": 3600,
+    "model_kind": "pipeline",
+    "transformer_quant": "none",
+    "text_encoder_quant": "none"
+   },
+   "env": {
+    "TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL": "1",
+    "PYTORCH_TUNABLEOP_ENABLED": "1",
+    "PYTORCH_TUNABLEOP_TUNING": "1",
+    "PYTORCH_TUNABLEOP_FILENAME": "$AMD_CI_WORK/tunableop_q21_%d.csv"
+   }
+  },
+  {
+   "tag": "q21_c_bf16_r",
+   "backend": "comfyui",
+   "ref": "q21_c_bf16",
+   "kind": "image",
+   "prompts": "image_24",
+   "width": 1024,
+   "height": 1024,
+   "steps": 25,
+   "short_steps": 5,
+   "short_n": 1,
+   "n": 3,
+   "warmup": 1,
+   "guidance": 1.0,
+   "options": {
+    "family": "qwen-image-2.1",
+    "files": {
+     "dit": "$AMD_CI_WORK/cm/q21_dit_bf16.safetensors",
+     "te": "$AMD_CI_WORK/cm/q21_te_bf16.safetensors",
+     "vae": "$AMD_CI_WORK/cm/q21_vae.safetensors"
+    },
+    "cache_bust": "sampler",
+    "graph_extra": {
+     "prefix_cache": "auto"
+    }
+   },
+   "env": {
+    "DIFFUSION_BENCH_COMFY_PYTHON": "$AMD_CI_WORK/comfy_venv_rock/bin/python",
+    "DIFFUSION_BENCH_COMFY_DIR": "$AMD_CI_WORK/ComfyUI"
+   }
+  },
+  {
+   "tag": "q21_s_fp8",
+   "backend": "studio",
+   "model": "Qwen/Qwen-Image-2.1",
+   "ref": "q21_s_bf16",
+   "kind": "image",
+   "prompts": "image_24",
+   "width": 1024,
+   "height": 1024,
+   "steps": 25,
+   "short_steps": 5,
+   "short_n": 1,
+   "n": 3,
+   "warmup": 1,
+   "guidance": 1.0,
+   "options": {
+    "local_files_only": false,
+    "load_timeout_s": 3600,
+    "model_kind": "pipeline",
+    "transformer_quant": "fp8",
+    "text_encoder_quant": "none"
+   },
+   "env": {
+    "TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL": "1"
+   }
+  },
+  {
+   "tag": "q21_c_fp8",
+   "backend": "comfyui",
+   "ref": "q21_c_bf16",
+   "kind": "image",
+   "prompts": "image_24",
+   "width": 1024,
+   "height": 1024,
+   "steps": 25,
+   "short_steps": 5,
+   "short_n": 1,
+   "n": 3,
+   "warmup": 1,
+   "guidance": 1.0,
+   "options": {
+    "family": "qwen-image-2.1",
+    "files": {
+     "dit": "$AMD_CI_WORK/cm/q21_dit_fp8_scaled.safetensors",
+     "te": "$AMD_CI_WORK/cm/q21_te_bf16.safetensors",
+     "vae": "$AMD_CI_WORK/cm/q21_vae.safetensors"
+    },
+    "cache_bust": "sampler",
+    "graph_extra": {
+     "prefix_cache": "auto"
+    }
+   },
+   "env": {
+    "DIFFUSION_BENCH_COMFY_PYTHON": "$AMD_CI_WORK/comfy_venv_rock/bin/python",
+    "DIFFUSION_BENCH_COMFY_DIR": "$AMD_CI_WORK/ComfyUI"
+   }
+  },
+  {
+   "tag": "q21_s_nvfp4",
+   "backend": "studio",
+   "model": "Qwen/Qwen-Image-2.1",
+   "ref": "q21_s_bf16",
+   "kind": "image",
+   "prompts": "image_24",
+   "width": 1024,
+   "height": 1024,
+   "steps": 25,
+   "short_steps": 5,
+   "short_n": 1,
+   "n": 3,
+   "warmup": 1,
+   "guidance": 1.0,
+   "options": {
+    "local_files_only": false,
+    "load_timeout_s": 3600,
+    "model_kind": "pipeline",
+    "transformer_quant": "nvfp4",
+    "text_encoder_quant": "none"
+   },
+   "env": {
+    "TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL": "1",
+    "UNSLOTH_NVFP4_DIFFUSION": "1"
+   }
+  },
+  {
+   "tag": "q21_c_nvfp4",
+   "backend": "comfyui",
+   "ref": "q21_c_bf16",
+   "kind": "image",
+   "prompts": "image_24",
+   "width": 1024,
+   "height": 1024,
+   "steps": 25,
+   "short_steps": 5,
+   "short_n": 1,
+   "n": 3,
+   "warmup": 1,
+   "guidance": 1.0,
+   "options": {
+    "family": "qwen-image-2.1",
+    "files": {
+     "dit": "$AMD_CI_WORK/cm/q21_dit_nvfp4.safetensors",
+     "te": "$AMD_CI_WORK/cm/q21_te_bf16.safetensors",
+     "vae": "$AMD_CI_WORK/cm/q21_vae.safetensors"
+    },
+    "cache_bust": "sampler",
+    "graph_extra": {
+     "prefix_cache": "auto"
+    }
+   },
+   "env": {
+    "DIFFUSION_BENCH_COMFY_PYTHON": "$AMD_CI_WORK/comfy_venv_rock/bin/python",
+    "DIFFUSION_BENCH_COMFY_DIR": "$AMD_CI_WORK/ComfyUI"
+   }
+  },
+  {
+   "tag": "q21_s_fp8f",
+   "backend": "studio",
+   "model": "unsloth/Qwen-Image-2.1-FP8",
+   "ref": "q21_s_bf16",
+   "kind": "image",
+   "prompts": "image_24",
+   "width": 1024,
+   "height": 1024,
+   "steps": 25,
+   "short_steps": 5,
+   "short_n": 1,
+   "n": 3,
+   "warmup": 1,
+   "guidance": 1.0,
+   "options": {
+    "local_files_only": false,
+    "load_timeout_s": 3600,
+    "model_kind": "single_file",
+    "gguf_filename": "Qwen-Image-2.1-FP8.safetensors",
+    "base_repo": "Qwen/Qwen-Image-2.1",
+    "transformer_quant": "none",
+    "text_encoder_quant": "none"
+   },
+   "env": {
+    "TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL": "1"
+   }
+  },
+  {
+   "tag": "q21_s_q8",
+   "backend": "studio",
+   "model": "unsloth/Qwen-Image-2.1-GGUF",
+   "ref": "q21_s_bf16",
+   "kind": "image",
+   "prompts": "image_24",
+   "width": 1024,
+   "height": 1024,
+   "steps": 25,
+   "short_steps": 5,
+   "short_n": 1,
+   "n": 3,
+   "warmup": 1,
+   "guidance": 1.0,
+   "options": {
+    "local_files_only": false,
+    "load_timeout_s": 3600,
+    "model_kind": "gguf",
+    "gguf_filename": "qwen-image-2.1-Q8_0.gguf",
+    "transformer_quant": "none",
+    "text_encoder_quant": "none"
+   },
+   "env": {
+    "TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL": "1"
+   }
+  },
+  {
+   "tag": "q21_c_q8",
+   "backend": "comfyui",
+   "ref": "q21_c_bf16",
+   "kind": "image",
+   "prompts": "image_24",
+   "width": 1024,
+   "height": 1024,
+   "steps": 25,
+   "short_steps": 5,
+   "short_n": 1,
+   "n": 3,
+   "warmup": 1,
+   "guidance": 1.0,
+   "options": {
+    "family": "qwen-image-2.1",
+    "files": {
+     "dit": "$AMD_CI_WORK/cm/q21_dit_Q8_0.gguf",
+     "te": "$AMD_CI_WORK/cm/q21_te_bf16.safetensors",
+     "vae": "$AMD_CI_WORK/cm/q21_vae.safetensors"
+    },
+    "cache_bust": "sampler",
+    "graph_extra": {
+     "prefix_cache": "auto"
+    }
+   },
+   "env": {
+    "DIFFUSION_BENCH_COMFY_PYTHON": "$AMD_CI_WORK/comfy_venv_rock/bin/python",
+    "DIFFUSION_BENCH_COMFY_DIR": "$AMD_CI_WORK/ComfyUI"
+   }
+  },
+  {
+   "tag": "q21_s_int8d_r",
+   "backend": "studio",
+   "model": "Qwen/Qwen-Image-2.1",
+   "ref": "q21_s_bf16",
+   "kind": "image",
+   "prompts": "image_24",
+   "width": 1024,
+   "height": 1024,
+   "steps": 25,
+   "short_steps": 5,
+   "short_n": 1,
+   "n": 3,
+   "warmup": 1,
+   "guidance": 1.0,
+   "options": {
+    "local_files_only": false,
+    "load_timeout_s": 3600,
+    "model_kind": "pipeline",
+    "transformer_quant": "int8",
+    "text_encoder_quant": "none"
+   },
+   "env": {
+    "TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL": "1"
+   }
+  },
+  {
+   "tag": "q21_c_int8d_r",
+   "backend": "comfyui",
+   "ref": "q21_c_bf16",
+   "kind": "image",
+   "prompts": "image_24",
+   "width": 1024,
+   "height": 1024,
+   "steps": 25,
+   "short_steps": 5,
+   "short_n": 1,
+   "n": 3,
+   "warmup": 1,
+   "guidance": 1.0,
+   "options": {
+    "family": "qwen-image-2.1",
+    "files": {
+     "dit": "$AMD_CI_WORK/cm/q21_dit_int8_convrot.safetensors",
+     "te": "$AMD_CI_WORK/cm/q21_te_bf16.safetensors",
+     "vae": "$AMD_CI_WORK/cm/q21_vae.safetensors"
+    },
+    "cache_bust": "sampler",
+    "graph_extra": {
+     "prefix_cache": "auto"
+    }
+   },
+   "env": {
+    "DIFFUSION_BENCH_COMFY_PYTHON": "$AMD_CI_WORK/comfy_venv_rock/bin/python",
+    "DIFFUSION_BENCH_COMFY_DIR": "$AMD_CI_WORK/ComfyUI"
+   }
+  },
+  {
+   "tag": "q21_s_int8d_i8a",
+   "backend": "studio",
+   "model": "Qwen/Qwen-Image-2.1",
+   "ref": "q21_s_bf16",
+   "kind": "image",
+   "prompts": "image_24",
+   "width": 1024,
+   "height": 1024,
+   "steps": 25,
+   "short_steps": 5,
+   "short_n": 1,
+   "n": 3,
+   "warmup": 1,
+   "guidance": 1.0,
+   "options": {
+    "local_files_only": false,
+    "load_timeout_s": 3600,
+    "model_kind": "pipeline",
+    "transformer_quant": "int8",
+    "text_encoder_quant": "none"
+   },
+   "env": {
+    "TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL": "1",
+    "UNSLOTH_DIFFUSION_INT8_ATTENTION_KERNEL": "1"
+   }
+  },
+  {
+   "tag": "q21_s_int8_r",
+   "backend": "studio",
+   "model": "Qwen/Qwen-Image-2.1",
+   "ref": "q21_s_bf16",
+   "kind": "image",
+   "prompts": "image_24",
+   "width": 1024,
+   "height": 1024,
+   "steps": 25,
+   "short_steps": 5,
+   "short_n": 1,
+   "n": 3,
+   "warmup": 1,
+   "guidance": 1.0,
+   "options": {
+    "local_files_only": false,
+    "load_timeout_s": 3600,
+    "model_kind": "pipeline",
+    "transformer_quant": "int8",
+    "text_encoder_quant": "int8"
+   },
+   "env": {
+    "TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL": "1"
+   }
+  },
+  {
+   "tag": "q21_c_int8_r",
+   "backend": "comfyui",
+   "ref": "q21_c_bf16",
+   "kind": "image",
+   "prompts": "image_24",
+   "width": 1024,
+   "height": 1024,
+   "steps": 25,
+   "short_steps": 5,
+   "short_n": 1,
+   "n": 3,
+   "warmup": 1,
+   "guidance": 1.0,
+   "options": {
+    "family": "qwen-image-2.1",
+    "files": {
+     "dit": "$AMD_CI_WORK/cm/q21_dit_int8_convrot.safetensors",
+     "te": "$AMD_CI_WORK/cm/q21_te_int8_convrot.safetensors",
+     "vae": "$AMD_CI_WORK/cm/q21_vae.safetensors"
+    },
+    "cache_bust": "sampler",
+    "graph_extra": {
+     "prefix_cache": "auto"
+    }
+   },
+   "env": {
+    "DIFFUSION_BENCH_COMFY_PYTHON": "$AMD_CI_WORK/comfy_venv_rock/bin/python",
+    "DIFFUSION_BENCH_COMFY_DIR": "$AMD_CI_WORK/ComfyUI"
+   }
+  },
+  {
+   "tag": "q21t_s_bf16",
+   "backend": "studio",
+   "model": "Qwen/Qwen-Image-2.1-Turbo",
+   "ref": "q21t_s_bf16",
+   "kind": "image",
+   "prompts": "image_24",
+   "width": 1024,
+   "height": 1024,
+   "steps": 8,
+   "short_steps": 8,
+   "short_n": 0,
+   "n": 3,
+   "warmup": 1,
+   "guidance": 1.0,
+   "options": {
+    "local_files_only": false,
+    "load_timeout_s": 3600,
+    "model_kind": "pipeline",
+    "transformer_quant": "none",
+    "text_encoder_quant": "none"
+   },
+   "env": {
+    "TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL": "1"
+   }
+  },
+  {
+   "tag": "q21t_c_bf16",
+   "backend": "comfyui",
+   "ref": "q21t_c_bf16",
+   "kind": "image",
+   "prompts": "image_24",
+   "width": 1024,
+   "height": 1024,
+   "steps": 8,
+   "short_steps": 8,
+   "short_n": 0,
+   "n": 3,
+   "warmup": 1,
+   "guidance": 1.0,
+   "options": {
+    "family": "qwen-image-2.1-turbo",
+    "files": {
+     "dit": "$AMD_CI_WORK/cm/q21t_dit_bf16.safetensors",
+     "te": "$AMD_CI_WORK/cm/q21_te_bf16.safetensors",
+     "vae": "$AMD_CI_WORK/cm/q21_vae.safetensors"
+    },
+    "cache_bust": "sampler"
+   },
+   "env": {
+    "DIFFUSION_BENCH_COMFY_PYTHON": "$AMD_CI_WORK/comfy_venv_rock/bin/python",
+    "DIFFUSION_BENCH_COMFY_DIR": "$AMD_CI_WORK/ComfyUI"
+   }
+  },
+  {
+   "tag": "q21t_s_int8",
+   "backend": "studio",
+   "model": "Qwen/Qwen-Image-2.1-Turbo",
+   "ref": "q21t_s_bf16",
+   "kind": "image",
+   "prompts": "image_24",
+   "width": 1024,
+   "height": 1024,
+   "steps": 8,
+   "short_steps": 8,
+   "short_n": 0,
+   "n": 3,
+   "warmup": 1,
+   "guidance": 1.0,
+   "options": {
+    "local_files_only": false,
+    "load_timeout_s": 3600,
+    "model_kind": "pipeline",
+    "transformer_quant": "int8",
+    "text_encoder_quant": "int8"
+   },
+   "env": {
+    "TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL": "1"
+   }
+  },
+  {
+   "tag": "q21t_c_int8",
+   "backend": "comfyui",
+   "ref": "q21t_c_bf16",
+   "kind": "image",
+   "prompts": "image_24",
+   "width": 1024,
+   "height": 1024,
+   "steps": 8,
+   "short_steps": 8,
+   "short_n": 0,
+   "n": 3,
+   "warmup": 1,
+   "guidance": 1.0,
+   "options": {
+    "family": "qwen-image-2.1-turbo",
+    "files": {
+     "dit": "$AMD_CI_WORK/cm/q21t_dit_int8_convrot.safetensors",
+     "te": "$AMD_CI_WORK/cm/q21_te_int8_convrot.safetensors",
+     "vae": "$AMD_CI_WORK/cm/q21_vae.safetensors"
+    },
+    "cache_bust": "sampler"
+   },
+   "env": {
+    "DIFFUSION_BENCH_COMFY_PYTHON": "$AMD_CI_WORK/comfy_venv_rock/bin/python",
+    "DIFFUSION_BENCH_COMFY_DIR": "$AMD_CI_WORK/ComfyUI"
+   }
+  },
+  {
+   "tag": "q21t_s_int8d",
+   "backend": "studio",
+   "model": "Qwen/Qwen-Image-2.1-Turbo",
+   "ref": "q21t_s_bf16",
+   "kind": "image",
+   "prompts": "image_24",
+   "width": 1024,
+   "height": 1024,
+   "steps": 8,
+   "short_steps": 8,
+   "short_n": 0,
+   "n": 3,
+   "warmup": 1,
+   "guidance": 1.0,
+   "options": {
+    "local_files_only": false,
+    "load_timeout_s": 3600,
+    "model_kind": "pipeline",
+    "transformer_quant": "int8",
+    "text_encoder_quant": "none"
+   },
+   "env": {
+    "TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL": "1"
+   }
+  },
+  {
+   "tag": "q21t_c_int8d",
+   "backend": "comfyui",
+   "ref": "q21t_c_bf16",
+   "kind": "image",
+   "prompts": "image_24",
+   "width": 1024,
+   "height": 1024,
+   "steps": 8,
+   "short_steps": 8,
+   "short_n": 0,
+   "n": 3,
+   "warmup": 1,
+   "guidance": 1.0,
+   "options": {
+    "family": "qwen-image-2.1-turbo",
+    "files": {
+     "dit": "$AMD_CI_WORK/cm/q21t_dit_int8_convrot.safetensors",
+     "te": "$AMD_CI_WORK/cm/q21_te_bf16.safetensors",
+     "vae": "$AMD_CI_WORK/cm/q21_vae.safetensors"
+    },
+    "cache_bust": "sampler"
+   },
+   "env": {
+    "DIFFUSION_BENCH_COMFY_PYTHON": "$AMD_CI_WORK/comfy_venv_rock/bin/python",
+    "DIFFUSION_BENCH_COMFY_DIR": "$AMD_CI_WORK/ComfyUI"
+   }
+  },
+  {
+   "tag": "q21t_s_int8adc",
+   "backend": "studio",
+   "model": "Qwen/Qwen-Image-2.1-Turbo",
+   "ref": "q21t_s_bf16",
+   "kind": "image",
+   "prompts": "image_24",
+   "width": 1024,
+   "height": 1024,
+   "steps": 8,
+   "short_steps": 8,
+   "short_n": 0,
+   "n": 3,
+   "warmup": 1,
+   "guidance": 1.0,
+   "options": {
+    "local_files_only": false,
+    "load_timeout_s": 3600,
+    "model_kind": "pipeline",
+    "transformer_quant": "int8",
+    "text_encoder_quant": "none",
+    "speed_mode": "default"
+   },
+   "env": {
+    "TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL": "1",
+    "UNSLOTH_NATIVE_INT8_ACT": "1"
+   }
+  },
+  {
+   "tag": "q21t_s_int8dc",
+   "backend": "studio",
+   "model": "Qwen/Qwen-Image-2.1-Turbo",
+   "ref": "q21t_s_bf16",
+   "kind": "image",
+   "prompts": "image_24",
+   "width": 1024,
+   "height": 1024,
+   "steps": 8,
+   "short_steps": 8,
+   "short_n": 0,
+   "n": 3,
+   "warmup": 1,
+   "guidance": 1.0,
+   "options": {
+    "local_files_only": false,
+    "load_timeout_s": 3600,
+    "model_kind": "pipeline",
+    "transformer_quant": "int8",
+    "text_encoder_quant": "none",
+    "speed_mode": "default"
+   },
+   "env": {
+    "TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL": "1"
+   }
+  },
+  {
+   "tag": "q21t_s_int8ad",
+   "backend": "studio",
+   "model": "Qwen/Qwen-Image-2.1-Turbo",
+   "ref": "q21t_s_bf16",
+   "kind": "image",
+   "prompts": "image_24",
+   "width": 1024,
+   "height": 1024,
+   "steps": 8,
+   "short_steps": 8,
+   "short_n": 0,
+   "n": 3,
+   "warmup": 1,
+   "guidance": 1.0,
+   "options": {
+    "local_files_only": false,
+    "load_timeout_s": 3600,
+    "model_kind": "pipeline",
+    "transformer_quant": "int8",
+    "text_encoder_quant": "none"
+   },
+   "env": {
+    "TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL": "1",
+    "UNSLOTH_NATIVE_INT8_ACT": "1"
+   }
+  },
+  {
+   "tag": "q21t_s_q4",
+   "backend": "studio",
+   "model": "unsloth/Qwen-Image-2.1-Turbo-GGUF",
+   "ref": "q21t_s_bf16",
+   "kind": "image",
+   "prompts": "image_24",
+   "width": 1024,
+   "height": 1024,
+   "steps": 8,
+   "short_steps": 8,
+   "short_n": 0,
+   "n": 3,
+   "warmup": 1,
+   "guidance": 1.0,
+   "options": {
+    "local_files_only": false,
+    "load_timeout_s": 3600,
+    "model_kind": "gguf",
+    "gguf_filename": "qwen-image-2.1-turbo-Q4_K_M.gguf",
+    "transformer_quant": "none",
+    "text_encoder_quant": "none"
+   },
+   "env": {
+    "TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL": "1"
+   }
+  },
+  {
+   "tag": "q21t_c_q4",
+   "backend": "comfyui",
+   "ref": "q21t_c_bf16",
+   "kind": "image",
+   "prompts": "image_24",
+   "width": 1024,
+   "height": 1024,
+   "steps": 8,
+   "short_steps": 8,
+   "short_n": 0,
+   "n": 3,
+   "warmup": 1,
+   "guidance": 1.0,
+   "options": {
+    "family": "qwen-image-2.1-turbo",
+    "files": {
+     "dit": "$AMD_CI_WORK/cm/q21t_dit_Q4_K_M.gguf",
+     "te": "$AMD_CI_WORK/cm/q21_te_bf16.safetensors",
+     "vae": "$AMD_CI_WORK/cm/q21_vae.safetensors"
+    },
+    "cache_bust": "sampler"
+   },
+   "env": {
+    "DIFFUSION_BENCH_COMFY_PYTHON": "$AMD_CI_WORK/comfy_venv_rock/bin/python",
+    "DIFFUSION_BENCH_COMFY_DIR": "$AMD_CI_WORK/ComfyUI"
+   }
+  },
+  {
+   "tag": "q21t_s_def",
+   "backend": "studio",
+   "model": "Qwen/Qwen-Image-2.1-Turbo",
+   "ref": "q21t_s_bf16",
+   "kind": "image",
+   "prompts": "image_24",
+   "width": 1024,
+   "height": 1024,
+   "steps": 8,
+   "short_steps": 8,
+   "short_n": 0,
+   "n": 3,
+   "warmup": 1,
+   "guidance": 1.0,
+   "options": {
+    "local_files_only": false,
+    "load_timeout_s": 3600,
+    "model_kind": "pipeline"
+   },
+   "env": {
+    "TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL": "1"
+   }
+  },
+  {
+   "tag": "q21t_c_bf16d",
+   "backend": "comfyui",
+   "ref": "q21t_c_bf16",
+   "kind": "image",
+   "prompts": "image_24",
+   "width": 1024,
+   "height": 1024,
+   "steps": 8,
+   "short_steps": 8,
+   "short_n": 0,
+   "n": 3,
+   "warmup": 1,
+   "guidance": 1.0,
+   "options": {
+    "family": "qwen-image-2.1-turbo",
+    "files": {
+     "dit": "$AMD_CI_WORK/cm/q21t_dit_bf16.safetensors",
+     "te": "$AMD_CI_WORK/cm/q21_te_bf16.safetensors",
+     "vae": "$AMD_CI_WORK/cm/q21_vae.safetensors"
+    },
+    "cache_bust": "sampler"
+   },
+   "env": {
+    "DIFFUSION_BENCH_COMFY_PYTHON": "$AMD_CI_WORK/comfy_venv_default/bin/python",
+    "DIFFUSION_BENCH_COMFY_DIR": "$AMD_CI_WORK/ComfyUI"
+   }
+  },
+  {
+   "tag": "q21t_s_bf16_r",
+   "backend": "studio",
+   "model": "Qwen/Qwen-Image-2.1-Turbo",
+   "ref": "q21t_s_bf16",
+   "kind": "image",
+   "prompts": "image_24",
+   "width": 1024,
+   "height": 1024,
+   "steps": 8,
+   "short_steps": 8,
+   "short_n": 0,
+   "n": 3,
+   "warmup": 1,
+   "guidance": 1.0,
+   "options": {
+    "local_files_only": false,
+    "load_timeout_s": 3600,
+    "model_kind": "pipeline",
+    "transformer_quant": "none",
+    "text_encoder_quant": "none"
+   },
+   "env": {
+    "TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL": "1"
+   }
+  },
+  {
+   "tag": "q21t_s_bf16mf",
+   "backend": "studio",
+   "model": "Qwen/Qwen-Image-2.1-Turbo",
+   "ref": "q21t_s_bf16",
+   "kind": "image",
+   "prompts": "image_24",
+   "width": 1024,
+   "height": 1024,
+   "steps": 8,
+   "short_steps": 8,
+   "short_n": 0,
+   "n": 3,
+   "warmup": 1,
+   "guidance": 1.0,
+   "options": {
+    "local_files_only": false,
+    "load_timeout_s": 3600,
+    "model_kind": "pipeline",
+    "transformer_quant": "none",
+    "text_encoder_quant": "none"
+   },
+   "env": {
+    "TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL": "1",
+    "MIOPEN_FIND_MODE": "NORMAL"
+   }
+  },
+  {
+   "tag": "q21t_s_bf16mff",
+   "backend": "studio",
+   "model": "Qwen/Qwen-Image-2.1-Turbo",
+   "ref": "q21t_s_bf16",
+   "kind": "image",
+   "prompts": "image_24",
+   "width": 1024,
+   "height": 1024,
+   "steps": 8,
+   "short_steps": 8,
+   "short_n": 0,
+   "n": 3,
+   "warmup": 1,
+   "guidance": 1.0,
+   "options": {
+    "local_files_only": false,
+    "load_timeout_s": 3600,
+    "model_kind": "pipeline",
+    "transformer_quant": "none",
+    "text_encoder_quant": "none"
+   },
+   "env": {
+    "TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL": "1",
+    "MIOPEN_FIND_MODE": "FAST"
+   }
+  },
+  {
+   "tag": "q21t_s_bf16t",
+   "backend": "studio",
+   "model": "Qwen/Qwen-Image-2.1-Turbo",
+   "ref": "q21t_s_bf16",
+   "kind": "image",
+   "prompts": "image_24",
+   "width": 1024,
+   "height": 1024,
+   "steps": 8,
+   "short_steps": 8,
+   "short_n": 0,
+   "n": 3,
+   "warmup": 1,
+   "guidance": 1.0,
+   "options": {
+    "local_files_only": false,
+    "load_timeout_s": 3600,
+    "model_kind": "pipeline",
+    "transformer_quant": "none",
+    "text_encoder_quant": "none"
+   },
+   "env": {
+    "TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL": "1",
+    "PYTORCH_TUNABLEOP_ENABLED": "1",
+    "PYTORCH_TUNABLEOP_TUNING": "1",
+    "PYTORCH_TUNABLEOP_FILENAME": "$AMD_CI_WORK/tunableop_q21t_%d.csv"
+   }
+  },
+  {
+   "tag": "q21t_c_bf16_r",
+   "backend": "comfyui",
+   "ref": "q21t_c_bf16",
+   "kind": "image",
+   "prompts": "image_24",
+   "width": 1024,
+   "height": 1024,
+   "steps": 8,
+   "short_steps": 8,
+   "short_n": 0,
+   "n": 3,
+   "warmup": 1,
+   "guidance": 1.0,
+   "options": {
+    "family": "qwen-image-2.1-turbo",
+    "files": {
+     "dit": "$AMD_CI_WORK/cm/q21t_dit_bf16.safetensors",
+     "te": "$AMD_CI_WORK/cm/q21_te_bf16.safetensors",
+     "vae": "$AMD_CI_WORK/cm/q21_vae.safetensors"
+    },
+    "cache_bust": "sampler"
+   },
+   "env": {
+    "DIFFUSION_BENCH_COMFY_PYTHON": "$AMD_CI_WORK/comfy_venv_rock/bin/python",
+    "DIFFUSION_BENCH_COMFY_DIR": "$AMD_CI_WORK/ComfyUI"
+   }
+  },
+  {
+   "tag": "q21t_s_fp8",
+   "backend": "studio",
+   "model": "Qwen/Qwen-Image-2.1-Turbo",
+   "ref": "q21t_s_bf16",
+   "kind": "image",
+   "prompts": "image_24",
+   "width": 1024,
+   "height": 1024,
+   "steps": 8,
+   "short_steps": 8,
+   "short_n": 0,
+   "n": 3,
+   "warmup": 1,
+   "guidance": 1.0,
+   "options": {
+    "local_files_only": false,
+    "load_timeout_s": 3600,
+    "model_kind": "pipeline",
+    "transformer_quant": "fp8",
+    "text_encoder_quant": "none"
+   },
+   "env": {
+    "TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL": "1"
+   }
+  },
+  {
+   "tag": "q21t_c_fp8",
+   "backend": "comfyui",
+   "ref": "q21t_c_bf16",
+   "kind": "image",
+   "prompts": "image_24",
+   "width": 1024,
+   "height": 1024,
+   "steps": 8,
+   "short_steps": 8,
+   "short_n": 0,
+   "n": 3,
+   "warmup": 1,
+   "guidance": 1.0,
+   "options": {
+    "family": "qwen-image-2.1-turbo",
+    "files": {
+     "dit": "$AMD_CI_WORK/cm/q21t_dit_fp8_scaled.safetensors",
+     "te": "$AMD_CI_WORK/cm/q21_te_bf16.safetensors",
+     "vae": "$AMD_CI_WORK/cm/q21_vae.safetensors"
+    },
+    "cache_bust": "sampler"
+   },
+   "env": {
+    "DIFFUSION_BENCH_COMFY_PYTHON": "$AMD_CI_WORK/comfy_venv_rock/bin/python",
+    "DIFFUSION_BENCH_COMFY_DIR": "$AMD_CI_WORK/ComfyUI"
+   }
+  },
+  {
+   "tag": "q21t_s_nvfp4",
+   "backend": "studio",
+   "model": "Qwen/Qwen-Image-2.1-Turbo",
+   "ref": "q21t_s_bf16",
+   "kind": "image",
+   "prompts": "image_24",
+   "width": 1024,
+   "height": 1024,
+   "steps": 8,
+   "short_steps": 8,
+   "short_n": 0,
+   "n": 3,
+   "warmup": 1,
+   "guidance": 1.0,
+   "options": {
+    "local_files_only": false,
+    "load_timeout_s": 3600,
+    "model_kind": "pipeline",
+    "transformer_quant": "nvfp4",
+    "text_encoder_quant": "none"
+   },
+   "env": {
+    "TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL": "1",
+    "UNSLOTH_NVFP4_DIFFUSION": "1"
+   }
+  },
+  {
+   "tag": "q21t_c_nvfp4",
+   "backend": "comfyui",
+   "ref": "q21t_c_bf16",
+   "kind": "image",
+   "prompts": "image_24",
+   "width": 1024,
+   "height": 1024,
+   "steps": 8,
+   "short_steps": 8,
+   "short_n": 0,
+   "n": 3,
+   "warmup": 1,
+   "guidance": 1.0,
+   "options": {
+    "family": "qwen-image-2.1-turbo",
+    "files": {
+     "dit": "$AMD_CI_WORK/cm/q21t_dit_nvfp4.safetensors",
+     "te": "$AMD_CI_WORK/cm/q21_te_bf16.safetensors",
+     "vae": "$AMD_CI_WORK/cm/q21_vae.safetensors"
+    },
+    "cache_bust": "sampler"
+   },
+   "env": {
+    "DIFFUSION_BENCH_COMFY_PYTHON": "$AMD_CI_WORK/comfy_venv_rock/bin/python",
+    "DIFFUSION_BENCH_COMFY_DIR": "$AMD_CI_WORK/ComfyUI"
+   }
+  },
+  {
+   "tag": "q21t_s_fp8f",
+   "backend": "studio",
+   "model": "unsloth/Qwen-Image-2.1-Turbo-FP8",
+   "ref": "q21t_s_bf16",
+   "kind": "image",
+   "prompts": "image_24",
+   "width": 1024,
+   "height": 1024,
+   "steps": 8,
+   "short_steps": 8,
+   "short_n": 0,
+   "n": 3,
+   "warmup": 1,
+   "guidance": 1.0,
+   "options": {
+    "local_files_only": false,
+    "load_timeout_s": 3600,
+    "model_kind": "single_file",
+    "gguf_filename": "Qwen-Image-2.1-Turbo-FP8.safetensors",
+    "base_repo": "Qwen/Qwen-Image-2.1-Turbo",
+    "transformer_quant": "none",
+    "text_encoder_quant": "none"
+   },
+   "env": {
+    "TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL": "1"
+   }
+  },
+  {
+   "tag": "q21t_s_q8",
+   "backend": "studio",
+   "model": "unsloth/Qwen-Image-2.1-Turbo-GGUF",
+   "ref": "q21t_s_bf16",
+   "kind": "image",
+   "prompts": "image_24",
+   "width": 1024,
+   "height": 1024,
+   "steps": 8,
+   "short_steps": 8,
+   "short_n": 0,
+   "n": 3,
+   "warmup": 1,
+   "guidance": 1.0,
+   "options": {
+    "local_files_only": false,
+    "load_timeout_s": 3600,
+    "model_kind": "gguf",
+    "gguf_filename": "qwen-image-2.1-turbo-Q8_0.gguf",
+    "transformer_quant": "none",
+    "text_encoder_quant": "none"
+   },
+   "env": {
+    "TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL": "1"
+   }
+  },
+  {
+   "tag": "q21t_c_q8",
+   "backend": "comfyui",
+   "ref": "q21t_c_bf16",
+   "kind": "image",
+   "prompts": "image_24",
+   "width": 1024,
+   "height": 1024,
+   "steps": 8,
+   "short_steps": 8,
+   "short_n": 0,
+   "n": 3,
+   "warmup": 1,
+   "guidance": 1.0,
+   "options": {
+    "family": "qwen-image-2.1-turbo",
+    "files": {
+     "dit": "$AMD_CI_WORK/cm/q21t_dit_Q8_0.gguf",
+     "te": "$AMD_CI_WORK/cm/q21_te_bf16.safetensors",
+     "vae": "$AMD_CI_WORK/cm/q21_vae.safetensors"
+    },
+    "cache_bust": "sampler"
+   },
+   "env": {
+    "DIFFUSION_BENCH_COMFY_PYTHON": "$AMD_CI_WORK/comfy_venv_rock/bin/python",
+    "DIFFUSION_BENCH_COMFY_DIR": "$AMD_CI_WORK/ComfyUI"
+   }
+  },
+  {
+   "tag": "q21t_s_int8d_r",
+   "backend": "studio",
+   "model": "Qwen/Qwen-Image-2.1-Turbo",
+   "ref": "q21t_s_bf16",
+   "kind": "image",
+   "prompts": "image_24",
+   "width": 1024,
+   "height": 1024,
+   "steps": 8,
+   "short_steps": 8,
+   "short_n": 0,
+   "n": 3,
+   "warmup": 1,
+   "guidance": 1.0,
+   "options": {
+    "local_files_only": false,
+    "load_timeout_s": 3600,
+    "model_kind": "pipeline",
+    "transformer_quant": "int8",
+    "text_encoder_quant": "none"
+   },
+   "env": {
+    "TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL": "1"
+   }
+  },
+  {
+   "tag": "q21t_c_int8d_r",
+   "backend": "comfyui",
+   "ref": "q21t_c_bf16",
+   "kind": "image",
+   "prompts": "image_24",
+   "width": 1024,
+   "height": 1024,
+   "steps": 8,
+   "short_steps": 8,
+   "short_n": 0,
+   "n": 3,
+   "warmup": 1,
+   "guidance": 1.0,
+   "options": {
+    "family": "qwen-image-2.1-turbo",
+    "files": {
+     "dit": "$AMD_CI_WORK/cm/q21t_dit_int8_convrot.safetensors",
+     "te": "$AMD_CI_WORK/cm/q21_te_bf16.safetensors",
+     "vae": "$AMD_CI_WORK/cm/q21_vae.safetensors"
+    },
+    "cache_bust": "sampler"
+   },
+   "env": {
+    "DIFFUSION_BENCH_COMFY_PYTHON": "$AMD_CI_WORK/comfy_venv_rock/bin/python",
+    "DIFFUSION_BENCH_COMFY_DIR": "$AMD_CI_WORK/ComfyUI"
+   }
+  },
+  {
+   "tag": "q21t_s_int8d_i8a",
+   "backend": "studio",
+   "model": "Qwen/Qwen-Image-2.1-Turbo",
+   "ref": "q21t_s_bf16",
+   "kind": "image",
+   "prompts": "image_24",
+   "width": 1024,
+   "height": 1024,
+   "steps": 8,
+   "short_steps": 8,
+   "short_n": 0,
+   "n": 3,
+   "warmup": 1,
+   "guidance": 1.0,
+   "options": {
+    "local_files_only": false,
+    "load_timeout_s": 3600,
+    "model_kind": "pipeline",
+    "transformer_quant": "int8",
+    "text_encoder_quant": "none"
+   },
+   "env": {
+    "TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL": "1",
+    "UNSLOTH_DIFFUSION_INT8_ATTENTION_KERNEL": "1"
+   }
+  },
+  {
+   "tag": "q21t_s_int8_r",
+   "backend": "studio",
+   "model": "Qwen/Qwen-Image-2.1-Turbo",
+   "ref": "q21t_s_bf16",
+   "kind": "image",
+   "prompts": "image_24",
+   "width": 1024,
+   "height": 1024,
+   "steps": 8,
+   "short_steps": 8,
+   "short_n": 0,
+   "n": 3,
+   "warmup": 1,
+   "guidance": 1.0,
+   "options": {
+    "local_files_only": false,
+    "load_timeout_s": 3600,
+    "model_kind": "pipeline",
+    "transformer_quant": "int8",
+    "text_encoder_quant": "int8"
+   },
+   "env": {
+    "TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL": "1"
+   }
+  },
+  {
+   "tag": "q21t_c_int8_r",
+   "backend": "comfyui",
+   "ref": "q21t_c_bf16",
+   "kind": "image",
+   "prompts": "image_24",
+   "width": 1024,
+   "height": 1024,
+   "steps": 8,
+   "short_steps": 8,
+   "short_n": 0,
+   "n": 3,
+   "warmup": 1,
+   "guidance": 1.0,
+   "options": {
+    "family": "qwen-image-2.1-turbo",
+    "files": {
+     "dit": "$AMD_CI_WORK/cm/q21t_dit_int8_convrot.safetensors",
+     "te": "$AMD_CI_WORK/cm/q21_te_int8_convrot.safetensors",
+     "vae": "$AMD_CI_WORK/cm/q21_vae.safetensors"
+    },
+    "cache_bust": "sampler"
+   },
+   "env": {
+    "DIFFUSION_BENCH_COMFY_PYTHON": "$AMD_CI_WORK/comfy_venv_rock/bin/python",
+    "DIFFUSION_BENCH_COMFY_DIR": "$AMD_CI_WORK/ComfyUI"
+   }
+  },
+  {
+   "tag": "f3_s_bf16",
+   "backend": "studio",
+   "model": "unsloth/flux-3-image-klein",
+   "ref": "f3_s_bf16",
+   "kind": "image",
+   "prompts": "image_24",
+   "width": 1024,
+   "height": 1024,
+   "steps": 16,
+   "short_steps": 4,
+   "short_n": 1,
+   "n": 3,
+   "warmup": 1,
+   "guidance": 1.0,
+   "options": {
+    "local_files_only": false,
+    "load_timeout_s": 3600,
+    "transformer_quant": "none",
+    "text_encoder_quant": "none"
+   },
+   "env": {
+    "TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL": "1"
+   }
+  },
+  {
+   "tag": "f3_c_bf16",
+   "backend": "comfyui",
+   "ref": "f3_c_bf16",
+   "kind": "image",
+   "prompts": "image_24",
+   "width": 1024,
+   "height": 1024,
+   "steps": 16,
+   "short_steps": 4,
+   "short_n": 1,
+   "n": 3,
+   "warmup": 1,
+   "guidance": 1.0,
+   "options": {
+    "family": "flux3-klein",
+    "files": {
+     "dit": "$AMD_CI_WORK/cm/f3_dit_bf16.safetensors",
+     "te": "$AMD_CI_WORK/cm/f3_te_bf16.safetensors",
+     "vae": "$AMD_CI_WORK/cm/f3_vae.safetensors"
+    },
+    "cache_bust": "sampler"
+   },
+   "env": {
+    "DIFFUSION_BENCH_COMFY_PYTHON": "$AMD_CI_WORK/comfy_venv_rock/bin/python",
+    "DIFFUSION_BENCH_COMFY_DIR": "$AMD_CI_WORK/ComfyUI"
+   }
+  },
+  {
+   "tag": "f3_s_int8",
+   "backend": "studio",
+   "model": "unsloth/flux-3-image-klein",
+   "ref": "f3_s_bf16",
+   "kind": "image",
+   "prompts": "image_24",
+   "width": 1024,
+   "height": 1024,
+   "steps": 16,
+   "short_steps": 4,
+   "short_n": 1,
+   "n": 3,
+   "warmup": 1,
+   "guidance": 1.0,
+   "options": {
+    "local_files_only": false,
+    "load_timeout_s": 3600,
+    "transformer_quant": "int8",
+    "text_encoder_quant": "int8"
+   },
+   "env": {
+    "TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL": "1"
+   }
+  },
+  {
+   "tag": "f3_c_int8",
+   "backend": "comfyui",
+   "ref": "f3_c_bf16",
+   "kind": "image",
+   "prompts": "image_24",
+   "width": 1024,
+   "height": 1024,
+   "steps": 16,
+   "short_steps": 4,
+   "short_n": 1,
+   "n": 3,
+   "warmup": 1,
+   "guidance": 1.0,
+   "options": {
+    "family": "flux3-klein",
+    "files": {
+     "dit": "$AMD_CI_WORK/cm/f3_dit_int8_convrot.safetensors",
+     "te": "$AMD_CI_WORK/cm/f3_te_int8_convrot.safetensors",
+     "vae": "$AMD_CI_WORK/cm/f3_vae.safetensors"
+    },
+    "cache_bust": "sampler"
+   },
+   "env": {
+    "DIFFUSION_BENCH_COMFY_PYTHON": "$AMD_CI_WORK/comfy_venv_rock/bin/python",
+    "DIFFUSION_BENCH_COMFY_DIR": "$AMD_CI_WORK/ComfyUI"
+   }
+  },
+  {
+   "tag": "f3_s_int8d",
+   "backend": "studio",
+   "model": "unsloth/flux-3-image-klein",
+   "ref": "f3_s_bf16",
+   "kind": "image",
+   "prompts": "image_24",
+   "width": 1024,
+   "height": 1024,
+   "steps": 16,
+   "short_steps": 4,
+   "short_n": 1,
+   "n": 3,
+   "warmup": 1,
+   "guidance": 1.0,
+   "options": {
+    "local_files_only": false,
+    "load_timeout_s": 3600,
+    "transformer_quant": "int8",
+    "text_encoder_quant": "none"
+   },
+   "env": {
+    "TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL": "1"
+   }
+  },
+  {
+   "tag": "f3_c_int8d",
+   "backend": "comfyui",
+   "ref": "f3_c_bf16",
+   "kind": "image",
+   "prompts": "image_24",
+   "width": 1024,
+   "height": 1024,
+   "steps": 16,
+   "short_steps": 4,
+   "short_n": 1,
+   "n": 3,
+   "warmup": 1,
+   "guidance": 1.0,
+   "options": {
+    "family": "flux3-klein",
+    "files": {
+     "dit": "$AMD_CI_WORK/cm/f3_dit_int8_convrot.safetensors",
+     "te": "$AMD_CI_WORK/cm/f3_te_bf16.safetensors",
+     "vae": "$AMD_CI_WORK/cm/f3_vae.safetensors"
+    },
+    "cache_bust": "sampler"
+   },
+   "env": {
+    "DIFFUSION_BENCH_COMFY_PYTHON": "$AMD_CI_WORK/comfy_venv_rock/bin/python",
+    "DIFFUSION_BENCH_COMFY_DIR": "$AMD_CI_WORK/ComfyUI"
+   }
+  },
+  {
+   "tag": "f3_s_int8adc",
+   "backend": "studio",
+   "model": "unsloth/flux-3-image-klein",
+   "ref": "f3_s_bf16",
+   "kind": "image",
+   "prompts": "image_24",
+   "width": 1024,
+   "height": 1024,
+   "steps": 16,
+   "short_steps": 4,
+   "short_n": 1,
+   "n": 3,
+   "warmup": 1,
+   "guidance": 1.0,
+   "options": {
+    "local_files_only": false,
+    "load_timeout_s": 3600,
+    "transformer_quant": "int8",
+    "text_encoder_quant": "none",
+    "speed_mode": "default"
+   },
+   "env": {
+    "TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL": "1",
+    "UNSLOTH_NATIVE_INT8_ACT": "1"
+   }
+  },
+  {
+   "tag": "f3_s_int8dc",
+   "backend": "studio",
+   "model": "unsloth/flux-3-image-klein",
+   "ref": "f3_s_bf16",
+   "kind": "image",
+   "prompts": "image_24",
+   "width": 1024,
+   "height": 1024,
+   "steps": 16,
+   "short_steps": 4,
+   "short_n": 1,
+   "n": 3,
+   "warmup": 1,
+   "guidance": 1.0,
+   "options": {
+    "local_files_only": false,
+    "load_timeout_s": 3600,
+    "transformer_quant": "int8",
+    "text_encoder_quant": "none",
+    "speed_mode": "default"
+   },
+   "env": {
+    "TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL": "1"
+   }
+  },
+  {
+   "tag": "f3_s_int8ad",
+   "backend": "studio",
+   "model": "unsloth/flux-3-image-klein",
+   "ref": "f3_s_bf16",
+   "kind": "image",
+   "prompts": "image_24",
+   "width": 1024,
+   "height": 1024,
+   "steps": 16,
+   "short_steps": 4,
+   "short_n": 1,
+   "n": 3,
+   "warmup": 1,
+   "guidance": 1.0,
+   "options": {
+    "local_files_only": false,
+    "load_timeout_s": 3600,
+    "transformer_quant": "int8",
+    "text_encoder_quant": "none"
+   },
+   "env": {
+    "TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL": "1",
+    "UNSLOTH_NATIVE_INT8_ACT": "1"
+   }
+  },
+  {
+   "tag": "f3_s_q4",
+   "backend": "studio",
+   "model": "unsloth/flux-3-image-klein-GGUF",
+   "ref": "f3_s_bf16",
+   "kind": "image",
+   "prompts": "image_24",
+   "width": 1024,
+   "height": 1024,
+   "steps": 16,
+   "short_steps": 4,
+   "short_n": 1,
+   "n": 3,
+   "warmup": 1,
+   "guidance": 1.0,
+   "options": {
+    "local_files_only": false,
+    "load_timeout_s": 3600,
+    "gguf_filename": "flux-3-image-klein-Q4_K_M.gguf",
+    "model_kind": "gguf",
+    "transformer_quant": "none",
+    "text_encoder_quant": "none"
+   },
+   "env": {
+    "TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL": "1"
+   }
+  },
+  {
+   "tag": "f3_c_q4",
+   "backend": "comfyui",
+   "ref": "f3_c_bf16",
+   "kind": "image",
+   "prompts": "image_24",
+   "width": 1024,
+   "height": 1024,
+   "steps": 16,
+   "short_steps": 4,
+   "short_n": 1,
+   "n": 3,
+   "warmup": 1,
+   "guidance": 1.0,
+   "options": {
+    "family": "flux3-klein",
+    "files": {
+     "dit": "$AMD_CI_WORK/cm/f3_dit_Q4_K_M.gguf",
+     "te": "$AMD_CI_WORK/cm/f3_te_bf16.safetensors",
+     "vae": "$AMD_CI_WORK/cm/f3_vae.safetensors"
+    },
+    "cache_bust": "sampler"
+   },
+   "env": {
+    "DIFFUSION_BENCH_COMFY_PYTHON": "$AMD_CI_WORK/comfy_venv_rock/bin/python",
+    "DIFFUSION_BENCH_COMFY_DIR": "$AMD_CI_WORK/ComfyUI"
+   }
+  },
+  {
+   "tag": "f3_s_def",
+   "backend": "studio",
+   "model": "unsloth/flux-3-image-klein",
+   "ref": "f3_s_bf16",
+   "kind": "image",
+   "prompts": "image_24",
+   "width": 1024,
+   "height": 1024,
+   "steps": 16,
+   "short_steps": 4,
+   "short_n": 1,
+   "n": 3,
+   "warmup": 1,
+   "guidance": 1.0,
+   "options": {
+    "local_files_only": false,
+    "load_timeout_s": 3600
+   },
+   "env": {
+    "TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL": "1"
+   }
+  },
+  {
+   "tag": "f3_c_bf16d",
+   "backend": "comfyui",
+   "ref": "f3_c_bf16",
+   "kind": "image",
+   "prompts": "image_24",
+   "width": 1024,
+   "height": 1024,
+   "steps": 16,
+   "short_steps": 4,
+   "short_n": 1,
+   "n": 3,
+   "warmup": 1,
+   "guidance": 1.0,
+   "options": {
+    "family": "flux3-klein",
+    "files": {
+     "dit": "$AMD_CI_WORK/cm/f3_dit_bf16.safetensors",
+     "te": "$AMD_CI_WORK/cm/f3_te_bf16.safetensors",
+     "vae": "$AMD_CI_WORK/cm/f3_vae.safetensors"
+    },
+    "cache_bust": "sampler"
+   },
+   "env": {
+    "DIFFUSION_BENCH_COMFY_PYTHON": "$AMD_CI_WORK/comfy_venv_default/bin/python",
+    "DIFFUSION_BENCH_COMFY_DIR": "$AMD_CI_WORK/ComfyUI"
+   }
+  },
+  {
+   "tag": "f3_s_bf16_r",
+   "backend": "studio",
+   "model": "unsloth/flux-3-image-klein",
+   "ref": "f3_s_bf16",
+   "kind": "image",
+   "prompts": "image_24",
+   "width": 1024,
+   "height": 1024,
+   "steps": 16,
+   "short_steps": 4,
+   "short_n": 1,
+   "n": 3,
+   "warmup": 1,
+   "guidance": 1.0,
+   "options": {
+    "local_files_only": false,
+    "load_timeout_s": 3600,
+    "transformer_quant": "none",
+    "text_encoder_quant": "none"
+   },
+   "env": {
+    "TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL": "1"
+   }
+  },
+  {
+   "tag": "f3_s_bf16mf",
+   "backend": "studio",
+   "model": "unsloth/flux-3-image-klein",
+   "ref": "f3_s_bf16",
+   "kind": "image",
+   "prompts": "image_24",
+   "width": 1024,
+   "height": 1024,
+   "steps": 16,
+   "short_steps": 4,
+   "short_n": 1,
+   "n": 3,
+   "warmup": 1,
+   "guidance": 1.0,
+   "options": {
+    "local_files_only": false,
+    "load_timeout_s": 3600,
+    "transformer_quant": "none",
+    "text_encoder_quant": "none"
+   },
+   "env": {
+    "TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL": "1",
+    "MIOPEN_FIND_MODE": "NORMAL"
+   }
+  },
+  {
+   "tag": "f3_s_bf16mff",
+   "backend": "studio",
+   "model": "unsloth/flux-3-image-klein",
+   "ref": "f3_s_bf16",
+   "kind": "image",
+   "prompts": "image_24",
+   "width": 1024,
+   "height": 1024,
+   "steps": 16,
+   "short_steps": 4,
+   "short_n": 1,
+   "n": 3,
+   "warmup": 1,
+   "guidance": 1.0,
+   "options": {
+    "local_files_only": false,
+    "load_timeout_s": 3600,
+    "transformer_quant": "none",
+    "text_encoder_quant": "none"
+   },
+   "env": {
+    "TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL": "1",
+    "MIOPEN_FIND_MODE": "FAST"
+   }
+  },
+  {
+   "tag": "f3_s_bf16t",
+   "backend": "studio",
+   "model": "unsloth/flux-3-image-klein",
+   "ref": "f3_s_bf16",
+   "kind": "image",
+   "prompts": "image_24",
+   "width": 1024,
+   "height": 1024,
+   "steps": 16,
+   "short_steps": 4,
+   "short_n": 1,
+   "n": 3,
+   "warmup": 1,
+   "guidance": 1.0,
+   "options": {
+    "local_files_only": false,
+    "load_timeout_s": 3600,
+    "transformer_quant": "none",
+    "text_encoder_quant": "none"
+   },
+   "env": {
+    "TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL": "1",
+    "PYTORCH_TUNABLEOP_ENABLED": "1",
+    "PYTORCH_TUNABLEOP_TUNING": "1",
+    "PYTORCH_TUNABLEOP_FILENAME": "$AMD_CI_WORK/tunableop_f3_%d.csv"
+   }
+  },
+  {
+   "tag": "f3_c_bf16_r",
+   "backend": "comfyui",
+   "ref": "f3_c_bf16",
+   "kind": "image",
+   "prompts": "image_24",
+   "width": 1024,
+   "height": 1024,
+   "steps": 16,
+   "short_steps": 4,
+   "short_n": 1,
+   "n": 3,
+   "warmup": 1,
+   "guidance": 1.0,
+   "options": {
+    "family": "flux3-klein",
+    "files": {
+     "dit": "$AMD_CI_WORK/cm/f3_dit_bf16.safetensors",
+     "te": "$AMD_CI_WORK/cm/f3_te_bf16.safetensors",
+     "vae": "$AMD_CI_WORK/cm/f3_vae.safetensors"
+    },
+    "cache_bust": "sampler"
+   },
+   "env": {
+    "DIFFUSION_BENCH_COMFY_PYTHON": "$AMD_CI_WORK/comfy_venv_rock/bin/python",
+    "DIFFUSION_BENCH_COMFY_DIR": "$AMD_CI_WORK/ComfyUI"
+   }
+  },
+  {
+   "tag": "f3_s_fp8",
+   "backend": "studio",
+   "model": "unsloth/flux-3-image-klein",
+   "ref": "f3_s_bf16",
+   "kind": "image",
+   "prompts": "image_24",
+   "width": 1024,
+   "height": 1024,
+   "steps": 16,
+   "short_steps": 4,
+   "short_n": 1,
+   "n": 3,
+   "warmup": 1,
+   "guidance": 1.0,
+   "options": {
+    "local_files_only": false,
+    "load_timeout_s": 3600,
+    "transformer_quant": "fp8",
+    "text_encoder_quant": "none"
+   },
+   "env": {
+    "TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL": "1"
+   }
+  },
+  {
+   "tag": "f3_c_fp8",
+   "backend": "comfyui",
+   "ref": "f3_c_bf16",
+   "kind": "image",
+   "prompts": "image_24",
+   "width": 1024,
+   "height": 1024,
+   "steps": 16,
+   "short_steps": 4,
+   "short_n": 1,
+   "n": 3,
+   "warmup": 1,
+   "guidance": 1.0,
+   "options": {
+    "family": "flux3-klein",
+    "files": {
+     "dit": "$AMD_CI_WORK/cm/f3_dit_fp8_scaled.safetensors",
+     "te": "$AMD_CI_WORK/cm/f3_te_bf16.safetensors",
+     "vae": "$AMD_CI_WORK/cm/f3_vae.safetensors"
+    },
+    "cache_bust": "sampler"
+   },
+   "env": {
+    "DIFFUSION_BENCH_COMFY_PYTHON": "$AMD_CI_WORK/comfy_venv_rock/bin/python",
+    "DIFFUSION_BENCH_COMFY_DIR": "$AMD_CI_WORK/ComfyUI"
+   }
+  },
+  {
+   "tag": "f3_s_nvfp4",
+   "backend": "studio",
+   "model": "unsloth/flux-3-image-klein",
+   "ref": "f3_s_bf16",
+   "kind": "image",
+   "prompts": "image_24",
+   "width": 1024,
+   "height": 1024,
+   "steps": 16,
+   "short_steps": 4,
+   "short_n": 1,
+   "n": 3,
+   "warmup": 1,
+   "guidance": 1.0,
+   "options": {
+    "local_files_only": false,
+    "load_timeout_s": 3600,
+    "transformer_quant": "nvfp4",
+    "text_encoder_quant": "none"
+   },
+   "env": {
+    "TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL": "1",
+    "UNSLOTH_NVFP4_DIFFUSION": "1"
+   }
+  },
+  {
+   "tag": "f3_c_nvfp4",
+   "backend": "comfyui",
+   "ref": "f3_c_bf16",
+   "kind": "image",
+   "prompts": "image_24",
+   "width": 1024,
+   "height": 1024,
+   "steps": 16,
+   "short_steps": 4,
+   "short_n": 1,
+   "n": 3,
+   "warmup": 1,
+   "guidance": 1.0,
+   "options": {
+    "family": "flux3-klein",
+    "files": {
+     "dit": "$AMD_CI_WORK/cm/f3_dit_nvfp4.safetensors",
+     "te": "$AMD_CI_WORK/cm/f3_te_bf16.safetensors",
+     "vae": "$AMD_CI_WORK/cm/f3_vae.safetensors"
+    },
+    "cache_bust": "sampler"
+   },
+   "env": {
+    "DIFFUSION_BENCH_COMFY_PYTHON": "$AMD_CI_WORK/comfy_venv_rock/bin/python",
+    "DIFFUSION_BENCH_COMFY_DIR": "$AMD_CI_WORK/ComfyUI"
+   }
+  },
+  {
+   "tag": "f3_s_fp8f",
+   "backend": "studio",
+   "model": "unsloth/flux-3-image-klein-FP8",
+   "ref": "f3_s_bf16",
+   "kind": "image",
+   "prompts": "image_24",
+   "width": 1024,
+   "height": 1024,
+   "steps": 16,
+   "short_steps": 4,
+   "short_n": 1,
+   "n": 3,
+   "warmup": 1,
+   "guidance": 1.0,
+   "options": {
+    "local_files_only": false,
+    "load_timeout_s": 3600,
+    "gguf_filename": "flux-3-image-klein-FP8.safetensors",
+    "model_kind": "single_file",
+    "base_repo": "unsloth/flux-3-image-klein",
+    "transformer_quant": "none",
+    "text_encoder_quant": "none"
+   },
+   "env": {
+    "TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL": "1"
+   }
+  },
+  {
+   "tag": "f3_s_nvfp4f",
+   "backend": "studio",
+   "model": "unsloth/flux-3-image-klein",
+   "ref": "f3_s_bf16",
+   "kind": "image",
+   "prompts": "image_24",
+   "width": 1024,
+   "height": 1024,
+   "steps": 16,
+   "short_steps": 4,
+   "short_n": 1,
+   "n": 3,
+   "warmup": 1,
+   "guidance": 1.0,
+   "options": {
+    "local_files_only": false,
+    "load_timeout_s": 3600,
+    "gguf_filename": "variants/nvfp4/model.safetensors",
+    "model_kind": "single_file",
+    "base_repo": "unsloth/flux-3-image-klein",
+    "transformer_quant": "none",
+    "text_encoder_quant": "none"
+   },
+   "env": {
+    "TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL": "1"
+   }
+  },
+  {
+   "tag": "f3_s_q8",
+   "backend": "studio",
+   "model": "unsloth/flux-3-image-klein-GGUF",
+   "ref": "f3_s_bf16",
+   "kind": "image",
+   "prompts": "image_24",
+   "width": 1024,
+   "height": 1024,
+   "steps": 16,
+   "short_steps": 4,
+   "short_n": 1,
+   "n": 3,
+   "warmup": 1,
+   "guidance": 1.0,
+   "options": {
+    "local_files_only": false,
+    "load_timeout_s": 3600,
+    "gguf_filename": "flux-3-image-klein-Q8_0.gguf",
+    "model_kind": "gguf",
+    "transformer_quant": "none",
+    "text_encoder_quant": "none"
+   },
+   "env": {
+    "TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL": "1"
+   }
+  },
+  {
+   "tag": "f3_c_q8",
+   "backend": "comfyui",
+   "ref": "f3_c_bf16",
+   "kind": "image",
+   "prompts": "image_24",
+   "width": 1024,
+   "height": 1024,
+   "steps": 16,
+   "short_steps": 4,
+   "short_n": 1,
+   "n": 3,
+   "warmup": 1,
+   "guidance": 1.0,
+   "options": {
+    "family": "flux3-klein",
+    "files": {
+     "dit": "$AMD_CI_WORK/cm/f3_dit_Q8_0.gguf",
+     "te": "$AMD_CI_WORK/cm/f3_te_bf16.safetensors",
+     "vae": "$AMD_CI_WORK/cm/f3_vae.safetensors"
+    },
+    "cache_bust": "sampler"
+   },
+   "env": {
+    "DIFFUSION_BENCH_COMFY_PYTHON": "$AMD_CI_WORK/comfy_venv_rock/bin/python",
+    "DIFFUSION_BENCH_COMFY_DIR": "$AMD_CI_WORK/ComfyUI"
+   }
+  },
+  {
+   "tag": "f3_s_ud",
+   "backend": "studio",
+   "model": "unsloth/flux-3-image-klein-GGUF",
+   "ref": "f3_s_bf16",
+   "kind": "image",
+   "prompts": "image_24",
+   "width": 1024,
+   "height": 1024,
+   "steps": 16,
+   "short_steps": 4,
+   "short_n": 1,
+   "n": 3,
+   "warmup": 1,
+   "guidance": 1.0,
+   "options": {
+    "local_files_only": false,
+    "load_timeout_s": 3600,
+    "gguf_filename": "flux-3-image-klein-UD-Q4_K_XL.gguf",
+    "model_kind": "gguf",
+    "transformer_quant": "none",
+    "text_encoder_quant": "none"
+   },
+   "env": {
+    "TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL": "1"
+   }
+  },
+  {
+   "tag": "f3_c_ud",
+   "backend": "comfyui",
+   "ref": "f3_c_bf16",
+   "kind": "image",
+   "prompts": "image_24",
+   "width": 1024,
+   "height": 1024,
+   "steps": 16,
+   "short_steps": 4,
+   "short_n": 1,
+   "n": 3,
+   "warmup": 1,
+   "guidance": 1.0,
+   "options": {
+    "family": "flux3-klein",
+    "files": {
+     "dit": "$AMD_CI_WORK/cm/f3_dit_UD-Q4_K_XL.gguf",
+     "te": "$AMD_CI_WORK/cm/f3_te_bf16.safetensors",
+     "vae": "$AMD_CI_WORK/cm/f3_vae.safetensors"
+    },
+    "cache_bust": "sampler"
+   },
+   "env": {
+    "DIFFUSION_BENCH_COMFY_PYTHON": "$AMD_CI_WORK/comfy_venv_rock/bin/python",
+    "DIFFUSION_BENCH_COMFY_DIR": "$AMD_CI_WORK/ComfyUI"
+   }
+  },
+  {
+   "tag": "f3_s_int8d_r",
+   "backend": "studio",
+   "model": "unsloth/flux-3-image-klein",
+   "ref": "f3_s_bf16",
+   "kind": "image",
+   "prompts": "image_24",
+   "width": 1024,
+   "height": 1024,
+   "steps": 16,
+   "short_steps": 4,
+   "short_n": 1,
+   "n": 3,
+   "warmup": 1,
+   "guidance": 1.0,
+   "options": {
+    "local_files_only": false,
+    "load_timeout_s": 3600,
+    "transformer_quant": "int8",
+    "text_encoder_quant": "none"
+   },
+   "env": {
+    "TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL": "1"
+   }
+  },
+  {
+   "tag": "f3_c_int8d_r",
+   "backend": "comfyui",
+   "ref": "f3_c_bf16",
+   "kind": "image",
+   "prompts": "image_24",
+   "width": 1024,
+   "height": 1024,
+   "steps": 16,
+   "short_steps": 4,
+   "short_n": 1,
+   "n": 3,
+   "warmup": 1,
+   "guidance": 1.0,
+   "options": {
+    "family": "flux3-klein",
+    "files": {
+     "dit": "$AMD_CI_WORK/cm/f3_dit_int8_convrot.safetensors",
+     "te": "$AMD_CI_WORK/cm/f3_te_bf16.safetensors",
+     "vae": "$AMD_CI_WORK/cm/f3_vae.safetensors"
+    },
+    "cache_bust": "sampler"
+   },
+   "env": {
+    "DIFFUSION_BENCH_COMFY_PYTHON": "$AMD_CI_WORK/comfy_venv_rock/bin/python",
+    "DIFFUSION_BENCH_COMFY_DIR": "$AMD_CI_WORK/ComfyUI"
+   }
+  },
+  {
+   "tag": "f3_s_int8d_i8a",
+   "backend": "studio",
+   "model": "unsloth/flux-3-image-klein",
+   "ref": "f3_s_bf16",
+   "kind": "image",
+   "prompts": "image_24",
+   "width": 1024,
+   "height": 1024,
+   "steps": 16,
+   "short_steps": 4,
+   "short_n": 1,
+   "n": 3,
+   "warmup": 1,
+   "guidance": 1.0,
+   "options": {
+    "local_files_only": false,
+    "load_timeout_s": 3600,
+    "transformer_quant": "int8",
+    "text_encoder_quant": "none"
+   },
+   "env": {
+    "TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL": "1",
+    "UNSLOTH_DIFFUSION_INT8_ATTENTION_KERNEL": "1"
+   }
+  },
+  {
+   "tag": "f3_s_int8_r",
+   "backend": "studio",
+   "model": "unsloth/flux-3-image-klein",
+   "ref": "f3_s_bf16",
+   "kind": "image",
+   "prompts": "image_24",
+   "width": 1024,
+   "height": 1024,
+   "steps": 16,
+   "short_steps": 4,
+   "short_n": 1,
+   "n": 3,
+   "warmup": 1,
+   "guidance": 1.0,
+   "options": {
+    "local_files_only": false,
+    "load_timeout_s": 3600,
+    "transformer_quant": "int8",
+    "text_encoder_quant": "int8"
+   },
+   "env": {
+    "TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL": "1"
+   }
+  },
+  {
+   "tag": "f3_c_int8_r",
+   "backend": "comfyui",
+   "ref": "f3_c_bf16",
+   "kind": "image",
+   "prompts": "image_24",
+   "width": 1024,
+   "height": 1024,
+   "steps": 16,
+   "short_steps": 4,
+   "short_n": 1,
+   "n": 3,
+   "warmup": 1,
+   "guidance": 1.0,
+   "options": {
+    "family": "flux3-klein",
+    "files": {
+     "dit": "$AMD_CI_WORK/cm/f3_dit_int8_convrot.safetensors",
+     "te": "$AMD_CI_WORK/cm/f3_te_int8_convrot.safetensors",
+     "vae": "$AMD_CI_WORK/cm/f3_vae.safetensors"
+    },
+    "cache_bust": "sampler"
+   },
+   "env": {
+    "DIFFUSION_BENCH_COMFY_PYTHON": "$AMD_CI_WORK/comfy_venv_rock/bin/python",
+    "DIFFUSION_BENCH_COMFY_DIR": "$AMD_CI_WORK/ComfyUI"
+   }
+  },
+  {
+   "tag": "f3b_s_bf16",
+   "backend": "studio",
+   "model": "unsloth/flux-3-image-klein-base",
+   "ref": "f3b_s_bf16",
+   "kind": "image",
+   "prompts": "image_24",
+   "width": 1024,
+   "height": 1024,
+   "steps": 50,
+   "short_steps": 10,
+   "short_n": 1,
+   "n": 3,
+   "warmup": 1,
+   "guidance": 3.5,
+   "negative_prompt": "",
+   "options": {
+    "local_files_only": false,
+    "load_timeout_s": 3600,
+    "transformer_quant": "none",
+    "text_encoder_quant": "none"
+   },
+   "env": {
+    "TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL": "1"
+   }
+  },
+  {
+   "tag": "f3b_c_bf16",
+   "backend": "comfyui",
+   "ref": "f3b_c_bf16",
+   "kind": "image",
+   "prompts": "image_24",
+   "width": 1024,
+   "height": 1024,
+   "steps": 50,
+   "short_steps": 10,
+   "short_n": 1,
+   "n": 3,
+   "warmup": 1,
+   "guidance": 3.5,
+   "negative_prompt": "",
+   "options": {
+    "family": "flux3-klein",
+    "files": {
+     "dit": "$AMD_CI_WORK/cm/f3b_dit_bf16.safetensors",
+     "te": "$AMD_CI_WORK/cm/f3_te_bf16.safetensors",
+     "vae": "$AMD_CI_WORK/cm/f3_vae.safetensors"
+    },
+    "cache_bust": "sampler"
+   },
+   "env": {
+    "DIFFUSION_BENCH_COMFY_PYTHON": "$AMD_CI_WORK/comfy_venv_rock/bin/python",
+    "DIFFUSION_BENCH_COMFY_DIR": "$AMD_CI_WORK/ComfyUI"
+   }
+  },
+  {
+   "tag": "f3b_s_int8",
+   "backend": "studio",
+   "model": "unsloth/flux-3-image-klein-base",
+   "ref": "f3b_s_bf16",
+   "kind": "image",
+   "prompts": "image_24",
+   "width": 1024,
+   "height": 1024,
+   "steps": 50,
+   "short_steps": 10,
+   "short_n": 1,
+   "n": 3,
+   "warmup": 1,
+   "guidance": 3.5,
+   "negative_prompt": "",
+   "options": {
+    "local_files_only": false,
+    "load_timeout_s": 3600,
+    "transformer_quant": "int8",
+    "text_encoder_quant": "int8"
+   },
+   "env": {
+    "TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL": "1"
+   }
+  },
+  {
+   "tag": "f3b_c_int8",
+   "backend": "comfyui",
+   "ref": "f3b_c_bf16",
+   "kind": "image",
+   "prompts": "image_24",
+   "width": 1024,
+   "height": 1024,
+   "steps": 50,
+   "short_steps": 10,
+   "short_n": 1,
+   "n": 3,
+   "warmup": 1,
+   "guidance": 3.5,
+   "negative_prompt": "",
+   "options": {
+    "family": "flux3-klein",
+    "files": {
+     "dit": "$AMD_CI_WORK/cm/f3b_dit_int8_convrot.safetensors",
+     "te": "$AMD_CI_WORK/cm/f3_te_int8_convrot.safetensors",
+     "vae": "$AMD_CI_WORK/cm/f3_vae.safetensors"
+    },
+    "cache_bust": "sampler"
+   },
+   "env": {
+    "DIFFUSION_BENCH_COMFY_PYTHON": "$AMD_CI_WORK/comfy_venv_rock/bin/python",
+    "DIFFUSION_BENCH_COMFY_DIR": "$AMD_CI_WORK/ComfyUI"
+   }
+  },
+  {
+   "tag": "f3b_s_int8d",
+   "backend": "studio",
+   "model": "unsloth/flux-3-image-klein-base",
+   "ref": "f3b_s_bf16",
+   "kind": "image",
+   "prompts": "image_24",
+   "width": 1024,
+   "height": 1024,
+   "steps": 50,
+   "short_steps": 10,
+   "short_n": 1,
+   "n": 3,
+   "warmup": 1,
+   "guidance": 3.5,
+   "negative_prompt": "",
+   "options": {
+    "local_files_only": false,
+    "load_timeout_s": 3600,
+    "transformer_quant": "int8",
+    "text_encoder_quant": "none"
+   },
+   "env": {
+    "TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL": "1"
+   }
+  },
+  {
+   "tag": "f3b_c_int8d",
+   "backend": "comfyui",
+   "ref": "f3b_c_bf16",
+   "kind": "image",
+   "prompts": "image_24",
+   "width": 1024,
+   "height": 1024,
+   "steps": 50,
+   "short_steps": 10,
+   "short_n": 1,
+   "n": 3,
+   "warmup": 1,
+   "guidance": 3.5,
+   "negative_prompt": "",
+   "options": {
+    "family": "flux3-klein",
+    "files": {
+     "dit": "$AMD_CI_WORK/cm/f3b_dit_int8_convrot.safetensors",
+     "te": "$AMD_CI_WORK/cm/f3_te_bf16.safetensors",
+     "vae": "$AMD_CI_WORK/cm/f3_vae.safetensors"
+    },
+    "cache_bust": "sampler"
+   },
+   "env": {
+    "DIFFUSION_BENCH_COMFY_PYTHON": "$AMD_CI_WORK/comfy_venv_rock/bin/python",
+    "DIFFUSION_BENCH_COMFY_DIR": "$AMD_CI_WORK/ComfyUI"
+   }
+  },
+  {
+   "tag": "f3b_s_int8adc",
+   "backend": "studio",
+   "model": "unsloth/flux-3-image-klein-base",
+   "ref": "f3b_s_bf16",
+   "kind": "image",
+   "prompts": "image_24",
+   "width": 1024,
+   "height": 1024,
+   "steps": 50,
+   "short_steps": 10,
+   "short_n": 1,
+   "n": 3,
+   "warmup": 1,
+   "guidance": 3.5,
+   "negative_prompt": "",
+   "options": {
+    "local_files_only": false,
+    "load_timeout_s": 3600,
+    "transformer_quant": "int8",
+    "text_encoder_quant": "none",
+    "speed_mode": "default"
+   },
+   "env": {
+    "TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL": "1",
+    "UNSLOTH_NATIVE_INT8_ACT": "1"
+   }
+  },
+  {
+   "tag": "f3b_s_int8dc",
+   "backend": "studio",
+   "model": "unsloth/flux-3-image-klein-base",
+   "ref": "f3b_s_bf16",
+   "kind": "image",
+   "prompts": "image_24",
+   "width": 1024,
+   "height": 1024,
+   "steps": 50,
+   "short_steps": 10,
+   "short_n": 1,
+   "n": 3,
+   "warmup": 1,
+   "guidance": 3.5,
+   "negative_prompt": "",
+   "options": {
+    "local_files_only": false,
+    "load_timeout_s": 3600,
+    "transformer_quant": "int8",
+    "text_encoder_quant": "none",
+    "speed_mode": "default"
+   },
+   "env": {
+    "TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL": "1"
+   }
+  },
+  {
+   "tag": "f3b_s_int8ad",
+   "backend": "studio",
+   "model": "unsloth/flux-3-image-klein-base",
+   "ref": "f3b_s_bf16",
+   "kind": "image",
+   "prompts": "image_24",
+   "width": 1024,
+   "height": 1024,
+   "steps": 50,
+   "short_steps": 10,
+   "short_n": 1,
+   "n": 3,
+   "warmup": 1,
+   "guidance": 3.5,
+   "negative_prompt": "",
+   "options": {
+    "local_files_only": false,
+    "load_timeout_s": 3600,
+    "transformer_quant": "int8",
+    "text_encoder_quant": "none"
+   },
+   "env": {
+    "TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL": "1",
+    "UNSLOTH_NATIVE_INT8_ACT": "1"
+   }
+  },
+  {
+   "tag": "f3b_s_q4",
+   "backend": "studio",
+   "model": "unsloth/flux-3-image-klein-base-GGUF",
+   "ref": "f3b_s_bf16",
+   "kind": "image",
+   "prompts": "image_24",
+   "width": 1024,
+   "height": 1024,
+   "steps": 50,
+   "short_steps": 10,
+   "short_n": 1,
+   "n": 3,
+   "warmup": 1,
+   "guidance": 3.5,
+   "negative_prompt": "",
+   "options": {
+    "local_files_only": false,
+    "load_timeout_s": 3600,
+    "gguf_filename": "flux-3-image-klein-base-Q4_K_M.gguf",
+    "model_kind": "gguf",
+    "transformer_quant": "none",
+    "text_encoder_quant": "none"
+   },
+   "env": {
+    "TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL": "1"
+   }
+  },
+  {
+   "tag": "f3b_c_q4",
+   "backend": "comfyui",
+   "ref": "f3b_c_bf16",
+   "kind": "image",
+   "prompts": "image_24",
+   "width": 1024,
+   "height": 1024,
+   "steps": 50,
+   "short_steps": 10,
+   "short_n": 1,
+   "n": 3,
+   "warmup": 1,
+   "guidance": 3.5,
+   "negative_prompt": "",
+   "options": {
+    "family": "flux3-klein",
+    "files": {
+     "dit": "$AMD_CI_WORK/cm/f3b_dit_Q4_K_M.gguf",
+     "te": "$AMD_CI_WORK/cm/f3_te_bf16.safetensors",
+     "vae": "$AMD_CI_WORK/cm/f3_vae.safetensors"
+    },
+    "cache_bust": "sampler"
+   },
+   "env": {
+    "DIFFUSION_BENCH_COMFY_PYTHON": "$AMD_CI_WORK/comfy_venv_rock/bin/python",
+    "DIFFUSION_BENCH_COMFY_DIR": "$AMD_CI_WORK/ComfyUI"
+   }
+  },
+  {
+   "tag": "f3b_s_def",
+   "backend": "studio",
+   "model": "unsloth/flux-3-image-klein-base",
+   "ref": "f3b_s_bf16",
+   "kind": "image",
+   "prompts": "image_24",
+   "width": 1024,
+   "height": 1024,
+   "steps": 50,
+   "short_steps": 10,
+   "short_n": 1,
+   "n": 3,
+   "warmup": 1,
+   "guidance": 3.5,
+   "negative_prompt": "",
+   "options": {
+    "local_files_only": false,
+    "load_timeout_s": 3600
+   },
+   "env": {
+    "TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL": "1"
+   }
+  },
+  {
+   "tag": "f3b_c_bf16d",
+   "backend": "comfyui",
+   "ref": "f3b_c_bf16",
+   "kind": "image",
+   "prompts": "image_24",
+   "width": 1024,
+   "height": 1024,
+   "steps": 50,
+   "short_steps": 10,
+   "short_n": 1,
+   "n": 3,
+   "warmup": 1,
+   "guidance": 3.5,
+   "negative_prompt": "",
+   "options": {
+    "family": "flux3-klein",
+    "files": {
+     "dit": "$AMD_CI_WORK/cm/f3b_dit_bf16.safetensors",
+     "te": "$AMD_CI_WORK/cm/f3_te_bf16.safetensors",
+     "vae": "$AMD_CI_WORK/cm/f3_vae.safetensors"
+    },
+    "cache_bust": "sampler"
+   },
+   "env": {
+    "DIFFUSION_BENCH_COMFY_PYTHON": "$AMD_CI_WORK/comfy_venv_default/bin/python",
+    "DIFFUSION_BENCH_COMFY_DIR": "$AMD_CI_WORK/ComfyUI"
+   }
+  },
+  {
+   "tag": "f3b_s_bf16_r",
+   "backend": "studio",
+   "model": "unsloth/flux-3-image-klein-base",
+   "ref": "f3b_s_bf16",
+   "kind": "image",
+   "prompts": "image_24",
+   "width": 1024,
+   "height": 1024,
+   "steps": 50,
+   "short_steps": 10,
+   "short_n": 1,
+   "n": 3,
+   "warmup": 1,
+   "guidance": 3.5,
+   "negative_prompt": "",
+   "options": {
+    "local_files_only": false,
+    "load_timeout_s": 3600,
+    "transformer_quant": "none",
+    "text_encoder_quant": "none"
+   },
+   "env": {
+    "TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL": "1"
+   }
+  },
+  {
+   "tag": "f3b_s_bf16mf",
+   "backend": "studio",
+   "model": "unsloth/flux-3-image-klein-base",
+   "ref": "f3b_s_bf16",
+   "kind": "image",
+   "prompts": "image_24",
+   "width": 1024,
+   "height": 1024,
+   "steps": 50,
+   "short_steps": 10,
+   "short_n": 1,
+   "n": 3,
+   "warmup": 1,
+   "guidance": 3.5,
+   "negative_prompt": "",
+   "options": {
+    "local_files_only": false,
+    "load_timeout_s": 3600,
+    "transformer_quant": "none",
+    "text_encoder_quant": "none"
+   },
+   "env": {
+    "TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL": "1",
+    "MIOPEN_FIND_MODE": "NORMAL"
+   }
+  },
+  {
+   "tag": "f3b_s_bf16mff",
+   "backend": "studio",
+   "model": "unsloth/flux-3-image-klein-base",
+   "ref": "f3b_s_bf16",
+   "kind": "image",
+   "prompts": "image_24",
+   "width": 1024,
+   "height": 1024,
+   "steps": 50,
+   "short_steps": 10,
+   "short_n": 1,
+   "n": 3,
+   "warmup": 1,
+   "guidance": 3.5,
+   "negative_prompt": "",
+   "options": {
+    "local_files_only": false,
+    "load_timeout_s": 3600,
+    "transformer_quant": "none",
+    "text_encoder_quant": "none"
+   },
+   "env": {
+    "TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL": "1",
+    "MIOPEN_FIND_MODE": "FAST"
+   }
+  },
+  {
+   "tag": "f3b_s_bf16t",
+   "backend": "studio",
+   "model": "unsloth/flux-3-image-klein-base",
+   "ref": "f3b_s_bf16",
+   "kind": "image",
+   "prompts": "image_24",
+   "width": 1024,
+   "height": 1024,
+   "steps": 50,
+   "short_steps": 10,
+   "short_n": 1,
+   "n": 3,
+   "warmup": 1,
+   "guidance": 3.5,
+   "negative_prompt": "",
+   "options": {
+    "local_files_only": false,
+    "load_timeout_s": 3600,
+    "transformer_quant": "none",
+    "text_encoder_quant": "none"
+   },
+   "env": {
+    "TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL": "1",
+    "PYTORCH_TUNABLEOP_ENABLED": "1",
+    "PYTORCH_TUNABLEOP_TUNING": "1",
+    "PYTORCH_TUNABLEOP_FILENAME": "$AMD_CI_WORK/tunableop_f3b_%d.csv"
+   }
+  },
+  {
+   "tag": "f3b_c_bf16_r",
+   "backend": "comfyui",
+   "ref": "f3b_c_bf16",
+   "kind": "image",
+   "prompts": "image_24",
+   "width": 1024,
+   "height": 1024,
+   "steps": 50,
+   "short_steps": 10,
+   "short_n": 1,
+   "n": 3,
+   "warmup": 1,
+   "guidance": 3.5,
+   "negative_prompt": "",
+   "options": {
+    "family": "flux3-klein",
+    "files": {
+     "dit": "$AMD_CI_WORK/cm/f3b_dit_bf16.safetensors",
+     "te": "$AMD_CI_WORK/cm/f3_te_bf16.safetensors",
+     "vae": "$AMD_CI_WORK/cm/f3_vae.safetensors"
+    },
+    "cache_bust": "sampler"
+   },
+   "env": {
+    "DIFFUSION_BENCH_COMFY_PYTHON": "$AMD_CI_WORK/comfy_venv_rock/bin/python",
+    "DIFFUSION_BENCH_COMFY_DIR": "$AMD_CI_WORK/ComfyUI"
+   }
+  },
+  {
+   "tag": "f3b_s_fp8",
+   "backend": "studio",
+   "model": "unsloth/flux-3-image-klein-base",
+   "ref": "f3b_s_bf16",
+   "kind": "image",
+   "prompts": "image_24",
+   "width": 1024,
+   "height": 1024,
+   "steps": 50,
+   "short_steps": 10,
+   "short_n": 1,
+   "n": 3,
+   "warmup": 1,
+   "guidance": 3.5,
+   "negative_prompt": "",
+   "options": {
+    "local_files_only": false,
+    "load_timeout_s": 3600,
+    "transformer_quant": "fp8",
+    "text_encoder_quant": "none"
+   },
+   "env": {
+    "TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL": "1"
+   }
+  },
+  {
+   "tag": "f3b_c_fp8",
+   "backend": "comfyui",
+   "ref": "f3b_c_bf16",
+   "kind": "image",
+   "prompts": "image_24",
+   "width": 1024,
+   "height": 1024,
+   "steps": 50,
+   "short_steps": 10,
+   "short_n": 1,
+   "n": 3,
+   "warmup": 1,
+   "guidance": 3.5,
+   "negative_prompt": "",
+   "options": {
+    "family": "flux3-klein",
+    "files": {
+     "dit": "$AMD_CI_WORK/cm/f3b_dit_fp8_scaled.safetensors",
+     "te": "$AMD_CI_WORK/cm/f3_te_bf16.safetensors",
+     "vae": "$AMD_CI_WORK/cm/f3_vae.safetensors"
+    },
+    "cache_bust": "sampler"
+   },
+   "env": {
+    "DIFFUSION_BENCH_COMFY_PYTHON": "$AMD_CI_WORK/comfy_venv_rock/bin/python",
+    "DIFFUSION_BENCH_COMFY_DIR": "$AMD_CI_WORK/ComfyUI"
+   }
+  },
+  {
+   "tag": "f3b_s_nvfp4",
+   "backend": "studio",
+   "model": "unsloth/flux-3-image-klein-base",
+   "ref": "f3b_s_bf16",
+   "kind": "image",
+   "prompts": "image_24",
+   "width": 1024,
+   "height": 1024,
+   "steps": 50,
+   "short_steps": 10,
+   "short_n": 1,
+   "n": 3,
+   "warmup": 1,
+   "guidance": 3.5,
+   "negative_prompt": "",
+   "options": {
+    "local_files_only": false,
+    "load_timeout_s": 3600,
+    "transformer_quant": "nvfp4",
+    "text_encoder_quant": "none"
+   },
+   "env": {
+    "TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL": "1",
+    "UNSLOTH_NVFP4_DIFFUSION": "1"
+   }
+  },
+  {
+   "tag": "f3b_c_nvfp4",
+   "backend": "comfyui",
+   "ref": "f3b_c_bf16",
+   "kind": "image",
+   "prompts": "image_24",
+   "width": 1024,
+   "height": 1024,
+   "steps": 50,
+   "short_steps": 10,
+   "short_n": 1,
+   "n": 3,
+   "warmup": 1,
+   "guidance": 3.5,
+   "negative_prompt": "",
+   "options": {
+    "family": "flux3-klein",
+    "files": {
+     "dit": "$AMD_CI_WORK/cm/f3b_dit_nvfp4.safetensors",
+     "te": "$AMD_CI_WORK/cm/f3_te_bf16.safetensors",
+     "vae": "$AMD_CI_WORK/cm/f3_vae.safetensors"
+    },
+    "cache_bust": "sampler"
+   },
+   "env": {
+    "DIFFUSION_BENCH_COMFY_PYTHON": "$AMD_CI_WORK/comfy_venv_rock/bin/python",
+    "DIFFUSION_BENCH_COMFY_DIR": "$AMD_CI_WORK/ComfyUI"
+   }
+  },
+  {
+   "tag": "f3b_s_fp8f",
+   "backend": "studio",
+   "model": "unsloth/flux-3-image-klein-base-FP8",
+   "ref": "f3b_s_bf16",
+   "kind": "image",
+   "prompts": "image_24",
+   "width": 1024,
+   "height": 1024,
+   "steps": 50,
+   "short_steps": 10,
+   "short_n": 1,
+   "n": 3,
+   "warmup": 1,
+   "guidance": 3.5,
+   "negative_prompt": "",
+   "options": {
+    "local_files_only": false,
+    "load_timeout_s": 3600,
+    "gguf_filename": "flux-3-image-klein-base-FP8.safetensors",
+    "model_kind": "single_file",
+    "base_repo": "unsloth/flux-3-image-klein-base",
+    "transformer_quant": "none",
+    "text_encoder_quant": "none"
+   },
+   "env": {
+    "TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL": "1"
+   }
+  },
+  {
+   "tag": "f3b_s_nvfp4f",
+   "backend": "studio",
+   "model": "unsloth/flux-3-image-klein-base",
+   "ref": "f3b_s_bf16",
+   "kind": "image",
+   "prompts": "image_24",
+   "width": 1024,
+   "height": 1024,
+   "steps": 50,
+   "short_steps": 10,
+   "short_n": 1,
+   "n": 3,
+   "warmup": 1,
+   "guidance": 3.5,
+   "negative_prompt": "",
+   "options": {
+    "local_files_only": false,
+    "load_timeout_s": 3600,
+    "gguf_filename": "variants/nvfp4/model.safetensors",
+    "model_kind": "single_file",
+    "base_repo": "unsloth/flux-3-image-klein-base",
+    "transformer_quant": "none",
+    "text_encoder_quant": "none"
+   },
+   "env": {
+    "TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL": "1"
+   }
+  },
+  {
+   "tag": "f3b_s_q8",
+   "backend": "studio",
+   "model": "unsloth/flux-3-image-klein-base-GGUF",
+   "ref": "f3b_s_bf16",
+   "kind": "image",
+   "prompts": "image_24",
+   "width": 1024,
+   "height": 1024,
+   "steps": 50,
+   "short_steps": 10,
+   "short_n": 1,
+   "n": 3,
+   "warmup": 1,
+   "guidance": 3.5,
+   "negative_prompt": "",
+   "options": {
+    "local_files_only": false,
+    "load_timeout_s": 3600,
+    "gguf_filename": "flux-3-image-klein-base-Q8_0.gguf",
+    "model_kind": "gguf",
+    "transformer_quant": "none",
+    "text_encoder_quant": "none"
+   },
+   "env": {
+    "TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL": "1"
+   }
+  },
+  {
+   "tag": "f3b_c_q8",
+   "backend": "comfyui",
+   "ref": "f3b_c_bf16",
+   "kind": "image",
+   "prompts": "image_24",
+   "width": 1024,
+   "height": 1024,
+   "steps": 50,
+   "short_steps": 10,
+   "short_n": 1,
+   "n": 3,
+   "warmup": 1,
+   "guidance": 3.5,
+   "negative_prompt": "",
+   "options": {
+    "family": "flux3-klein",
+    "files": {
+     "dit": "$AMD_CI_WORK/cm/f3b_dit_Q8_0.gguf",
+     "te": "$AMD_CI_WORK/cm/f3_te_bf16.safetensors",
+     "vae": "$AMD_CI_WORK/cm/f3_vae.safetensors"
+    },
+    "cache_bust": "sampler"
+   },
+   "env": {
+    "DIFFUSION_BENCH_COMFY_PYTHON": "$AMD_CI_WORK/comfy_venv_rock/bin/python",
+    "DIFFUSION_BENCH_COMFY_DIR": "$AMD_CI_WORK/ComfyUI"
+   }
+  },
+  {
+   "tag": "f3b_s_ud",
+   "backend": "studio",
+   "model": "unsloth/flux-3-image-klein-base-GGUF",
+   "ref": "f3b_s_bf16",
+   "kind": "image",
+   "prompts": "image_24",
+   "width": 1024,
+   "height": 1024,
+   "steps": 50,
+   "short_steps": 10,
+   "short_n": 1,
+   "n": 3,
+   "warmup": 1,
+   "guidance": 3.5,
+   "negative_prompt": "",
+   "options": {
+    "local_files_only": false,
+    "load_timeout_s": 3600,
+    "gguf_filename": "flux-3-image-klein-base-UD-Q4_K_XL.gguf",
+    "model_kind": "gguf",
+    "transformer_quant": "none",
+    "text_encoder_quant": "none"
+   },
+   "env": {
+    "TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL": "1"
+   }
+  },
+  {
+   "tag": "f3b_c_ud",
+   "backend": "comfyui",
+   "ref": "f3b_c_bf16",
+   "kind": "image",
+   "prompts": "image_24",
+   "width": 1024,
+   "height": 1024,
+   "steps": 50,
+   "short_steps": 10,
+   "short_n": 1,
+   "n": 3,
+   "warmup": 1,
+   "guidance": 3.5,
+   "negative_prompt": "",
+   "options": {
+    "family": "flux3-klein",
+    "files": {
+     "dit": "$AMD_CI_WORK/cm/f3b_dit_UD-Q4_K_XL.gguf",
+     "te": "$AMD_CI_WORK/cm/f3_te_bf16.safetensors",
+     "vae": "$AMD_CI_WORK/cm/f3_vae.safetensors"
+    },
+    "cache_bust": "sampler"
+   },
+   "env": {
+    "DIFFUSION_BENCH_COMFY_PYTHON": "$AMD_CI_WORK/comfy_venv_rock/bin/python",
+    "DIFFUSION_BENCH_COMFY_DIR": "$AMD_CI_WORK/ComfyUI"
+   }
+  },
+  {
+   "tag": "f3b_s_int8d_r",
+   "backend": "studio",
+   "model": "unsloth/flux-3-image-klein-base",
+   "ref": "f3b_s_bf16",
+   "kind": "image",
+   "prompts": "image_24",
+   "width": 1024,
+   "height": 1024,
+   "steps": 50,
+   "short_steps": 10,
+   "short_n": 1,
+   "n": 3,
+   "warmup": 1,
+   "guidance": 3.5,
+   "negative_prompt": "",
+   "options": {
+    "local_files_only": false,
+    "load_timeout_s": 3600,
+    "transformer_quant": "int8",
+    "text_encoder_quant": "none"
+   },
+   "env": {
+    "TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL": "1"
+   }
+  },
+  {
+   "tag": "f3b_c_int8d_r",
+   "backend": "comfyui",
+   "ref": "f3b_c_bf16",
+   "kind": "image",
+   "prompts": "image_24",
+   "width": 1024,
+   "height": 1024,
+   "steps": 50,
+   "short_steps": 10,
+   "short_n": 1,
+   "n": 3,
+   "warmup": 1,
+   "guidance": 3.5,
+   "negative_prompt": "",
+   "options": {
+    "family": "flux3-klein",
+    "files": {
+     "dit": "$AMD_CI_WORK/cm/f3b_dit_int8_convrot.safetensors",
+     "te": "$AMD_CI_WORK/cm/f3_te_bf16.safetensors",
+     "vae": "$AMD_CI_WORK/cm/f3_vae.safetensors"
+    },
+    "cache_bust": "sampler"
+   },
+   "env": {
+    "DIFFUSION_BENCH_COMFY_PYTHON": "$AMD_CI_WORK/comfy_venv_rock/bin/python",
+    "DIFFUSION_BENCH_COMFY_DIR": "$AMD_CI_WORK/ComfyUI"
+   }
+  },
+  {
+   "tag": "f3b_s_int8d_i8a",
+   "backend": "studio",
+   "model": "unsloth/flux-3-image-klein-base",
+   "ref": "f3b_s_bf16",
+   "kind": "image",
+   "prompts": "image_24",
+   "width": 1024,
+   "height": 1024,
+   "steps": 50,
+   "short_steps": 10,
+   "short_n": 1,
+   "n": 3,
+   "warmup": 1,
+   "guidance": 3.5,
+   "negative_prompt": "",
+   "options": {
+    "local_files_only": false,
+    "load_timeout_s": 3600,
+    "transformer_quant": "int8",
+    "text_encoder_quant": "none"
+   },
+   "env": {
+    "TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL": "1",
+    "UNSLOTH_DIFFUSION_INT8_ATTENTION_KERNEL": "1"
+   }
+  },
+  {
+   "tag": "f3b_s_int8_r",
+   "backend": "studio",
+   "model": "unsloth/flux-3-image-klein-base",
+   "ref": "f3b_s_bf16",
+   "kind": "image",
+   "prompts": "image_24",
+   "width": 1024,
+   "height": 1024,
+   "steps": 50,
+   "short_steps": 10,
+   "short_n": 1,
+   "n": 3,
+   "warmup": 1,
+   "guidance": 3.5,
+   "negative_prompt": "",
+   "options": {
+    "local_files_only": false,
+    "load_timeout_s": 3600,
+    "transformer_quant": "int8",
+    "text_encoder_quant": "int8"
+   },
+   "env": {
+    "TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL": "1"
+   }
+  },
+  {
+   "tag": "f3b_c_int8_r",
+   "backend": "comfyui",
+   "ref": "f3b_c_bf16",
+   "kind": "image",
+   "prompts": "image_24",
+   "width": 1024,
+   "height": 1024,
+   "steps": 50,
+   "short_steps": 10,
+   "short_n": 1,
+   "n": 3,
+   "warmup": 1,
+   "guidance": 3.5,
+   "negative_prompt": "",
+   "options": {
+    "family": "flux3-klein",
+    "files": {
+     "dit": "$AMD_CI_WORK/cm/f3b_dit_int8_convrot.safetensors",
+     "te": "$AMD_CI_WORK/cm/f3_te_int8_convrot.safetensors",
+     "vae": "$AMD_CI_WORK/cm/f3_vae.safetensors"
+    },
+    "cache_bust": "sampler"
+   },
+   "env": {
+    "DIFFUSION_BENCH_COMFY_PYTHON": "$AMD_CI_WORK/comfy_venv_rock/bin/python",
+    "DIFFUSION_BENCH_COMFY_DIR": "$AMD_CI_WORK/ComfyUI"
+   }
+  }
+ ]
+}
