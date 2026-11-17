@@ -2393,7 +2393,17 @@ def cell_fsdp2_io():
     os.environ.update(MASTER_ADDR = "127.0.0.1", MASTER_PORT = str(port), RANK = "0", WORLD_SIZE = "1", LOCAL_RANK = "0")
     backend = "cuda:nccl,cpu:gloo" if (dist.is_nccl_available() and os.name != "nt") else "gloo"
     res["backend"] = backend
-    dist.init_process_group(backend, rank = 0, world_size = 1, timeout = datetime.timedelta(seconds = 300))
+    stage("pg_init")
+    if os.name == "nt":  # TCPStore + gloo on this Windows host crashed in c10d (0xC0000005): a FileStore rendezvous
+        import tempfile
+        from pathlib import Path
+        store_file = Path(tempfile.mkdtemp()) / "pg_store"
+        res["init_method"] = "file"
+        dist.init_process_group(backend, init_method = store_file.as_uri(), rank = 0, world_size = 1,
+                                timeout = datetime.timedelta(seconds = 300))
+    else:
+        dist.init_process_group(backend, rank = 0, world_size = 1, timeout = datetime.timedelta(seconds = 300))
+    stage("pg_ok")
     try:
         from unsloth.models import fsdp2_native as native
         from torch.distributed.fsdp import FSDPModule
@@ -2416,6 +2426,7 @@ def cell_fsdp2_io():
             return m
         dev = torch.device("cuda", torch.cuda.current_device())
         ref, model = make().to(dev), make().to(dev)
+        stage("shard")
         buf = io.StringIO()
         with contextlib.redirect_stdout(buf):
             native.shard_model(model, native.FSDP2Config(param_dtype = torch.float32, device = "cuda", fit_layout = False))
