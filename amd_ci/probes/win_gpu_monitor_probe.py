@@ -136,8 +136,9 @@ def main() -> int:
             raise RuntimeError(f"no LUID for device 0: {devices!r}")
         obs["all_engines_query_s"] = all_engines_seconds()
         obs["idle"] = sample(hw, luid, 3, 4.0)
+        # stderr apart: a torch warning ahead of READY must not read as a failed start.
         load = subprocess.Popen([sys.executable, "-c", LOAD, "60"], stdout = subprocess.PIPE,
-                                stderr = subprocess.STDOUT, text = True)
+                                stderr = subprocess.DEVNULL, text = True)
         first = load.stdout.readline().strip()
         obs["load_first_line"] = first
         if first == "READY":
