@@ -127,9 +127,14 @@ jobs:
           & $py -m pip install -q --upgrade pip
           & $py -m pip install -q pytest pytest-asyncio pytest-timeout
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          # A cancelled earlier run of this PR can leave python processes holding DLLs in this venv: stop them.
-          Get-Process -ErrorAction SilentlyContinue | Where-Object { $_.Path -and $_.Path -like "$env:AMD_CI_WORK*" } |
-            Stop-Process -Force -ErrorAction SilentlyContinue
+          # A cancelled earlier run (this PR's or another's on this machine) can leave python processes under
+          # the runner's temp dir holding DLLs or gloo ports. One job runs per runner, so every process there
+          # that started before this job is an orphan: stop and list them.
+          $orphans = @(Get-Process -ErrorAction SilentlyContinue | Where-Object { $_.Id -ne $PID -and $_.Path -and
+            ($_.Path -like "$env:AMD_CI_WORK*" -or $_.Path -like "$env:RUNNER_TEMP*") })
+          $orphans | ForEach-Object { Write-Host "stopping orphan $($_.Id) $($_.Path) started $($_.StartTime)" }
+          $orphans | Stop-Process -Force -ErrorAction SilentlyContinue
+          Write-Host "orphans stopped: $($orphans.Count)"
           Start-Sleep -Seconds 3
           # --windows-rocm-torch: ROCm torch from AMD's multi-arch index, then the gate WITH torch.
           # The gate exits 1 when HIP / gfx1151 is absent: a box without ROCm torch fails, never skips.
