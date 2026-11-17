@@ -235,9 +235,10 @@ def task_hf_fwd(res: dict) -> None:
                     MODEL, dtype = torch.bfloat16, attn_implementation = impl, token = False)
                 break
             except Exception as e:  # noqa: BLE001
-                out[f"load_{cls}_{impl}"] = f"{type(e).__name__}: {str(e)[:200]}"
+                out[f"load_{cls}_{impl}"] = f"{type(e).__name__}: {str(e)[:600]}"
         if model is None:
-            raise RuntimeError(f"no class loaded {MODEL} with {impl}")
+            res["hf_fwd"] = out
+            raise RuntimeError(f"no class loaded {MODEL} with {impl}: {out}")
         out["class"] = type(model).__name__
         model = model.to("cuda").eval()
         with torch.no_grad():
