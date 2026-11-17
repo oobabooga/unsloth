@@ -1,0 +1,7 @@
+diff --git a/studio/backend/tests/data/amd_ci_nov5_marker.txt b/studio/backend/tests/data/amd_ci_nov5_marker.txt
+new file mode 100644
+index 0000000..d5b3a62
+--- /dev/null
++++ b/studio/backend/tests/data/amd_ci_nov5_marker.txt
+@@ -0,0 +1 @@
++AMD CI nov5 measurement head: identical code to the base, re-measures one reference cell.
