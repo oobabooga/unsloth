@@ -48,7 +48,7 @@ try:
     mode = sys.argv[1]
     if mode == "amd_smi":
         import shutil
-        exe = shutil.which("amd-smi") or r"C:\Windows\System32\amd-smi.exe"
+        exe = sys.argv[3] if len(sys.argv) > 3 and sys.argv[3].lower().endswith(".exe") else (shutil.which("amd-smi") or "amd-smi")
         t0 = time.monotonic()
         try:
             r = __import__("subprocess").run([exe, "static", "--json"], capture_output=True, text=True, timeout=60)
@@ -149,7 +149,7 @@ def runner_identity() -> dict:
     return out
 
 
-def safer_token():
+def safer_token(medium: bool = True):
     import ctypes
     from ctypes import wintypes
     adv = ctypes.WinDLL("advapi32", use_last_error = True)
@@ -158,7 +158,24 @@ def safer_token():
         raise OSError(ctypes.get_last_error(), "SaferCreateLevel")
     if not adv.SaferComputeTokenFromLevel(lvl, None, ctypes.byref(tok), 0, None):
         raise OSError(ctypes.get_last_error(), "SaferComputeTokenFromLevel")
+    if medium:
+        _set_medium(adv, tok)
     return tok
+
+
+def _set_medium(adv, tok) -> None:
+    import ctypes
+    from ctypes import wintypes
+
+    class SA(ctypes.Structure):
+        _fields_ = [("Sid", ctypes.c_void_p), ("Attributes", wintypes.DWORD)]
+    sid = ctypes.c_void_p()
+    adv.ConvertStringSidToSidW.argtypes = [wintypes.LPCWSTR, ctypes.POINTER(ctypes.c_void_p)]
+    adv.GetLengthSid.argtypes = [ctypes.c_void_p]
+    adv.ConvertStringSidToSidW("S-1-16-8192", ctypes.byref(sid))
+    label = SA(sid, 0x20)
+    if not adv.SetTokenInformation(tok, 25, ctypes.byref(label), ctypes.sizeof(SA) + adv.GetLengthSid(sid)):
+        raise OSError(ctypes.get_last_error(), "SetTokenInformation(IntegrityLevel)")
 
 
 def restricted_token(medium: bool = True):
@@ -252,7 +269,7 @@ def run_restricted(argv: list[str], timeout_s: float, watcher: Watcher, variant:
     pi = PI()
     cmd = ctypes.create_unicode_buffer(subprocess.list2cmdline(argv))
     t0 = time.monotonic()
-    token = (safer_token() if variant.startswith("safer") else restricted_token(medium = not variant.startswith("high")))
+    token = (safer_token(medium = "medium" in variant) if variant.startswith("safer") else restricted_token(medium = not variant.startswith("high")))
     if not adv.CreateProcessAsUserW(token, None, cmd, None, None, False, 0x08000000,
                                     None, None, ctypes.byref(si), ctypes.byref(pi)):
         return {"spawn_error": ctypes.get_last_error()}
@@ -290,7 +307,7 @@ def main() -> int:
                                capture_output = True, text = True)
             obs.setdefault("icacls_rc", {})[str(d)] = r.returncode
         diag = {}
-        for variant in ("high", "medium", "medium_desk", "safer", "safer_desk"):
+        for variant in ("safer", "safer_medium", "safer_medium_desk"):
             for name, argv in (("cmd", ["cmd.exe", "/c", f"whoami /groups /fo csv > {work / ('diag_' + variant + '.txt')}"]),
                                ("python", [sys.executable, "-c", "print(1)"])):
                 w = Watcher(); w.start()
@@ -304,14 +321,19 @@ def main() -> int:
                 txt = f.read_text(encoding = "utf-8", errors = "replace")
                 diag[f"{variant}/groups"] = [l for l in txt.splitlines() if "Administrators" in l or "Mandatory Label" in l]
         obs["diag"] = diag
-        good = next((v for v in ("medium_desk", "medium", "safer_desk", "safer") if diag.get(f"{v}/python", {}).get("exit_code") == "0x0"), "medium_desk")
+        good = next((v for v in ("safer_medium", "safer_medium_desk") if diag.get(f"{v}/python", {}).get("exit_code") == "0x0"), "safer_medium")
+        r = subprocess.run(["powershell", "-NoProfile", "-Command",
+                            "(Get-Command amd-smi -ErrorAction SilentlyContinue).Source;"
+                            "Get-ChildItem 'C:\\Program Files\\AMD','C:\\Windows\\System32' -Filter amd-smi*.exe -Recurse -ErrorAction SilentlyContinue | Select-Object -First 3 -ExpandProperty FullName"],
+                           capture_output = True, text = True, timeout = 120)
+        obs["amd_smi_found"] = [l.strip() for l in r.stdout.splitlines() if l.strip()]
         obs["variant"] = good
         for mode, timeout_s in (("readings", 240.0), ("amd_smi", 90.0)):
             res = work / f"uac_{args.state}_{mode}.json"
             res.unlink(missing_ok = True)
             w = Watcher(); w.start()
-            run = run_restricted([sys.executable, str(child_py), mode, str(res),
-                                  str(args.checkout / "studio" / "backend")], timeout_s, w, good)
+            extra = (obs.get("amd_smi_found") or ["amd-smi"])[0] if mode == "amd_smi" else str(args.checkout / "studio" / "backend")
+            run = run_restricted([sys.executable, str(child_py), mode, str(res), extra], timeout_s, w, good)
             w.stop.set(); w.join(2)
             run["prompt_processes_anywhere"] = w.anywhere(("consent.exe", "diskpart.exe"))
             run["child"] = json.loads(res.read_text(encoding = "utf-8")) if res.exists() else None
