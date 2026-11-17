@@ -58,6 +58,8 @@ MODELS = {
     "fsdp2_io": "random tiny untied Qwen3 (vocab 1024, hidden 32, 3 layers), native FSDP2 world 1 on the GPU",
     "fsdp2_gen": "random tiny untied Qwen3, native FSDP2 world 1 on the GPU, generate all / block",
     "pauto": "built:llama, torchrun 2 ranks on one GPU, UNSLOTH_PARALLEL=auto",
+    "tphost": "random tiny untied Qwen3 + PEFT LoRA, tensor parallel tp=1 on the GPU, UNSLOTH_TP_EMBED_ON_CPU 1 vs 0",
+    "atree": "trl-internal-testing/tiny-Qwen3ForCausalLM, TRL prefix-trie packed row vs unpacked log-probs (fast backbone)",
     "qwen38_long": "hf-tiny-v2/tiny-random-Qwen4ExpForCausalLM (2052-token packed rows)",
     "dec_mistral": "trl-internal-testing/tiny-MistralForCausalLM-0.1",
     "sft_eos": "trl-internal-testing/tiny-Qwen3ForCausalLM",
@@ -2641,6 +2643,106 @@ def cell_pauto():
         res["rank_tracebacks"] = [r.get("traceback", "")[-1200:] for r in ranks]
 
 
+def cell_tphost():
+    """unsloth #18068: tensor parallel tp=1 on the GPU (one process) over a tiny untied Qwen3 + PEFT LoRA (frozen input
+    embedding), apply_tensor_parallel with UNSLOTH_TP_EMBED_ON_CPU=1 vs =0: whether the host-embedding hooks engage on
+    this device, and 2 SGD steps' losses / first-step grads on vs off (they should be equal)."""
+    import contextlib
+    import io
+    import torch
+    import torch.distributed as dist
+    import transformers
+    from peft import LoraConfig, get_peft_model
+    versions()
+    stage("load")
+    _pg_world1()
+    try:
+        from torch.distributed.device_mesh import init_device_mesh
+        from torch.distributed.tensor import DTensor
+        from unsloth.models import tp_native as tpn
+        res["has_host_input_embedding"] = hasattr(tpn, "_host_input_embedding")
+        mesh = init_device_mesh("cuda", (1,), mesh_dim_names = ("tp",))
+        dev = torch.device("cuda", torch.cuda.current_device())
+
+        def make():
+            config = transformers.Qwen3Config(vocab_size = 1024, hidden_size = 32, intermediate_size = 64, num_hidden_layers = 2,
+                                              num_attention_heads = 4, num_key_value_heads = 2, head_dim = 8, tie_word_embeddings = False)
+            config._attn_implementation = "eager"
+            torch.manual_seed(0)
+            m = transformers.Qwen3ForCausalLM(config).float()
+            torch.manual_seed(1)
+            lora = LoraConfig(r = 4, lora_alpha = 8, target_modules = "all-linear", init_lora_weights = False)
+            return get_peft_model(m, lora).to(dev)
+
+        arms = {}
+        for flag in ("0", "1"):
+            os.environ["UNSLOTH_TP_EMBED_ON_CPU"] = flag
+            stage(f"apply_{flag}")
+            model = make()
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                tpn.apply_tensor_parallel(model, mesh["tp"])
+            embed = model.get_input_embeddings()
+            rec = {"embed_device": str(embed.weight.device),
+                   "offload_hooks": bool(getattr(embed, "_unsloth_offload_hooks_installed", False)),
+                   "cpu_lookup": bool(getattr(embed, "_unsloth_fsdp2_cpu_lookup", False)),
+                   "msg": [ln for ln in buf.getvalue().splitlines() if "input embedding" in ln][:1]}
+            params = [p for p in model.parameters() if p.requires_grad]
+            opt = torch.optim.SGD(params, lr = 0.5)
+            torch.manual_seed(2)
+            ids = torch.randint(0, 1024, (2, 16), device = dev)
+            losses, grads = [], {}
+            for step in range(2):
+                out = model(input_ids = ids, labels = ids, use_cache = False)
+                out.loss.backward()
+                if step == 0:
+                    for n, p in model.named_parameters():
+                        if p.grad is not None:
+                            g = p.grad.full_tensor() if isinstance(p.grad, DTensor) else p.grad
+                            grads[n] = g.detach().float().cpu()
+                opt.step()
+                opt.zero_grad(set_to_none = True)
+                losses.append(float(out.loss))
+            rec["losses"] = losses
+            arms[flag] = (rec, grads)
+        os.environ.pop("UNSLOTH_TP_EMBED_ON_CPU", None)
+        res["arms"] = {k: v[0] for k, v in arms.items()}
+        g0, g1 = arms["0"][1], arms["1"][1]
+        res["grad_names_equal"] = sorted(g0) == sorted(g1)
+        res["max_grad_diff_on_vs_off"] = max((float((g0[n] - g1[n]).abs().max()) for n in g0 if n in g1), default = None)
+        res["max_loss_diff_on_vs_off"] = max(abs(a - b) for a, b in zip(arms["0"][0]["losses"], arms["1"][0]["losses"]))
+        res["engaged_on"] = arms["1"][0]["embed_device"].startswith("cpu")
+        finish_losses(arms["1"][0]["losses"])
+    finally:
+        dist.destroy_process_group()
+
+
+def cell_atree():
+    """unsloth #18070 (PR author's scripts/gpu_async_tree_check.py): a TRL >= 1.17 prefix-trie packed row through a real
+    Unsloth fast backbone (tiny Qwen3 LoRA, fp32) + TRL's fused head on the GPU; packed log-probs vs each sample alone.
+    PASS = this state's arm within 2e-3 of unpacked and the TRL-only arm visibly off. Expected FAIL at the base."""
+    import subprocess
+    import unsloth as _u
+    versions()
+    stage("train")
+    tree = os.path.dirname(os.path.dirname(os.path.abspath(_u.__file__)))
+    script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "gpu_async_tree_check.py")
+    env = dict(os.environ, UNSLOTH_COMPILE_LOCATION = os.path.join(os.path.dirname(os.path.abspath(args.out)), "uc_atree"))
+    try:
+        p = subprocess.run([sys.executable, script, tree], env = env, capture_output = True, text = True, encoding = "utf-8",
+                           errors = "replace", timeout = 1200)
+        rc, out = p.returncode, (p.stdout or "") + "\n--- stderr ---\n" + (p.stderr or "")
+    except subprocess.TimeoutExpired as e:
+        rc, out = "timeout", str(e.stdout or "")
+    res["atree_rc"] = rc
+    keep = ("trl ", "sentinel", "fast backbone", "unique tokens", "HEAD arm", "BASE arm", "VERDICT")
+    res["atree_lines"] = [ln.strip() for ln in out.splitlines() if ln.startswith(keep)]
+    res["atree_verdict"] = next((ln.split()[-1] for ln in res["atree_lines"] if ln.startswith("VERDICT")), None)
+    if rc not in (0, 1):
+        res["atree_tail"] = out[-2500:]
+    res["finite"] = res["atree_verdict"] == "PASS"
+
+
 CELLS = {"hd512_llama": lambda: cell_hd512("llama"), "hd512_gemma4": lambda: cell_hd512("gemma4"),
          "hd512_gemma4_nc": lambda: cell_hd512("gemma4"),
          "bclens": cell_bclens, "bswap": cell_bswap,
@@ -2663,7 +2765,7 @@ CELLS = {"hd512_llama": lambda: cell_hd512("llama"), "hd512_gemma4": lambda: cel
          "pfree_llama": lambda: cell_sft_pack("llama", "pfree"), "pfree_qwen3": lambda: cell_sft_pack("qwen3", "pfree"),
          "sftdef_steps": lambda: cell_sft_pack("llama", "steps"), "sftdef_epoch": lambda: cell_sft_pack("llama", "epoch"),
          "plelens": lambda: cell_bclens("plelens", (37, 91, 150, 203, 64, 177, 119), "float32"),
-         "seqcls": cell_seqcls, "tok_save": cell_tok_save, "fsdp2_io": cell_fsdp2_io, "fsdp2_gen": cell_fsdp2_gen, "pauto": cell_pauto,
+         "seqcls": cell_seqcls, "tok_save": cell_tok_save, "fsdp2_io": cell_fsdp2_io, "fsdp2_gen": cell_fsdp2_gen, "pauto": cell_pauto, "tphost": cell_tphost, "atree": cell_atree,
          "gcnr_qwen3": lambda: cell_gc(True), "gcdef_qwen3": lambda: cell_gc(False),
          "gcnr_gemma3": lambda: cell_gc(True), "gcdef_gemma3": lambda: cell_gc(False), "lora_noac": cell_lora_noac,
          "st_minilm": lambda: cell_st(False), "st_qwen3": lambda: cell_st(True),
