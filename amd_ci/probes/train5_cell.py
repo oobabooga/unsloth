@@ -56,6 +56,7 @@ MODELS = {
     "hd512_gemma4_nc": "built:gemma4-global-hd512 (UNSLOTH_COMPILE_DISABLE=1)",
     "seqcls": "trl-internal-testing/tiny-Qwen3ForCausalLM",
     "fsdp2_io": "random tiny untied Qwen3 (vocab 1024, hidden 32, 3 layers), native FSDP2 world 1 on the GPU",
+    "fsdp2_gen": "random tiny untied Qwen3, native FSDP2 world 1 on the GPU, generate all / block",
     "qwen38_long": "hf-tiny-v2/tiny-random-Qwen4ExpForCausalLM (2052-token packed rows)",
     "dec_mistral": "trl-internal-testing/tiny-MistralForCausalLM-0.1",
     "sft_eos": "trl-internal-testing/tiny-Qwen3ForCausalLM",
@@ -2459,6 +2460,97 @@ def cell_fsdp2_io():
         dist.destroy_process_group()
 
 
+def _pg_world1():
+    """One-process torch.distributed group for GPU FSDP2 cells (RCCL on Linux; gloo + FileStore on Windows)."""
+    import datetime
+    import socket
+    import torch.distributed as dist
+    with socket.socket() as sk:
+        sk.bind(("127.0.0.1", 0))
+        port = sk.getsockname()[1]
+    os.environ.update(MASTER_ADDR = "127.0.0.1", MASTER_PORT = str(port), RANK = "0", WORLD_SIZE = "1", LOCAL_RANK = "0")
+    backend = "cuda:nccl,cpu:gloo" if (dist.is_nccl_available() and os.name != "nt") else "gloo"
+    res["backend"] = backend
+    stage("pg_init")
+    if os.name == "nt":
+        import tempfile
+        from pathlib import Path
+        res["init_method"] = "file"
+        dist.init_process_group(backend, init_method = (Path(tempfile.mkdtemp()) / "pg_store").as_uri(), rank = 0,
+                                world_size = 1, timeout = datetime.timedelta(seconds = 300))
+    else:
+        dist.init_process_group(backend, rank = 0, world_size = 1, timeout = datetime.timedelta(seconds = 300))
+    stage("pg_ok")
+
+
+def cell_fsdp2_gen():
+    """unsloth #18038: native FSDP2 (one process, GPU) on a tiny untied Qwen3, then greedy generate under
+    UNSLOTH_FSDP2_GENERATE_GATHER=all and =block vs the unsharded model. Records what _generate_streams_blocks decided
+    per mode (absent at the base), so the block-streaming path is shown to run or not on this device."""
+    import torch
+    import torch.distributed as dist
+    import transformers
+    versions()
+    stage("load")
+    os.environ["UNSLOTH_FSDP2"] = "1"
+    _pg_world1()
+    try:
+        from unsloth.models import fsdp2_native as native
+        decided = []
+        orig = getattr(native, "_generate_streams_blocks", None)
+        res["has_generate_streams_blocks"] = orig is not None
+        if orig is not None:
+            def spy(*a, **k):
+                out = orig(*a, **k)
+                decided.append(bool(out))
+                return out
+            native._generate_streams_blocks = spy
+
+        def make():
+            config = transformers.Qwen3Config(vocab_size = 1024, hidden_size = 32, intermediate_size = 64, num_hidden_layers = 3,
+                                              num_attention_heads = 4, num_key_value_heads = 2, head_dim = 8, tie_word_embeddings = False)
+            torch.manual_seed(0)
+            m = transformers.Qwen3ForCausalLM(config).float()
+            for name, prm in m.named_parameters():
+                prm.requires_grad_(".mlp." in name)
+            return m
+        dev = torch.device("cuda", torch.cuda.current_device())
+        ref, model = make().to(dev), make().to(dev)
+        stage("shard")
+        native.shard_model(model, native.FSDP2Config(param_dtype = torch.float32, device = "cuda", fit_layout = False))
+        stage("generate")
+        torch.manual_seed(1)
+        ids = torch.randint(0, 1024, (2, 8), device = dev)
+        kw = dict(max_new_tokens = 12, do_sample = False, pad_token_id = 0, eos_token_id = None)
+        with torch.no_grad():
+            want = ref.generate(input_ids = ids, **kw)[:, 8:].tolist()
+        res["ref_tokens"] = want
+        per = {}
+        for mode in ("all", "block"):
+            os.environ["UNSLOTH_FSDP2_GENERATE_GATHER"] = mode
+            n0 = len(decided)
+            try:
+                got = model.generate(input_ids = ids, **kw)[:, 8:].tolist()
+                per[mode] = {"tokens_equal": got == want, "streamed": decided[n0:]}
+            except Exception as e:  # noqa: BLE001
+                per[mode] = {"error": f"{type(e).__name__}: {e}"[:400]}
+        os.environ.pop("UNSLOTH_FSDP2_GENERATE_GATHER", None)
+        res["gen_modes"] = per
+        stage("train")  # the model still trains after generate (params resharded)
+        opt = torch.optim.SGD([q for q in model.parameters() if q.requires_grad], lr = 0.5)
+        losses = []
+        for _ in range(3):
+            x = torch.randint(0, 1024, (2, 16), device = dev)
+            loss = model(input_ids = x, labels = x, use_cache = False).loss
+            loss.backward(); opt.step(); opt.zero_grad(set_to_none = True)
+            losses.append(float(loss))
+        res["losses"] = losses
+        res["finite"] = all(math.isfinite(v) for v in losses) and all("error" not in v for v in per.values())
+        res["peak_alloc_mb"] = round(torch.cuda.max_memory_allocated() / 2**20, 1)
+    finally:
+        dist.destroy_process_group()
+
+
 CELLS = {"hd512_llama": lambda: cell_hd512("llama"), "hd512_gemma4": lambda: cell_hd512("gemma4"),
          "hd512_gemma4_nc": lambda: cell_hd512("gemma4"),
          "bclens": cell_bclens, "bswap": cell_bswap,
@@ -2481,7 +2573,7 @@ CELLS = {"hd512_llama": lambda: cell_hd512("llama"), "hd512_gemma4": lambda: cel
          "pfree_llama": lambda: cell_sft_pack("llama", "pfree"), "pfree_qwen3": lambda: cell_sft_pack("qwen3", "pfree"),
          "sftdef_steps": lambda: cell_sft_pack("llama", "steps"), "sftdef_epoch": lambda: cell_sft_pack("llama", "epoch"),
          "plelens": lambda: cell_bclens("plelens", (37, 91, 150, 203, 64, 177, 119), "float32"),
-         "seqcls": cell_seqcls, "tok_save": cell_tok_save, "fsdp2_io": cell_fsdp2_io,
+         "seqcls": cell_seqcls, "tok_save": cell_tok_save, "fsdp2_io": cell_fsdp2_io, "fsdp2_gen": cell_fsdp2_gen,
          "gcnr_qwen3": lambda: cell_gc(True), "gcdef_qwen3": lambda: cell_gc(False),
          "gcnr_gemma3": lambda: cell_gc(True), "gcdef_gemma3": lambda: cell_gc(False), "lora_noac": cell_lora_noac,
          "st_minilm": lambda: cell_st(False), "st_qwen3": lambda: cell_st(True),

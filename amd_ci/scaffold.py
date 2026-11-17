@@ -321,9 +321,14 @@ def main() -> int:
             raise SystemExit("Windows template has no AMD_CI_PY line in the Test environment step")
         specs = " ".join(f'"{s}"' for s in args.windows_rocm_torch.split())
         step = (
-            "          # A cancelled earlier run of this PR can leave python processes holding DLLs in this venv: stop them.\n"
-            "          Get-Process -ErrorAction SilentlyContinue | Where-Object { $_.Path -and $_.Path -like \"$env:AMD_CI_WORK*\" } |\n"
-            "            Stop-Process -Force -ErrorAction SilentlyContinue\n"
+            "          # A cancelled earlier run (this PR's or another's on this machine) can leave python processes under\n"
+            "          # the runner's temp dir holding DLLs or gloo ports. One job runs per runner, so every process there\n"
+            "          # that started before this job is an orphan: stop and list them.\n"
+            "          $orphans = @(Get-Process -ErrorAction SilentlyContinue | Where-Object { $_.Id -ne $PID -and $_.Path -and\n"
+            "            ($_.Path -like \"$env:AMD_CI_WORK*\" -or $_.Path -like \"$env:RUNNER_TEMP*\") })\n"
+            "          $orphans | ForEach-Object { Write-Host \"stopping orphan $($_.Id) $($_.Path) started $($_.StartTime)\" }\n"
+            "          $orphans | Stop-Process -Force -ErrorAction SilentlyContinue\n"
+            "          Write-Host \"orphans stopped: $($orphans.Count)\"\n"
             "          Start-Sleep -Seconds 3\n"
             "          # --windows-rocm-torch: ROCm torch from AMD's multi-arch index, then the gate WITH torch.\n"
             "          # The gate exits 1 when HIP / gfx1151 is absent: a box without ROCm torch fails, never skips.\n"

@@ -127,9 +127,14 @@ jobs:
           & $py -m pip install -q --upgrade pip
           & $py -m pip install -q pytest pytest-asyncio pytest-timeout
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          # A cancelled earlier run of this PR can leave python processes holding DLLs in this venv: stop them.
-          Get-Process -ErrorAction SilentlyContinue | Where-Object { $_.Path -and $_.Path -like "$env:AMD_CI_WORK*" } |
-            Stop-Process -Force -ErrorAction SilentlyContinue
+          # A cancelled earlier run (this PR's or another's on this machine) can leave python processes under
+          # the runner's temp dir holding DLLs or gloo ports. One job runs per runner, so every process there
+          # that started before this job is an orphan: stop and list them.
+          $orphans = @(Get-Process -ErrorAction SilentlyContinue | Where-Object { $_.Id -ne $PID -and $_.Path -and
+            ($_.Path -like "$env:AMD_CI_WORK*" -or $_.Path -like "$env:RUNNER_TEMP*") })
+          $orphans | ForEach-Object { Write-Host "stopping orphan $($_.Id) $($_.Path) started $($_.StartTime)" }
+          $orphans | Stop-Process -Force -ErrorAction SilentlyContinue
+          Write-Host "orphans stopped: $($orphans.Count)"
           Start-Sleep -Seconds 3
           # --windows-rocm-torch: ROCm torch from AMD's multi-arch index, then the gate WITH torch.
           # The gate exits 1 when HIP / gfx1151 is absent: a box without ROCm torch fails, never skips.
@@ -152,7 +157,7 @@ jobs:
             --probe "$env:GITHUB_WORKSPACE/amd_ci/probes/train5_probe.py" `
             --criteria "$env:GITHUB_WORKSPACE/amd_ci/criteria/train5_rocm.py" `
             --out-dir "$env:AMD_CI_WORK\out\windows" `
-            --python "$env:AMD_CI_PY" -- --unit u18028 --state-repo unsloth --transformers 5.23.0 --trl 1.18.0 --cells env,flm16,flm4,fsdp2_io --companion-repo https://github.com/unslothai/unsloth-zoo --companion-base 73ee2bd675861d61d2c7940689b4ba9f369242fe --companion-head 73ee2bd675861d61d2c7940689b4ba9f369242fe --use-current --tests tests/test_fsdp2_native_io_tables_gloo.py tests/test_sharded_load_bnb4_gloo.py tests/test_frozen_table_fsdp2_gloo.py tests/test_fsdp2_frozen_dtypes_gloo.py tests/test_fsdp2_native_units.py tests/test_fsdp2_native_layout_agree_gloo.py tests/test_fsdp2_native_layout_cpu_split_gloo.py tests/test_fsdp2_native_shared_params_gloo.py tests/test_fsdp2_perf_layout_gloo.py tests/test_fsdp2_recompute_prefetch_gloo.py tests/test_fsdp2_wrap_gloo.py tests/test_fsdp2_native_default_path.py tests/test_fsdp2_native_vllm_shared_frozen_gloo.py tests/test_fsdp2_native_unsharded_block_calls_gloo.py --repeat flm16,flm4,fsdp2_io --tests-from-head tests/test_fsdp2_native_io_tables_gloo.py
+            --python "$env:AMD_CI_PY" -- --unit u18028 --state-repo unsloth --transformers 5.23.0 --trl 1.18.0 --cells env,flm16,flm4 --companion-repo https://github.com/unslothai/unsloth-zoo --companion-base 73ee2bd675861d61d2c7940689b4ba9f369242fe --companion-head 73ee2bd675861d61d2c7940689b4ba9f369242fe --use-current --tests tests/test_fsdp2_native_io_tables_gloo.py tests/test_pp_load_gloo.py --repeat flm16,flm4 --test-timeout 900 --no-rerun-timed-out --tests-from-head tests/test_fsdp2_native_io_tables_gloo.py
           Get-Content "$env:AMD_CI_WORK\out\windows\VERDICT.md" |
             Add-Content -Path $env:GITHUB_STEP_SUMMARY
           # A finding keeps the job green; a NON-result (VOID / INCONCLUSIVE) does not.

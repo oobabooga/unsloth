@@ -245,6 +245,9 @@ def _per_test(py, checkout, test, paths, out_dir: Path, tag, timeout, first):
     return merged
 
 
+NO_RERUN_TIMED_OUT = False  # set from --no-rerun-timed-out in main
+
+
 def run_pytest(py, checkout, tests, paths, out_dir: Path, state, prefix, timeout):
     present = [t for t in tests if (Path(checkout) / t.split("::")[0]).exists()]
     obs: dict = {"selected": present, "absent_at_this_state": [t for t in tests if t not in present], "files": {},
@@ -253,10 +256,12 @@ def run_pytest(py, checkout, tests, paths, out_dir: Path, state, prefix, timeout
         # File tag: no ":" (NTFS and upload-artifact refuse it); the test-ID prefix keeps it.
         tag = f"{state}_{'comp' if prefix else ''}{i}"
         r = pytest_one(py, checkout, t, paths, out_dir, tag, timeout)
-        if r.get("crashed"):
+        if r.get("crashed") and r.get("rc") == "timeout" and NO_RERUN_TIMED_OUT:
+            r["timed_out"] = True  # a hanging file: per-test reruns would each wait out their own timeout
+        elif r.get("crashed"):
             # The file killed its process: one process per test, so the killer is named and the rest still count.
             r = _per_test(py, checkout, t, paths, out_dir, tag, timeout, r)
-        obs["files"][t] = {k: r.get(k) for k in ("rc", "crashed", "stderr_tail", "junit_error", "per_test", "n_ids", "killers")
+        obs["files"][t] = {k: r.get(k) for k in ("rc", "crashed", "timed_out", "stderr_tail", "junit_error", "per_test", "n_ids", "killers")
                            if r.get(k) is not None}
         for k in ("passed", "failed", "errors"):
             obs[k] += [f"{prefix}{x}" for x in r[k]]
@@ -287,8 +292,8 @@ def main() -> int:
     ap.add_argument("--companion-head", default = None)
     ap.add_argument("--cells", default = "env,flm16,flm4,vision,moe")
     ap.add_argument("--tests-from-head", nargs = "*", default = [],
-                    help = "base state only: copy these files (new tests and their helpers) from the head checkout "
-                           "so the base runs the head's test against base code (proves the test fails without the fix)")
+                    help = "base state only: copy these files (new tests and their helpers) from the head checkout when base lacks "
+                           "them (prefix ! to replace a base copy) so the base runs the head's test against base code (proves the test fails without the fix)")
     ap.add_argument("--head-files", type = Path, default = None,
                     help = "JSON list of {repo: unsloth|zoo, path, orig_sha256, content}: written into the HEAD state's "
                          "checkouts (a local fix that is not pushed), after checking the file is still the PR-head version")
@@ -298,7 +303,11 @@ def main() -> int:
     ap.add_argument("--companion-tests", nargs = "*", default = [])
     ap.add_argument("--cell-timeout", type = int, default = 1500)
     ap.add_argument("--test-timeout", type = int, default = 1800)
+    ap.add_argument("--no-rerun-timed-out", action = "store_true",
+                    help = "a test file that hits --test-timeout is recorded as timed out, not rerun one test at a time")
     args = ap.parse_args()
+    global NO_RERUN_TIMED_OUT
+    NO_RERUN_TIMED_OUT = args.no_rerun_timed_out
     if bool(args.venv) == bool(args.use_current):
         raise SystemExit("exactly one of --venv / --use-current")
     args.out = args.out.resolve()
@@ -333,12 +342,14 @@ def main() -> int:
         head_ck = Path(args.checkout).parent / "head"
         copied = []
         for rel in args.tests_from_head:
-            rel = rel.split("::")[0]
+            force = rel.startswith("!")  # "!path": the PR edits a test that base already has; run the head's version at base
+            rel = rel.lstrip("!").split("::")[0]
             src, dst = head_ck / rel, Path(args.checkout) / rel
-            if src.is_file() and not dst.exists():
+            if src.is_file() and (force or not dst.exists()):
+                existed = dst.exists()
                 dst.parent.mkdir(parents = True, exist_ok = True)
                 shutil.copy2(src, dst)
-                copied.append(rel)
+                copied.append(rel + (" (replaced base copy)" if existed else ""))
         obs["tests_copied_from_head"] = copied
     if args.head_files and args.state == "head":
         obs["head_files"] = apply_head_files(args.head_files, {"unsloth": unsloth_ck, "zoo": zoo_ck})
