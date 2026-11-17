@@ -1,0 +1,702 @@
+diff --git a/studio/backend/core/inference/diffusion_autoopt/patches.py b/studio/backend/core/inference/diffusion_autoopt/patches.py
+index 30197c2014..20b0943709 100644
+--- a/studio/backend/core/inference/diffusion_autoopt/patches.py
++++ b/studio/backend/core/inference/diffusion_autoopt/patches.py
+@@ -476,6 +476,20 @@ def _builtin_specs() -> list[PatchSpec]:
+         from ..diffusion_qwenimage21_fused import uninstall
+         uninstall()
+ 
++    def q21_gate_up(ctx: PatchContext) -> Any:
++        from ..diffusion_qwenimage21_gate_up import install
++        return install(
++            ctx.transformer,
++            ctx.logger,
++            offload_active = ctx.offload_active
++            if ctx.denoiser_offloaded is None
++            else bool(ctx.denoiser_offloaded),
++        )
++
++    def q21_gate_up_uninstall() -> None:
++        from ..diffusion_qwenimage21_gate_up import uninstall
++        uninstall()
++
+     def moss_fused(ctx: PatchContext) -> Any:
+         from ..diffusion_moss_fused import install
+         return install(
+@@ -594,6 +608,16 @@ def _builtin_specs() -> list[PatchSpec]:
+             warn = "qwen-image-2.1 convrot sharing",
+             env = "UNSLOTH_DIFFUSION_Q21_CONVROT_FUSED",
+         ),
++        PatchSpec(
++            "qwenimage21_gate_up",
++            STAGE_PRE_COMPILE,
++            q21_gate_up,
++            q21_gate_up_uninstall,
++            group = GROUP_FUSED_DIT,
++            classes = ("QwenImage21Transformer2DModel",),
++            warn = "qwen-image-2.1 fused gate/value GEMM",
++            env = "UNSLOTH_DIFFUSION_Q21_GATE_UP",
++        ),
+         PatchSpec(
+             "moss_fused",
+             STAGE_PRE_COMPILE,
+diff --git a/studio/backend/core/inference/diffusion_qwenimage21_eager.py b/studio/backend/core/inference/diffusion_qwenimage21_eager.py
+index d8a2b6e50f..23d374d8ef 100644
+--- a/studio/backend/core/inference/diffusion_qwenimage21_eager.py
++++ b/studio/backend/core/inference/diffusion_qwenimage21_eager.py
+@@ -73,6 +73,12 @@ def set_state(transformer: Any, state: Optional[str]) -> None:
+             module.__dict__[_ATTR] = state
+ 
+ 
++def _rocm() -> bool:
++    import torch
++
++    return is_rocm_torch(torch)
++
++
+ @functools.lru_cache(maxsize = 1)
+ def _kernel() -> Any:
+     import triton
+@@ -84,8 +90,21 @@ def _kernel() -> Any:
+         from triton.language.extra.cuda import libdevice
+ 
+     # Module globals, which the JIT resolves. *_rn: Triton would otherwise FMA-contract the products eager rounds.
++    # The HIP libdevice has no *_rn: plain ops there, launched with enable_fp_fusion=False (``_launch_options``).
+     global _rsqrt, _mul, _add
+-    _rsqrt, _mul, _add = libdevice.rsqrt, libdevice.mul_rn, libdevice.add_rn
++    if _rocm():
++
++        @triton.jit
++        def _mul_plain(a, b):
++            return a * b
++
++        @triton.jit
++        def _add_plain(a, b):
++            return a + b
++
++        _rsqrt, _mul, _add = libdevice.rsqrt, _mul_plain, _add_plain
++    else:
++        _rsqrt, _mul, _add = libdevice.rsqrt, libdevice.mul_rn, libdevice.add_rn
+ 
+     # n_rows keeps its % 16 hint: runtime it was 2.5% slower at even token counts on A100.
+     @triton.jit(do_not_specialize = ["n_seq"])
+@@ -106,6 +125,7 @@ def _kernel() -> Any:
+         ROWS: tl.constexpr,  # rows per program
+         REAL_FMA_X: tl.constexpr,  # fma pairing of real part
+         IMAG_FMA_X: tl.constexpr,  # fma pairing of imag part
++        PLAIN: tl.constexpr,  # no fma: both products rounded, then added
+     ):
+         pid = tl.program_id(0).to(tl.int64)
+         rows = pid * ROWS + tl.arange(0, ROWS).to(tl.int64)
+@@ -133,14 +153,18 @@ def _kernel() -> Any:
+         fo = s[:, None] * f_stride + 2 * i[None, :]
+         c = tl.load(f_ptr + fo, mask = m, other = 0.0)
+         d = tl.load(f_ptr + fo + 1, mask = m, other = 0.0)
+-        if REAL_FMA_X:
+-            real = tl.fma(a, c, -_mul(bb, d))
+-        else:
+-            real = tl.fma(-bb, d, _mul(a, c))
+-        if IMAG_FMA_X:
+-            imag = tl.fma(bb, c, _mul(a, d))
++        if PLAIN:
++            real = _add(_mul(a, c), -_mul(bb, d))
++            imag = _add(_mul(bb, c), _mul(a, d))
+         else:
+-            imag = tl.fma(a, d, _mul(bb, c))
++            if REAL_FMA_X:
++                real = tl.fma(a, c, -_mul(bb, d))
++            else:
++                real = tl.fma(-bb, d, _mul(a, c))
++            if IMAG_FMA_X:
++                imag = tl.fma(bb, c, _mul(a, d))
++            else:
++                imag = tl.fma(a, d, _mul(bb, c))
+         o = rows[:, None] * (2 * HALF) + 2 * i[None, :]
+         tl.store(out_ptr + o, real.to(dt), mask = m)
+         tl.store(out_ptr + o + 1, imag.to(dt), mask = m)
+@@ -152,17 +176,59 @@ _ROWS = 16
+ _WARPS = 4
+ 
+ 
++def classify_plain(a: Any, b: Any, c: Any, d: Any, real: Any, imag: Any) -> bool:
++    """True when the complex multiply rounds both products before adding (no fma): ``probe_fusion``'s inputs."""
++    import numpy as np
++
++    f32 = np.float32
++    a, b, c, d = (np.asarray(t, dtype = f32) for t in (a, b, c, d))
++    return bool(
++        np.array_equal(np.asarray(real, dtype = f32), a * c - b * d)
++        and np.array_equal(np.asarray(imag, dtype = f32), b * c + a * d)
++    )
++
++
++def _probe_plain(device: Any) -> bool:
++    import torch
++
++    g = torch.Generator(device = "cpu").manual_seed(0)
++    sign = lambda *shape: torch.randint(0, 2, shape, generator = g).float() * 2 - 1  # noqa: E731
++    x = (torch.rand(1, 64, 4, 16, 2, generator = g) + 1) * sign(1, 64, 4, 16, 2)
++    f = (torch.rand(64, 16, 2, generator = g) + 1) * sign(64, 16, 2)
++    out = torch.view_as_real(
++        torch.view_as_complex(x.to(device)) * torch.view_as_complex(f.to(device)).unsqueeze(1)
++    ).cpu()
++    fb = f.unsqueeze(1).expand(64, 4, 16, 2).unsqueeze(0)
++    return classify_plain(
++        x[..., 0].numpy(),
++        x[..., 1].numpy(),
++        fb[..., 0].numpy(),
++        fb[..., 1].numpy(),
++        out[..., 0].numpy(),
++        out[..., 1].numpy(),
++    )
++
++
+ def _fusion(device: Any) -> Optional[tuple]:
++    """(even, odd) fma pairing of this card's complex multiply, ("p", "p") for an unfused one (ROCm only), or None."""
+     index = device.index
+     if index not in _FUSION:
+         from .diffusion_qwenimage21_rope import probe_fusion
+         try:
+-            _FUSION[index] = probe_fusion(device)
++            fusion = probe_fusion(device)
++            if fusion is None and _rocm() and _probe_plain(device):
++                fusion = ("p", "p")
++            _FUSION[index] = fusion
+         except Exception:  # noqa: BLE001 - unknown pairing: keep the stock RoPE
+             _FUSION[index] = None
+     return _FUSION[index]
+ 
+ 
++def _launch_options() -> dict:
++    # ROCm: the plain multiplies and adds above must not be contracted into fma (CUDA uses the *_rn intrinsics).
++    return {"enable_fp_fusion": False} if _rocm() else {}
++
++
+ def _eligible(x: Any, norm: Any, freqs: Any) -> bool:
+     import torch
+ 
+@@ -245,7 +311,9 @@ def _norm_rope(x: Any, norm: Any, freqs: Any) -> Optional[Any]:
+                 ROWS = _ROWS,
+                 REAL_FMA_X = fusion[0] == "x",
+                 IMAG_FMA_X = fusion[1] == "x",
++                PLAIN = fusion[0] == "p",
+                 num_warps = _WARPS,
++                **_launch_options(),
+             )
+     except Exception:  # noqa: BLE001 - a JIT / driver failure: the stock math for the rest of the process
+         _FAILED[0] = True
+@@ -310,7 +378,7 @@ def why_unsupported(mod: Any) -> Optional[str]:
+ def install(logger: Any = None) -> bool:
+     try:
+         import torch
+-        if is_rocm_torch(torch) or not torch.cuda.is_available():
++        if not torch.cuda.is_available():
+             return False
+         from diffusers.models.transformers import transformer_qwenimage21 as mod
+     except Exception:  # noqa: BLE001 - no CUDA, or diffusers without Qwen-Image 2.1
+diff --git a/studio/backend/core/inference/diffusion_qwenimage21_gate_up.py b/studio/backend/core/inference/diffusion_qwenimage21_gate_up.py
+new file mode 100644
+index 0000000000..f3b4bccf7b
+--- /dev/null
++++ b/studio/backend/core/inference/diffusion_qwenimage21_gate_up.py
+@@ -0,0 +1,212 @@
++# SPDX-License-Identifier: AGPL-3.0-only
++# Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
++
++"""Qwen-Image-2.1 SwiGLU gate and value projections as one GEMM on ROCm (gfx1151: one N=24576 GEMM beats two
++N=12288 ones by ~7%). The two Linears become views of the fused weight (no extra memory); resident bf16 / fp16
++nn.Linear only, so LoRA wrappers, quantized weights and offloaded loads keep the stock pair.
++UNSLOTH_DIFFUSION_Q21_GATE_UP: auto (measured arches) | 1 (any ROCm card) | 0 (off)"""
++
++from __future__ import annotations
++
++import os
++import threading
++from typing import Any, Optional
++
++from .diffusion_autoopt.patches import source_digest
++from .rocm_bf16 import is_rocm_torch
++
++GATE_UP_ENV = "UNSLOTH_DIFFUSION_Q21_GATE_UP"
++# gfx1151 measured (Strix Halo, torch 2.11 + ROCm 7.13 hipBLASLt); other ROCm cards need UNSLOTH_DIFFUSION_Q21_GATE_UP=1.
++GATE_UP_ARCHES = frozenset({"gfx1151"})
++
++_MODULE = "diffusers.models.transformers.transformer_qwenimage21"
++_CLASS = "QwenImage21SwiGLUFeedForward"
++# diffusers 0.41.0 / 0.42.1
++_FINGERPRINTS = frozenset({"5658f3c8fa668c6d"})
++_ATTR = "_unsloth_q21_gate_up"
++
++_LOCK = threading.Lock()
++_STATE: dict = {}
++
++
++def _setting() -> str:
++    raw = (os.environ.get(GATE_UP_ENV) or "auto").strip().lower()
++    if raw in ("0", "off", "false", "no"):
++        return "0"
++    if raw in ("1", "on", "true", "yes"):
++        return "1"
++    return "auto"
++
++
++def disabled() -> bool:
++    return _setting() == "0"
++
++
++def arch_ok(device: Any) -> bool:
++    """ROCm only; ``auto`` keeps it to the measured arches."""
++    try:
++        import torch
++
++        setting = _setting()
++        if setting == "0" or not torch.cuda.is_available() or not is_rocm_torch(torch):
++            return False
++        if setting == "1":
++            return True
++        from utils.hardware.hardware import _props_gfx_arch
++
++        index = device.index if device.index is not None else torch.cuda.current_device()
++        return _props_gfx_arch(torch.cuda.get_device_properties(index)) in GATE_UP_ARCHES
++    except Exception:  # noqa: BLE001
++        return False
++
++
++def _stock_digest(cls: Any) -> Optional[str]:
++    return source_digest(cls.__dict__.get("forward"))
++
++
++def _plain_linear(lin: Any) -> bool:
++    import torch
++    from torch import nn
++
++    if type(lin) is not nn.Linear or lin.bias is not None:
++        return False
++    if "forward" in lin.__dict__ or lin._forward_hooks or lin._forward_pre_hooks:
++        return False
++    w = lin.weight
++    return (
++        type(w) is nn.Parameter
++        and w.dtype in (torch.bfloat16, torch.float16)
++        and w.device.type == "cuda"
++        and w.dim() == 2
++    )
++
++
++def _fused_record(module: Any) -> Any:
++    """The fused Linear when its parts are still the ones it was built from, on its device; else None."""
++    rec = module.__dict__.get(_ATTR)
++    if rec is None:
++        return None
++    fused, gate, proj, gate_w, proj_w = rec
++    if module.gate_layer is not gate or module.proj is not proj:
++        return None  # a LoRA wrapper or a swapped Linear: the stock pair honours it
++    if gate.weight is not gate_w or proj.weight is not proj_w:
++        return None
++    if gate_w.device != fused.weight.device:
++        return None
++    return fused
++
++
++def _make_forward(stock: Any) -> Any:
++    def forward(self, hidden_states):
++        fused = _fused_record(self)
++        if fused is None:
++            return stock(self, hidden_states)
++        gate, value = fused(hidden_states).split(
++            (self.gate_layer.out_features, self.proj.out_features), dim = -1
++        )
++        return self.out(self.activation_fn(gate) * value)
++
++    forward.__unsloth_q21_gate_up__ = True
++    forward.__wrapped_stock__ = stock
++    return forward
++
++
++def _patch_class(logger: Any = None) -> bool:
++    try:
++        import importlib
++
++        cls = getattr(importlib.import_module(_MODULE), _CLASS)
++    except Exception:  # noqa: BLE001 - diffusers without Qwen-Image 2.1
++        return False
++    with _LOCK:
++        current = cls.__dict__.get("forward")
++        if getattr(current, "__unsloth_q21_gate_up__", False):
++            return True
++        digest = _stock_digest(cls)
++        if digest not in _FINGERPRINTS:
++            if logger is not None:
++                logger.info("diffusion.q21_gate_up: stock SwiGLU kept: forward differs (%s)", digest)
++            return False
++        _STATE["stock"] = (cls, current)
++        cls.forward = _make_forward(current)
++    return True
++
++
++def _resident_device(root: Any) -> Any:
++    devices = {p.device for p in root.parameters()}
++    if len(devices) != 1:
++        return None
++    dev = next(iter(devices))
++    return dev if dev.type == "cuda" else None
++
++
++def install_modules(root: Any, logger: Any = None) -> int:
++    """Fuse every eligible SwiGLU of ``root`` (weights resident on one ROCm card); returns the fused count."""
++    if disabled():
++        return 0
++    dev = _resident_device(root)
++    if dev is None or not arch_ok(dev) or not _patch_class(logger):
++        return 0
++    from .diffusion_zimage_fused import _fuse_linears, _share_storage
++
++    count = 0
++    with _LOCK:
++        for module in root.modules():
++            if type(module).__name__ != _CLASS:
++                continue
++            if _fused_record(module) is not None:
++                count += 1
++                continue
++            parts = [module.gate_layer, module.proj]
++            if not all(_plain_linear(p) for p in parts):
++                continue
++            if len({(p.weight.dtype, p.weight.device, p.in_features) for p in parts}) != 1:
++                continue
++            fused = _fuse_linears(parts)
++            if fused is None or not _share_storage(fused, parts):
++                continue
++            module.__dict__[_ATTR] = (fused, parts[0], parts[1], parts[0].weight, parts[1].weight)
++            count += 1
++    if logger is not None and count:
++        logger.info(
++            "diffusion.q21_gate_up: SwiGLU gate + value projections run as one GEMM on %d block(s)", count
++        )
++    return count
++
++
++def install(transformer: Any, logger: Any = None, offload_active: bool = False) -> Any:
++    """Before the first compile; deferred to the first forward when the weights are not on the GPU yet."""
++    if disabled():
++        uninstall(transformer)
++        return 0
++    if type(transformer).__name__ != "QwenImage21Transformer2DModel" or offload_active:
++        return 0
++    try:
++        import torch
++
++        if not torch.cuda.is_available() or not is_rocm_torch(torch):
++            return 0
++    except Exception:  # noqa: BLE001
++        return 0
++    if _resident_device(transformer) is not None:
++        return install_modules(transformer, logger)
++    from .diffusion_int8_fused import run_on_first_call
++
++    run_on_first_call(transformer, "q21_gate_up", lambda t: install_modules(t, logger))
++    return None
++
++
++def uninstall(transformer: Any = None) -> None:
++    """Restore the stock SwiGLU forward and drop the fused records (the parts keep their weight views)."""
++    if transformer is not None:
++        from .diffusion_int8_fused import cancel_first_call
++
++        cancel_first_call(transformer, "q21_gate_up")
++        for module in transformer.modules():
++            module.__dict__.pop(_ATTR, None)
++    with _LOCK:
++        stock = _STATE.pop("stock", None)
++        if stock is not None:
++            cls, fn = stock
++            if getattr(cls.__dict__.get("forward"), "__unsloth_q21_gate_up__", False):
++                cls.forward = fn
+diff --git a/studio/backend/tests/test_diffusion_autoopt_core.py b/studio/backend/tests/test_diffusion_autoopt_core.py
+index 7f621d8d44..ffcec57578 100644
+--- a/studio/backend/tests/test_diffusion_autoopt_core.py
++++ b/studio/backend/tests/test_diffusion_autoopt_core.py
+@@ -204,6 +204,7 @@ def test_builtin_specs_cover_every_former_install_site():
+         "qwenimage_real_rope",
+         "zimage_fused",
+         "qwenimage21_fused",
++        "qwenimage21_gate_up",
+         "moss_fused",
+     }
+     # the former hand-kept teardown list is now a registry group
+@@ -213,6 +214,7 @@ def test_builtin_specs_cover_every_former_install_site():
+         "qwenimage_real_rope",
+         "zimage_fused",
+         "qwenimage21_fused",
++        "qwenimage21_gate_up",
+         "moss_fused",
+     }
+     # every spec answers its module's existing kill switch name
+@@ -226,6 +228,7 @@ def test_builtin_specs_cover_every_former_install_site():
+         "qwenimage_real_rope",
+         "zimage_fused",
+         "qwenimage21_fused",
++        "qwenimage21_gate_up",
+         "moss_fused",
+     ]
+ 
+diff --git a/studio/backend/tests/test_diffusion_autoopt_parity.py b/studio/backend/tests/test_diffusion_autoopt_parity.py
+index ca18b7cea1..7ddf600334 100644
+--- a/studio/backend/tests/test_diffusion_autoopt_parity.py
++++ b/studio/backend/tests/test_diffusion_autoopt_parity.py
+@@ -178,6 +178,7 @@ def _teardown() -> None:
+         "diffusion_qwenimage_rope",
+         "diffusion_zimage_fused",
+         "diffusion_qwenimage21_fused",
++        "diffusion_qwenimage21_gate_up",
+         "diffusion_rocm_fused",
+         "diffusion_qwenimage21",
+         "diffusion_qwenimage21_rope",
+diff --git a/studio/backend/tests/test_diffusion_qwenimage21_eager.py b/studio/backend/tests/test_diffusion_qwenimage21_eager.py
+index 3678bf5f32..e6c6c8d82a 100644
+--- a/studio/backend/tests/test_diffusion_qwenimage21_eager.py
++++ b/studio/backend/tests/test_diffusion_qwenimage21_eager.py
+@@ -23,7 +23,7 @@ from test_diffusion_qwenimage21 import _inputs, _model, _render  # noqa: E402
+ def _clean(monkeypatch):
+     monkeypatch.delenv(e.EAGER_FAST_ENV, raising = False)
+     monkeypatch.delenv(q.FAST_STEP_ENV, raising = False)
+-    # Wiring tests on CPU tensors posing as an NVIDIA host: ROCm torch keeps the stock step (test below).
++    # Wiring tests on CPU tensors posing as an NVIDIA host; the ROCm host has its own tests below.
+     monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+     monkeypatch.setattr(e, "is_rocm_torch", lambda _torch: False)
+     q.uninstall()
+@@ -131,14 +131,55 @@ def test_install_is_idempotent_and_uninstall_restores():
+     assert qmod._qwenimage21_prepare_qkv is stock
+ 
+ 
+-def test_rocm_torch_keeps_the_stock_step(monkeypatch):
++def test_rocm_torch_takes_the_eager_step(monkeypatch):
+     monkeypatch.setattr(e, "is_rocm_torch", lambda _torch: True)
+-    stock = qmod._qwenimage21_prepare_qkv
+     m = _model()
+-    assert not e.install()
+-    assert not e.install_for_pipe(types.SimpleNamespace(transformer = m))
+-    assert qmod._qwenimage21_prepare_qkv is stock
+-    assert e._ATTR not in m.__dict__
++    assert e.install()
++    assert e.install_for_pipe(types.SimpleNamespace(transformer = m))
++    assert getattr(qmod._qwenimage21_prepare_qkv, "__unsloth_q21_eager__", False)
++    assert m.__dict__[e._ATTR] == e.EAGER
++    # the modulation broadcast is bit-identical on any backend
++    inp = _valid(_inputs())
++    e.uninstall()
++    ref = _render(_model(), inp)
++    got = _render(_armed(_model()), inp)
++    for a, b in zip(ref, got):
++        assert torch.equal(a, b)
++
++
++def test_rocm_launches_without_fp_contraction(monkeypatch):
++    monkeypatch.setattr(e, "is_rocm_torch", lambda _torch: True)
++    assert e._launch_options() == {"enable_fp_fusion": False}
++    monkeypatch.setattr(e, "is_rocm_torch", lambda _torch: False)
++    assert e._launch_options() == {}
++
++
++def test_classify_plain_needs_both_products_rounded():
++    np = pytest.importorskip("numpy")
++    rng = np.random.default_rng(0)
++    a, b, c, d = (((rng.random(4096) + 1) * rng.choice([-1, 1], 4096)).astype(np.float32) for _ in range(4))
++    real, imag = a * c - b * d, b * c + a * d
++    assert e.classify_plain(a, b, c, d, real, imag)
++    f64 = np.float64
++    fused_real = (a.astype(f64) * c - (b * d).astype(f64)).astype(np.float32)
++    assert not np.array_equal(fused_real, real)
++    assert not e.classify_plain(a, b, c, d, fused_real, imag)
++
++
++@pytest.mark.parametrize("rocm, probed, plain, want", [
++    (True, None, True, ("p", "p")),
++    (True, None, False, None),
++    (False, None, True, None),
++    (True, ("x", "s"), True, ("x", "s")),
++])
++def test_fusion_falls_back_to_plain_only_on_rocm(monkeypatch, rocm, probed, plain, want):
++    from core.inference import diffusion_qwenimage21_rope as rope
++
++    monkeypatch.setattr(e, "is_rocm_torch", lambda _torch: rocm)
++    monkeypatch.setattr(rope, "probe_fusion", lambda device: probed)
++    monkeypatch.setattr(e, "_probe_plain", lambda device: plain)
++    monkeypatch.setattr(e, "_FUSION", {})
++    assert e._fusion(types.SimpleNamespace(index = 0)) == want
+ 
+ 
+ def test_installed_diffusers_matches_the_fingerprints():
+diff --git a/studio/backend/tests/test_diffusion_qwenimage21_gate_up.py b/studio/backend/tests/test_diffusion_qwenimage21_gate_up.py
+new file mode 100644
+index 0000000000..77df8ce3fb
+--- /dev/null
++++ b/studio/backend/tests/test_diffusion_qwenimage21_gate_up.py
+@@ -0,0 +1,167 @@
++# SPDX-License-Identifier: AGPL-3.0-only
++# Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
++
++from __future__ import annotations
++
++import types
++
++import pytest
++
++from core.inference import diffusion_qwenimage21_gate_up as g
++
++torch = pytest.importorskip("torch")
++qmod = pytest.importorskip("diffusers.models.transformers.transformer_qwenimage21")
++nn = torch.nn
++
++
++@pytest.fixture(autouse = True)
++def _clean(monkeypatch):
++    monkeypatch.delenv(g.GATE_UP_ENV, raising = False)
++    g.uninstall()
++    yield
++    g.uninstall()
++
++
++def _ff(dtype = torch.float64, hidden = 32, mlp = 96, seed = 0):
++    torch.manual_seed(seed)
++    return qmod.QwenImage21SwiGLUFeedForward(hidden, mlp).to(dtype)
++
++
++def _root(*ffs):
++    root = nn.Module()
++    root.blocks = nn.ModuleList(ffs)
++    return root
++
++
++@pytest.fixture
++def rocm_host(monkeypatch):
++    """CPU tensors posing as resident weights on a measured ROCm card."""
++    monkeypatch.setattr(g, "_resident_device", lambda root: torch.device("cpu"))
++    monkeypatch.setattr(g, "arch_ok", lambda device: True)
++    # the real check also wants a cuda bf16 / fp16 weight; everything else it checks is kept
++    monkeypatch.setattr(
++        g,
++        "_plain_linear",
++        lambda lin: type(lin) is nn.Linear
++        and lin.bias is None
++        and not lin._forward_hooks
++        and not lin._forward_pre_hooks
++        and "forward" not in lin.__dict__,
++    )
++
++
++def test_installed_diffusers_matches_the_fingerprint():
++    assert g._stock_digest(qmod.QwenImage21SwiGLUFeedForward) in g._FINGERPRINTS
++
++
++def test_fused_forward_matches_stock_and_shares_storage(rocm_host):
++    ff = _ff()
++    x = torch.randn(2, 7, 32, dtype = torch.float64)
++    ref = ff(x)
++    gate_before = ff.gate_layer.weight.detach().clone()
++    proj_before = ff.proj.weight.detach().clone()
++    assert g.install_modules(_root(ff)) == 1
++    fused = ff.__dict__[g._ATTR][0]
++    # the parts are views of the fused weight: same values, no second copy
++    whole = fused.weight
++    assert ff.gate_layer.weight.data_ptr() == whole.data_ptr()
++    assert ff.proj.weight.data_ptr() == whole.data_ptr() + 96 * 32 * whole.element_size()
++    assert torch.equal(ff.gate_layer.weight, gate_before) and torch.equal(ff.proj.weight, proj_before)
++    got = ff(x)
++    torch.testing.assert_close(got, ref, rtol = 0, atol = 1e-12)
++    assert type(ff).forward.__unsloth_q21_gate_up__
++
++
++def test_a_replaced_part_falls_back_to_the_stock_pair(rocm_host):
++    ff = _ff()
++    x = torch.randn(1, 5, 32, dtype = torch.float64)
++    assert g.install_modules(_root(ff)) == 1
++
++    class Wrapped(nn.Module):  # stands in for a LoRA wrapper
++        def __init__(self, base):
++            super().__init__()
++            self.base = base
++
++        def forward(self, h):
++            return self.base(h) * 2
++
++    ff.gate_layer = Wrapped(ff.gate_layer)
++    assert g._fused_record(ff) is None
++    want = ff.out(ff.activation_fn(ff.gate_layer(x)) * ff.proj(x))
++    torch.testing.assert_close(ff(x), want, rtol = 0, atol = 0)
++
++
++def test_a_reassigned_weight_falls_back(rocm_host):
++    ff = _ff()
++    assert g.install_modules(_root(ff)) == 1
++    ff.proj.weight = nn.Parameter(ff.proj.weight.detach().clone() + 1)
++    assert g._fused_record(ff) is None
++
++
++def test_ineligible_parts_stay_stock(rocm_host):
++    ff = _ff()
++    ff.gate_layer.register_forward_hook(lambda *a: None)
++    assert g.install_modules(_root(ff)) == 0
++    assert g._ATTR not in ff.__dict__
++
++
++def test_nvidia_and_cpu_hosts_never_install(monkeypatch):
++    ff = _ff()
++    monkeypatch.setattr(g, "is_rocm_torch", lambda _torch: False)
++    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
++    stock = qmod.QwenImage21SwiGLUFeedForward.__dict__["forward"]
++    # not even the class is patched on NVIDIA
++    fake = type("QwenImage21Transformer2DModel", (nn.Module,), {})()
++    fake.ff = ff
++    assert not g.install(fake)
++    assert qmod.QwenImage21SwiGLUFeedForward.__dict__["forward"] is stock
++    assert g._ATTR not in ff.__dict__
++    assert not g.arch_ok(torch.device("cuda", 0))
++
++
++def test_offloaded_or_other_models_never_install(monkeypatch):
++    monkeypatch.setattr(g, "is_rocm_torch", lambda _torch: True)
++    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
++    fake = type("QwenImage21Transformer2DModel", (nn.Module,), {})()
++    fake.ff = _ff()
++    assert not g.install(fake, offload_active = True)
++    other = type("FluxTransformer2DModel", (nn.Module,), {})()
++    other.ff = _ff()
++    assert not g.install(other)
++
++
++@pytest.mark.parametrize("value, arch, want", [
++    (None, "gfx1151", True),
++    (None, "gfx942", False),
++    ("1", "gfx942", True),
++    ("0", "gfx1151", False),
++])
++def test_arch_gate(monkeypatch, value, arch, want):
++    if value is None:
++        monkeypatch.delenv(g.GATE_UP_ENV, raising = False)
++    else:
++        monkeypatch.setenv(g.GATE_UP_ENV, value)
++    monkeypatch.setattr(g, "is_rocm_torch", lambda _torch: True)
++    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
++    monkeypatch.setattr(torch.cuda, "get_device_properties", lambda index: types.SimpleNamespace(gcnArchName = arch))
++    assert g.arch_ok(torch.device("cuda", 0)) is want
++
++
++def test_kill_switch_uninstalls(monkeypatch, rocm_host):
++    ff = _ff()
++    assert g.install_modules(_root(ff)) == 1
++    monkeypatch.setenv(g.GATE_UP_ENV, "0")
++    fake = type("QwenImage21Transformer2DModel", (nn.Module,), {})()
++    fake.ff = ff
++    assert not g.install(fake)
++    assert g._ATTR not in ff.__dict__
++    assert not getattr(qmod.QwenImage21SwiGLUFeedForward.__dict__["forward"], "__unsloth_q21_gate_up__", False)
++
++
++def test_install_is_idempotent(rocm_host):
++    ff = _ff()
++    root = _root(ff)
++    assert g.install_modules(root) == 1
++    rec = ff.__dict__[g._ATTR]
++    assert g.install_modules(root) == 1
++    assert ff.__dict__[g._ATTR] is rec
