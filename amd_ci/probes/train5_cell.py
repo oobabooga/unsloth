@@ -38,6 +38,8 @@ LLAMA_TOKENIZER = "trl-internal-testing/tiny-MistralForCausalLM-0.1"
 MODELS = {
     "flm16": "built:llama",
     "flm16_gcsave": "built:llama",
+    "fft16": "built:llama",
+    "fft16_sroff": "built:llama",
     "flm4": "built:llama",
     "rl_decode": "built:llama",
     "gcmem": "built:llama",
@@ -1895,6 +1897,58 @@ def cell_sft_pack(kind, mode):
     res["decreasing"] = None
 
 
+def cell_fft16():
+    """unsloth #18192: bf16 full finetuning (tiny built llama, full_finetuning=True, adamw_torch, lr 1e-5, 4 steps):
+    fraction of trainable bf16 weights changed after step 1, stochastic-rounding engagement, losses / peak."""
+    import torch
+    from unsloth import FastLanguageModel
+    from datasets import Dataset
+    from transformers import TrainerCallback
+    from trl import SFTConfig, SFTTrainer
+    versions()
+    stage("load")
+    model, tok = FastLanguageModel.from_pretrained(built_llama(), max_seq_length = 256, dtype = torch.bfloat16,
+                                                   load_in_4bit = False, full_finetuning = True)
+    params = [(n, p) for n, p in model.named_parameters() if p.requires_grad]
+    res["trainable_dtypes"] = sorted({str(p.dtype) for _, p in params})
+    res["trainable_numel"] = sum(p.numel() for _, p in params)
+    snap = {n: p.detach().clone() for n, p in params}
+    tt = getattr(tok, "tokenizer", tok)
+    if tt.pad_token is None:
+        tt.pad_token = tt.eos_token
+    ds = Dataset.from_dict({"text": [d + (tt.eos_token or "") for d in DOCS] * 8})
+    cfg = SFTConfig(output_dir = os.path.join(os.path.dirname(os.path.abspath(args.out)), f"trainer_{args.cell}"),
+                    per_device_train_batch_size = 2, gradient_accumulation_steps = 1, max_steps = 4,
+                    learning_rate = 1e-5, logging_steps = 1, bf16 = True, report_to = "none", seed = 0,
+                    dataset_text_field = "text", max_length = 64, save_strategy = "no", dataset_num_proc = 1,
+                    warmup_steps = 0, lr_scheduler_type = "constant", packing = False, optim = "adamw_torch")
+
+    class _Step1(TrainerCallback):
+        def on_step_end(self, a, state, control, **kw):
+            if state.global_step == 1:
+                changed = total = 0
+                for n, p in params:
+                    changed += int((p.detach() != snap[n]).sum())
+                    total += p.numel()
+                res["frac_changed_step1"] = changed / max(total, 1)
+    stage("train")
+    torch.cuda.reset_peak_memory_stats()
+    trainer = SFTTrainer(model = model, train_dataset = ds, processing_class = tt, args = cfg)
+    trainer.add_callback(_Step1())
+    res["trainer_class"] = type(trainer).__name__
+    trainer.train()
+    peak()
+    opt = trainer.optimizer
+    inner = getattr(opt, "optimizer", opt)
+    res["sr_weights"] = getattr(inner, "_unsloth_bf16_stochastic_rounding", None)
+    res["sr_env"] = os.environ.get("UNSLOTH_BF16_STOCHASTIC_ROUNDING")
+    res["optimizer_class"] = type(inner).__name__
+    logs = [h for h in trainer.state.log_history if "loss" in h]
+    finish_losses([float(h["loss"]) for h in logs])
+    res["decreasing"] = None
+
+
+
 def _dpo_prefix_share_stats():
     """unsloth #18169: shared-prompt preference forward counters (absent at the base)."""
     try:
@@ -3051,7 +3105,7 @@ CELLS = {"hd512_llama": lambda: cell_hd512("llama"), "hd512_gemma4": lambda: cel
          "aol_gemma3_trl": lambda: cell_aol("aol_gemma3_trl", "trl"),
          "aol_qwen25vl_none": lambda: cell_aol("aol_qwen25vl", "trl"),
          "aol_gemma3_none": lambda: cell_aol("aol_gemma3_unsloth", "trl"), "cp_ring_kernels": cell_cp_ring_kernels, "gkd_proc_qwen35": lambda: cell_gkd_proc("gkd_proc_qwen35"),
-         "gkd_proc_gemma3": lambda: cell_gkd_proc("gkd_proc_gemma3"), "mrope_pack": cell_mrope_pack, "orpo_txt": cell_orpo_txt, "grpo_zadv": lambda: cell_grpo_txt(True), "grpo_zadv_zoff": lambda: cell_grpo_txt(True), "orpo_txt_psoff": cell_orpo_txt, "orpo_txt_unwrap": lambda: cell_orpo_txt(True),
+         "gkd_proc_gemma3": lambda: cell_gkd_proc("gkd_proc_gemma3"), "mrope_pack": cell_mrope_pack, "orpo_txt": cell_orpo_txt, "fft16": cell_fft16, "fft16_sroff": cell_fft16, "grpo_zadv": lambda: cell_grpo_txt(True), "grpo_zadv_zoff": lambda: cell_grpo_txt(True), "orpo_txt_psoff": cell_orpo_txt, "orpo_txt_unwrap": lambda: cell_orpo_txt(True),
          "vision_gemma3": cell_vision,
          "pfree_llama": lambda: cell_sft_pack("llama", "pfree"), "pfree_qwen3": lambda: cell_sft_pack("qwen3", "pfree"),
          "sftdef_steps": lambda: cell_sft_pack("llama", "steps"), "sftdef_epoch": lambda: cell_sft_pack("llama", "epoch"),
@@ -3076,6 +3130,8 @@ def main():
         os.environ["UNSLOTH_COMPILE_DISABLE"] = "1"  # diagnostic twin: same cell, no Unsloth compile
     if args.cell.endswith("_zoff"):
         os.environ["UNSLOTH_GRPO_SKIP_ZERO_ADVANTAGE"] = "0"  # zoo #2577 kill switch
+    if args.cell.endswith("_sroff"):
+        os.environ["UNSLOTH_BF16_STOCHASTIC_ROUNDING"] = "0"  # unsloth #18192 kill switch
     if args.cell.endswith("_psoff"):
         os.environ["UNSLOTH_DPO_PREFIX_SHARE"] = "off"  # unsloth #18169 kill switch
     if args.cell == "grpo_vl":
