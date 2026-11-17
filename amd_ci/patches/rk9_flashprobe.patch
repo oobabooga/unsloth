@@ -1,0 +1,79 @@
+diff --git a/studio/backend/core/inference/diffusion_attention.py b/studio/backend/core/inference/diffusion_attention.py
+index 534ba14ab4..618ccb9c27 100644
+--- a/studio/backend/core/inference/diffusion_attention.py
++++ b/studio/backend/core/inference/diffusion_attention.py
+@@ -1961,9 +1961,15 @@ def _run_rocm_flash_probe(device: str, dtype: Any) -> bool:
+         dtype = torch.bfloat16
+     gen = torch.Generator().manual_seed(0)
+     q, k, v = (torch.randn((1, 128, 2, 64), generator = gen).to(device, dtype) for _ in range(3))
++    # The AMD Triton build launches on the current device and asserts the operands sit there: a secondary card probed
++    # from the primary's load scope (the layer split) would otherwise read as unsupported.
++    card = torch.device(device)
++    index = card.index if card.type == "cuda" else None
++    scope = torch.cuda.device(index) if index is not None else contextlib.nullcontext()
+     try:
+-        out = flash_attn_func(q, k, v)
+-        torch.cuda.synchronize(device)
++        with scope:
++            out = flash_attn_func(q, k, v)
++            torch.cuda.synchronize(device)
+     except torch.cuda.OutOfMemoryError:
+         raise
+     except Exception:  # noqa: BLE001 - no kernel for this arch is the answer
+diff --git a/studio/backend/tests/test_diffusion_attention_rocm_flash.py b/studio/backend/tests/test_diffusion_attention_rocm_flash.py
+index 0b1d5d92f3..fd851137d0 100644
+--- a/studio/backend/tests/test_diffusion_attention_rocm_flash.py
++++ b/studio/backend/tests/test_diffusion_attention_rocm_flash.py
+@@ -2518,3 +2518,52 @@ def test_segments_memo_key_follows_eager_verdicts_not_traced_ones(monkeypatch):
+     )  # a traced call's verdict keeps the key (Dynamo restart)
+     att._ROCM_FLASH_BUCKETS[("cuda:0", "torch.bfloat16", 32, 2, 16, 16384, 16384, 1)] = False
+     assert att._rocm_flash_segments_key(args) != k0  # an eager / stored verdict moves it
++
++
++def test_probe_runs_on_the_probed_card_not_the_current_one(monkeypatch):
++    # The layer split probes a secondary card from the primary's load scope; the AMD Triton build asserts its
++    # operands sit on the current device (fwd_prefill: "Kernel will launch on cuda:0, but tensors are on cuda:1").
++    torch = pytest.importorskip("torch")
++    current = [0]
++
++    class _Device:
++        def __init__(self, index):
++            self.index = index
++
++        def __enter__(self):
++            self.prev, current[0] = current[0], self.index
++
++        def __exit__(self, *exc):
++            current[0] = self.prev
++
++    monkeypatch.setattr(torch.cuda, "device", _Device)
++    monkeypatch.setattr(torch.cuda, "current_device", lambda: current[0])
++    monkeypatch.setattr(torch.cuda, "synchronize", lambda *a, **k: None)
++    real_to = torch.Tensor.to
++
++    def to_host(
++        self, *args, **kwargs
++    ):  # CPU host: keep the operands on the CPU, the card index is what is checked
++        args = tuple(a for a in args if not str(a).startswith("cuda"))
++        return real_to(self, *args, **kwargs)
++
++    monkeypatch.setattr(torch.Tensor, "to", to_host)
++    fa = types.ModuleType("flash_attn")
++
++    def flash_attn_func(q, k, v):
++        if torch.cuda.current_device() != 1:
++            raise AssertionError(
++                f"Device mismatch: Kernel will launch on cuda:{torch.cuda.current_device()}, but tensors are on cuda:1"
++            )
++        return (
++            torch.nn.functional.scaled_dot_product_attention(
++                *(t.float().transpose(1, 2) for t in (q, k, v))
++            )
++            .transpose(1, 2)
++            .to(q.dtype)
++        )
++
++    fa.flash_attn_func = flash_attn_func
++    monkeypatch.setitem(sys.modules, "flash_attn", fa)
++    assert att._run_rocm_flash_probe("cuda:1", torch.bfloat16) is True
++    assert current[0] == 0
