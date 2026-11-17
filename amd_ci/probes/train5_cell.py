@@ -57,6 +57,7 @@ MODELS = {
     "seqcls": "trl-internal-testing/tiny-Qwen3ForCausalLM",
     "fsdp2_io": "random tiny untied Qwen3 (vocab 1024, hidden 32, 3 layers), native FSDP2 world 1 on the GPU",
     "fsdp2_gen": "random tiny untied Qwen3, native FSDP2 world 1 on the GPU, generate all / block",
+    "pauto": "built:llama, torchrun 2 ranks on one GPU, UNSLOTH_PARALLEL=auto",
     "qwen38_long": "hf-tiny-v2/tiny-random-Qwen4ExpForCausalLM (2052-token packed rows)",
     "dec_mistral": "trl-internal-testing/tiny-MistralForCausalLM-0.1",
     "sft_eos": "trl-internal-testing/tiny-Qwen3ForCausalLM",
@@ -2551,6 +2552,95 @@ def cell_fsdp2_gen():
         dist.destroy_process_group()
 
 
+_PAUTO_WORKER = r"""
+import json, math, os, sys
+import torch
+import torch.distributed as dist
+out_path, model_dir = sys.argv[1], sys.argv[2]
+rank = int(os.environ["RANK"])
+os.environ["LOCAL_RANK"] = "0"            # two ranks share the one card
+torch.cuda.set_device(0)
+dist.init_process_group("gloo")          # RCCL refuses two ranks on one GPU; Unsloth / accelerate reuse this group
+rec = {"rank": rank, "world": dist.get_world_size()}
+try:
+    import unsloth  # noqa: F401
+    from unsloth import FastLanguageModel
+    from datasets import Dataset
+    from trl import SFTConfig, SFTTrainer
+    model, tok = FastLanguageModel.from_pretrained(model_dir, max_seq_length = 256, dtype = torch.bfloat16, load_in_4bit = False)
+    rec["env_after_load"] = {k: v for k, v in os.environ.items() if k.startswith(("UNSLOTH_PARALLEL", "UNSLOTH_FSDP2"))}
+    model = FastLanguageModel.get_peft_model(model, r = 8, lora_alpha = 16, lora_dropout = 0.0, bias = "none",
+                                             target_modules = ["q_proj", "k_proj", "v_proj", "o_proj"], random_state = 0)
+    tt = getattr(tok, "tokenizer", tok)
+    if tt.pad_token is None:
+        tt.pad_token = tt.eos_token
+    docs = ["the river runs north past the old mill and the green house by the water.",
+            "a small cat sat on the warm stone wall and watched the birds fly over the field."]
+    ds = Dataset.from_dict({"text": [d + (tt.eos_token or "") for d in docs] * 16})
+    cfg = SFTConfig(output_dir = os.path.join(os.path.dirname(out_path), f"pauto_trainer_{rank}"), per_device_train_batch_size = 2,
+                    max_steps = 5, learning_rate = 2e-4, logging_steps = 1, bf16 = True, report_to = "none", seed = 0,
+                    dataset_text_field = "text", max_length = 64, save_strategy = "no", dataset_num_proc = 1,
+                    lr_scheduler_type = "constant", packing = False, ddp_find_unused_parameters = False)
+    trainer = SFTTrainer(model = model, train_dataset = ds, processing_class = tt, args = cfg)
+    trainer.train()
+    rec["wrapped"] = type(trainer.model_wrapped).__name__
+    rec["losses"] = [float(h["loss"]) for h in trainer.state.log_history if "loss" in h]
+    rec["ok"] = bool(rec["losses"]) and all(math.isfinite(x) for x in rec["losses"])
+except Exception as e:
+    import traceback
+    rec["error"] = f"{type(e).__name__}: {e}"[:1500]
+    rec["traceback"] = traceback.format_exc()[-3000:]
+with open(f"{out_path}.rank{rank}.json", "w", encoding = "utf-8") as fh:
+    json.dump(rec, fh, default = str)
+dist.destroy_process_group()
+"""
+
+
+def cell_pauto():
+    """unsloth #18061: torchrun 2 ranks on the one GPU (gloo group, both ranks on device 0) with UNSLOTH_PARALLEL=auto,
+    tiny Llama LoRA SFT 5 steps. Records auto's decision line (rank 0 stdout), the resolved env, the Trainer wrapper and
+    both ranks' losses. Base has no `auto` value."""
+    import subprocess
+    versions()
+    stage("load")
+    model_dir = built_llama()
+    work = os.path.join(os.path.dirname(os.path.abspath(args.out)), "pauto")
+    os.makedirs(work, exist_ok = True)
+    worker = os.path.join(work, "pauto_worker.py")
+    with open(worker, "w", encoding = "utf-8") as fh:
+        fh.write(_PAUTO_WORKER)
+    rec_base = os.path.join(work, "rec")
+    env = dict(os.environ, UNSLOTH_PARALLEL = "auto", OMP_NUM_THREADS = "2")
+    for k in ("UNSLOTH_FSDP2", "UNSLOTH_PARALLEL_AUTO_RESOLVED"):
+        env.pop(k, None)
+    stage("train")
+    try:
+        p = subprocess.run([sys.executable, "-m", "torch.distributed.run", "--standalone", "--nproc_per_node", "2", worker,
+                            rec_base, model_dir], env = env, capture_output = True, text = True, encoding = "utf-8",
+                           errors = "replace", timeout = 1200)
+        rc, out = p.returncode, (p.stdout or "") + "\n--- stderr ---\n" + (p.stderr or "")
+    except subprocess.TimeoutExpired as e:
+        rc, out = "timeout", str(e.stdout or "")[-4000:]
+    with open(os.path.join(work, "torchrun.log"), "w", encoding = "utf-8") as fh:
+        fh.write(out)
+    res["torchrun_rc"] = rc
+    res["decision_line"] = [ln.strip() for ln in out.splitlines() if "UNSLOTH_PARALLEL=auto picked" in ln][:2]
+    ranks = []
+    for r in (0, 1):
+        f = f"{rec_base}.rank{r}.json"
+        if os.path.exists(f):
+            with open(f, encoding = "utf-8") as fh:
+                ranks.append(json.load(fh))
+    res["ranks"] = [{k: v for k, v in r.items() if k != "traceback"} for r in ranks]
+    if ranks and ranks[0].get("losses"):
+        finish_losses(ranks[0]["losses"])
+    res["finite"] = rc == 0 and len(ranks) == 2 and all(r.get("ok") for r in ranks)
+    if not res["finite"]:
+        res["torchrun_tail"] = out[-2500:]
+        res["rank_errors"] = [r.get("error") for r in ranks]
+        res["rank_tracebacks"] = [r.get("traceback", "")[-1200:] for r in ranks]
+
+
 CELLS = {"hd512_llama": lambda: cell_hd512("llama"), "hd512_gemma4": lambda: cell_hd512("gemma4"),
          "hd512_gemma4_nc": lambda: cell_hd512("gemma4"),
          "bclens": cell_bclens, "bswap": cell_bswap,
@@ -2573,7 +2663,7 @@ CELLS = {"hd512_llama": lambda: cell_hd512("llama"), "hd512_gemma4": lambda: cel
          "pfree_llama": lambda: cell_sft_pack("llama", "pfree"), "pfree_qwen3": lambda: cell_sft_pack("qwen3", "pfree"),
          "sftdef_steps": lambda: cell_sft_pack("llama", "steps"), "sftdef_epoch": lambda: cell_sft_pack("llama", "epoch"),
          "plelens": lambda: cell_bclens("plelens", (37, 91, 150, 203, 64, 177, 119), "float32"),
-         "seqcls": cell_seqcls, "tok_save": cell_tok_save, "fsdp2_io": cell_fsdp2_io, "fsdp2_gen": cell_fsdp2_gen,
+         "seqcls": cell_seqcls, "tok_save": cell_tok_save, "fsdp2_io": cell_fsdp2_io, "fsdp2_gen": cell_fsdp2_gen, "pauto": cell_pauto,
          "gcnr_qwen3": lambda: cell_gc(True), "gcdef_qwen3": lambda: cell_gc(False),
          "gcnr_gemma3": lambda: cell_gc(True), "gcdef_gemma3": lambda: cell_gc(False), "lora_noac": cell_lora_noac,
          "st_minilm": lambda: cell_st(False), "st_qwen3": lambda: cell_st(True),

@@ -289,7 +289,9 @@ def push(ticket: dict) -> bool:
             subprocess.run(git + ["checkout", "-q", "-b", ticket["branch"]], check = True, timeout = 60)
             subprocess.run(git + ["add", "-A"], check = True, timeout = 120)
             subprocess.run(git + ["commit", "-q", "-m", f"AMD CI {ticket['branch']}"], check = True, timeout = 120)
-        elif ticket.get("pushes", 0):
+        else:
+            # Always a new commit: a re-submitted dir whose HEAD is already on the remote would push nothing,
+            # start no run, and hold its slot until NO_RUN_H expires it.
             subprocess.run(git + ["commit", "-q", "--allow-empty", "-m", "Rerun from the AMD CI queue"],
                            check = True, timeout = 120)
         p = subprocess.run(git + ["push", "-q", ticket.get("remote", REMOTE), f"HEAD:refs/heads/{ticket['branch']}"],
