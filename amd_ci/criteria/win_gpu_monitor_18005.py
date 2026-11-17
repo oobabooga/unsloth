@@ -27,8 +27,10 @@ def gates(obs: dict) -> list[tuple[str, bool, str]]:
     out.append(("HIP torch on gfx1151", all(v.get("hip") and str(v.get("arch", "")).startswith("gfx1151")
                                             for v in st.values()),
                 ", ".join(f"{n}: torch={v.get('torch')} hip={v.get('hip')} arch={v.get('arch')}" for n, v in st.items())))
-    out.append(("the HIP load ran", all((v.get("load_ops") or 0) > 0 for v in st.values()),
-                ", ".join(f"{n}: ops={v.get('load_ops')}" for n, v in st.items())))
+    out.append(("the HIP load ran through every sample",
+                all((v.get("load_ops") or 0) > 0 and v.get("load_alive_after_sampling") for v in st.values()),
+                ", ".join(f"{n}: ops={v.get('load_ops')} alive={v.get('load_alive_after_sampling')}"
+                          for n, v in st.items())))
     out.append(("independent counter saw the load (busiest type >= 50 %)",
                 all((v.get("load_raw_busiest_median") or 0) >= 50 for v in st.values()),
                 ", ".join(f"{n}: busiest={v.get('load_raw_busiest_median')} 3d={v.get('load_raw_3d_median')}"

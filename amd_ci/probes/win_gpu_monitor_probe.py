@@ -137,14 +137,16 @@ def main() -> int:
         obs["all_engines_query_s"] = all_engines_seconds()
         obs["idle"] = sample(hw, luid, 3, 4.0)
         # stderr apart: a torch warning ahead of READY must not read as a failed start.
-        load = subprocess.Popen([sys.executable, "-c", LOAD, "60"], stdout = subprocess.PIPE,
+        load = subprocess.Popen([sys.executable, "-c", LOAD, "150"], stdout = subprocess.PIPE,
                                 stderr = subprocess.DEVNULL, text = True)
         first = load.stdout.readline().strip()
         obs["load_first_line"] = first
         if first == "READY":
             time.sleep(8.0)
+            # 6 samples of ~13 s each must all fall inside the 150 s load.
             obs["load"] = sample(hw, luid, 6, 4.0)
-        rest = load.communicate(timeout = 120)[0]
+            obs["load_alive_after_sampling"] = load.poll() is None
+        rest = load.communicate(timeout = 300)[0]
         obs["load_tail"] = rest[-400:]
         obs["load_ops"] = next((int(x.split()[1]) for x in rest.splitlines() if x.startswith("OPS")), 0)
         obs["load_rc"] = load.returncode
