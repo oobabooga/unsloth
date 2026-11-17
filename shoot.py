@@ -25,12 +25,14 @@ PROMPT = (
     "with a bridge or a pond, and lots of trees (at least 100) in varied greens, plus bushes, rocks and flowers. "
     "Use one self-contained HTML file with three.js r128 and OrbitControls from a CDN, size the renderer from "
     "window.innerWidth and window.innerHeight and update it correctly on resize, frame the camera so the whole "
-    "kingdom fills the view at a 3/4 angle, and keep any on-screen text small in a corner."
+    "kingdom fills the view at a 3/4 angle, and keep any on-screen text small in a corner. Build every structure "
+    "and tree from many small voxel cubes, never from single large boxes, and keep the whole kingdom on one "
+    "connected island of terrain."
 )
 W, H = 1440, 900
 ERRORS = []
 BENIGN = ("localStorage", "Failed to load resource")
-TRIES = 3
+TRIES = 4
 
 
 def call(method, path, body = None, token = None, timeout = 60):
@@ -346,12 +348,19 @@ def measure(page, path):
             if min(sum(abs(c[i] - r[i]) for i in range(3)) for r in refs) > 40:
                 xs.append(x); ys.append(y); n += 1
     cov = n / (sw * sh)
+    fam = {}
+    for y in range(sh):
+        for x in range(sw):
+            c = px[x, y]
+            k = (c[0] // 40, c[1] // 40, c[2] // 40)
+            fam[k] = fam.get(k, 0) + 1
+    rich = sum(1 for v in fam.values() if v > sw * sh * 0.003)
     if n < 50:
-        return {"cov": cov, "black": black / (sw * sh), "box": None}
+        return {"cov": cov, "black": black / (sw * sh), "box": None, "rich": rich}
     xs.sort(); ys.sort()
     q = lambda v, f: v[min(len(v) - 1, int(len(v) * f))]
     box = (q(xs, 0.02) / sw, q(ys, 0.02) / sh, q(xs, 0.98) / sw, q(ys, 0.98) / sh)
-    return {"cov": cov, "black": black / (sw * sh), "box": box}
+    return {"cov": cov, "black": black / (sw * sh), "box": box, "rich": rich}
 
 
 def frame_scene(page, tag):
@@ -426,7 +435,9 @@ def present(page, tag):
         st = frame_state(page)
         has_canvas = any(x.get("canvas") for x in st.get("inner", []))
         log(tag, f"t+{time.time() - t1:.0f}s canvas={has_canvas} flat={flat:.2f} buckets={spread}")
-        if has_canvas and flat < 0.45 and spread > 60:
+        texts = " ".join(x.get("text", "") for x in st.get("inner", [])).lower()
+        loading = any(w in texts for w in ("loading", "building", "generating", "%"))
+        if has_canvas and spread > 50 and not loading and measure(page, OUT / f"{tag}-measure.png")["cov"] > 0.08:
             ok = True
             break
     page.wait_for_timeout(5000)  # let title cards fade
@@ -441,8 +452,8 @@ def present(page, tag):
         errs.append("banner: " + " ".join(banner.first.locator("xpath=..").inner_text().split())[:200])
     m = measure(page, OUT / f"{tag}-measure.png")
     clean = ok and not errs and m["black"] < 0.02
-    log(tag, f"CHECK rendered={ok} errors={errs[:3]} black={m['black']:.3f} cov={m['cov']:.2f} clean={clean}")
-    return {"ok": ok, "clean": clean, "errs": errs, "cov": m["cov"]}
+    log(tag, f"CHECK rendered={ok} errors={errs[:3]} black={m['black']:.3f} cov={m['cov']:.2f} rich={m['rich']} clean={clean}")
+    return {"ok": ok, "clean": clean, "errs": errs, "cov": m["cov"], "rich": m["rich"]}
 
 
 def scroll_chat_end(page):
@@ -497,12 +508,16 @@ def attempt(page, n):
     r = present(page, tag)
     if not r or not r["clean"]:
         shot(page, f"{tag}-rejected")
+        try:
+            page.locator("iframe").last.screenshot(path = str(OUT / f"{tag}-rejected-canvas.png"), timeout = 60000)
+        except Exception:
+            pass
         return {"clean": False, **(r or {})}
     view, m = pick_view(page, tag)
     scroll_chat_end(page)
     park_mouse(page)
     shot(page, f"{tag}-candidate")
-    return {"clean": True, "cov": m["cov"], "view": view}
+    return {"clean": True, "cov": m["cov"], "rich": m.get("rich", r["rich"]), "view": view}
 
 
 def final_shots(page, title, view):
@@ -616,7 +631,7 @@ def main():
                     delete_threads([t["id"] for t in new])
             good = False
             if results:
-                best = max(results, key = lambda k: results[k][0]["cov"])
+                best = max(results, key = lambda k: (results[k][0]["rich"], results[k][0]["cov"]))
                 log("BEST", best, json.dumps(results[best][0]))
                 delete_threads([t["id"] for t in threads() if t["id"] != best])
                 good = final_shots(page, results[best][1], results[best][0]["view"])
