@@ -1,4 +1,4 @@
-name: AMD DevLab NPU blog stills, voxel kingdom (main b48ca2e + #18059)
+name: AMD DevLab NPU blog stills, voxel kingdom (main 4ef06c9 + #18107 + #18196)
 
 on:
   push:
@@ -11,8 +11,8 @@ jobs:
     runs-on: [self-hosted, Linux, strix-halo, devlab-dispatch]
     timeout-minutes: 240
     env:
-      BASE_SHA: b48ca2e430ca567f917684ee710984e283d7de45
-      STACK_SHA: 7ceb567445d524855a5662099ddadda5854c8c7c
+      BASE_SHA: 4ef06c9992eca6bc5d560bb8d1666e5995a04d44
+      STACK_SHA: 7ca16ae8f610f838a6598c6624fbcaeda31f4e03
       MODEL: qwen3.6-moe-35b-a3b-FLM
       NEW_NAME: Qwen3.6-35B-A3B-NPU2
     steps:
@@ -38,12 +38,12 @@ jobs:
           git clone -q https://github.com/unslothai/unsloth.git "$W/src"
           cd "$W/src"
           git checkout -q "$BASE_SHA"
-          git fetch -q "$RUNNER_TEMP/stack.bundle" npu-voxel-stack
+          git fetch -q "$RUNNER_TEMP/stack.bundle" npu-voxel-stack-3
           git checkout -q FETCH_HEAD
           test "$(git rev-parse HEAD)" = "$STACK_SHA"
           git log -1 --format='installing %H %s'
           git log --format='%P' --first-parent "$BASE_SHA..HEAD" | awk '{print "merged PR head " $2}'
-          echo "skipped (conflicts with #18059 in composer-model-picker.tsx): #17636"
+          echo "#18107 conflict with main resolved locally in composer-model-picker.tsx, picker-model.ts and its test"
           UNSLOTH_SKIP_AUTOSTART=1 bash install.sh --local --no-rollback > "$W/install.log" 2>&1 || { tail -150 "$W/install.log"; exit 1; }
           tail -5 "$W/install.log"
 

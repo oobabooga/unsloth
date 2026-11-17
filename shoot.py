@@ -27,7 +27,8 @@ PROMPT = (
     "window.innerWidth and window.innerHeight and update it correctly on resize, frame the camera so the whole "
     "kingdom fills the view at a 3/4 angle, and keep any on-screen text small in a corner. Build every structure "
     "and tree from many small voxel cubes, never from single large boxes, and keep the whole kingdom on one "
-    "connected island of terrain."
+    "connected island of terrain. Keep it light enough to run smoothly in a browser tab: merge voxels "
+    "per colour with InstancedMesh and stay under about 150,000 voxels in total."
 )
 W, H = 1440, 900
 ERRORS = []
@@ -604,9 +605,20 @@ def main():
         log("browser", kw, "software GL" if software else "GPU GL", "scale", dsf)
         ctx = browser.new_context(viewport = {"width": W, "height": H}, device_scale_factor = dsf, color_scheme = "light")
         ctx.add_init_script(seed())
-        page = ctx.new_page()
-        page.on("console", lambda m: m.type in ("error", "warning") and log("console", m.type, m.text[:200]))
-        page.on("pageerror", lambda e: (ERRORS.append(str(e)), log("pageerror", str(e)[:300])))
+        def fresh(old = None):
+            # a generated page can exhaust the renderer; every try starts in a new tab
+            if old is not None:
+                try:
+                    old.close()
+                except Exception:
+                    pass
+            pg = ctx.new_page()
+            pg.on("console", lambda m: m.type in ("error", "warning") and log("console", m.type, m.text[:200]))
+            pg.on("pageerror", lambda e: (ERRORS.append(str(e)), log("pageerror", str(e)[:300])))
+            pg.on("crash", lambda *_: log("PAGE CRASHED"))
+            return pg
+
+        page = fresh()
         try:
             try:
                 network_setting(page)
@@ -618,6 +630,8 @@ def main():
             for n in range(1, TRIES + 1):
                 before = {t["id"] for t in threads()}
                 try:
+                    if n > 1:
+                        page = fresh(page)
                     r = attempt(page, n)
                 except Exception as exc:
                     log(f"try{n}", "FAILED", type(exc).__name__, str(exc)[:400])
@@ -634,6 +648,7 @@ def main():
                 best = max(results, key = lambda k: (results[k][0]["rich"], results[k][0]["cov"]))
                 log("BEST", best, json.dumps(results[best][0]))
                 delete_threads([t["id"] for t in threads() if t["id"] != best])
+                page = fresh(page)
                 good = final_shots(page, results[best][1], results[best][0]["view"])
             left = threads()
             log("RECENTS", json.dumps([[t["id"], t.get("title")] for t in left]))
