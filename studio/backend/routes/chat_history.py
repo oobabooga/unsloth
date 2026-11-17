@@ -606,6 +606,9 @@ class ChatSettingsPayload(BaseModel):
     customPresets: Optional[list[ChatPreset]] = None
     activePreset: Optional[str] = None
     activePresetSource: Optional[Literal["builtin-default", "custom", "modified"]] = None
+    presetEditedKeys: Optional[
+        dict[Literal["temperature", "topP", "topK", "minP", "presencePenalty", "maxTokens"], bool]
+    ] = None
     autoTitle: Optional[bool] = None
     reasoningEffort: Optional[
         Literal["none", "minimal", "low", "medium", "high", "max", "xhigh"]
