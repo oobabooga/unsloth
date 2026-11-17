@@ -229,13 +229,20 @@ def task_hf_fwd(res: dict) -> None:
     logits = {}
     for impl in ("eager", "sdpa"):
         model = None
+        # transformers 5.23 refuses sdpa for Gemma4AudioModel as a whole-model string; the text tower (the
+        # head-512 global layers under test) takes it per sub-config, with the audio / vision towers on eager.
+        per_tower = {"text_config": impl, "vision_config": "eager", "audio_config": "eager"}
         for cls in ("AutoModelForCausalLM", "AutoModelForImageTextToText"):
-            try:
-                model = getattr(transformers, cls).from_pretrained(
-                    MODEL, dtype = torch.bfloat16, attn_implementation = impl, token = False)
+            for label, attn in (("str", impl), ("text_only", per_tower)):
+                try:
+                    model = getattr(transformers, cls).from_pretrained(
+                        MODEL, dtype = torch.bfloat16, attn_implementation = attn, token = False)
+                    out["attn_implementation"] = attn
+                    break
+                except Exception as e:  # noqa: BLE001
+                    out[f"load_{cls}_{impl}_{label}"] = f"{type(e).__name__}: {str(e)[:600]}"
+            if model is not None:
                 break
-            except Exception as e:  # noqa: BLE001
-                out[f"load_{cls}_{impl}"] = f"{type(e).__name__}: {str(e)[:600]}"
         if model is None:
             res["hf_fwd"] = out
             raise RuntimeError(f"no class loaded {MODEL} with {impl}: {out}")
