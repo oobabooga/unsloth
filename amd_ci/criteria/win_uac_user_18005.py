@@ -85,5 +85,9 @@ def head_is_worse(base, head):
     utils = [u for u in c.get("util_parent_luid") or [] if u is not None]
     if not utils or max(utils) < 50:
         return True, f"head utilization {c.get('util_parent_luid')} misses the load the counter saw"
+    # End to end: the monitor payload itself, which needs the LUID the poll resolves on its own.
+    pay = [p for p in c.get("payload") or [] if p.get("gpu_utilization_pct") is not None]
+    if not pay or max(p["gpu_utilization_pct"] for p in pay) < 50 or not any(p.get("temperature_c") for p in pay):
+        return True, f"head monitor payload as a standard user: {c.get('payload')} (child LUID {c.get('luid')})"
     return False, (f"standard user under load: util {c.get('util_parent_luid')}, temp {c.get('temp_parent_luid')}, "
                    f"started {sorted(set(r.get('spawned') or []))}, no prompt, no elevation error")
