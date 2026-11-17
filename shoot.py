@@ -27,13 +27,15 @@ PROMPT = (
     "window.innerWidth and window.innerHeight and update it correctly on resize, frame the camera so the whole "
     "kingdom fills the view at a 3/4 angle, and keep any on-screen text small in a corner. Build every structure "
     "and tree from many small voxel cubes, never from single large boxes, and keep the whole kingdom on one "
-    "connected island of terrain. Keep it light enough to run smoothly in a browser tab: merge voxels "
-    "per colour with InstancedMesh and stay under about 150,000 voxels in total."
+    "connected island of terrain. Voxels must touch with no gaps (cube size equal to the grid spacing) so the "
+    "ground, walls and roofs read as solid surfaces, and give every building a clear shape with walls, a roof "
+    "and a door. Keep it light enough for a browser tab: one InstancedMesh per colour, only the top layer of "
+    "ground, and under about 200,000 voxels in total."
 )
 W, H = 1440, 900
 ERRORS = []
 BENIGN = ("localStorage", "Failed to load resource")
-TRIES = 4
+TRIES = 6
 
 
 def call(method, path, body = None, token = None, timeout = 60):
@@ -430,6 +432,9 @@ def present(page, tag):
     t1 = time.time()
     while time.time() - t1 < 300:
         page.wait_for_timeout(8000)
+        if any(not any(b in e for b in BENIGN) for e in ERRORS[e0:]):
+            log(tag, "the page threw; not waiting further")
+            break
         probe = OUT / f"{tag}-canvas-probe.png"
         page.locator("iframe").last.screenshot(path = str(probe), timeout = 180000)
         flat, spread = flat_share(probe), colour_spread(probe)
@@ -517,7 +522,13 @@ def attempt(page, n):
     view, m = pick_view(page, tag)
     scroll_chat_end(page)
     park_mouse(page)
-    shot(page, f"{tag}-candidate")
+    shot(page, f"{tag}-1-final")
+    page.locator("iframe").last.screenshot(path = str(OUT / f"{tag}-2-closeup.png"), timeout = 180000)
+    drag(page, 45, 0)
+    frame_scene(page, f"{tag}-b")
+    scroll_chat_end(page)
+    park_mouse(page)
+    shot(page, f"{tag}-1b-alt")
     return {"clean": True, "cov": m["cov"], "rich": m.get("rich", r["rich"]), "view": view}
 
 
