@@ -580,6 +580,44 @@ def attempt(page, n):
     return {"clean": True, "cov": m["cov"], "rich": m.get("rich", r["rich"]), "view": view}
 
 
+# Inside the preview iframe only: real time until __arm(), then time moves only on __step(ms), so a
+# recording of the whole UI gets evenly spaced frames however slow each screenshot is.
+FRAME_CLOCK = """(() => { if (window.top === window) return;
+  const rr = window.requestAnimationFrame.bind(window), rn = performance.now.bind(performance), rd = Date.now;
+  let armed = false, t = 0, d0 = 0, q = [];
+  performance.now = () => armed ? t : rn();
+  Date.now = () => armed ? d0 + t : rd();
+  window.requestAnimationFrame = cb => armed ? (q.push(cb), q.length) : rr(cb);
+  window.__arm = () => { t = rn(); d0 = rd() - t; armed = true; };
+  window.__step = ms => { t += ms; const run = q; q = []; run.forEach(cb => { try { cb(t); } catch (e) {} }); };
+})();"""
+
+
+def record_ui(page, seconds = 8, fps = 30, warmup = 1.5):
+    """Frames of the whole page while the preview animates on a fixed clock -> OUT/ui-rec/f0000.jpg..."""
+    fr = None
+    for f in page.frames[1:]:
+        try:
+            if f.evaluate("typeof window.__arm === 'function' && !!document.querySelector('canvas')"):
+                fr = f
+        except Exception:
+            pass
+    if fr is None:
+        log("record_ui: no preview frame with a canvas")
+        return
+    rec = OUT / "ui-rec"
+    rec.mkdir(exist_ok = True)
+    fr.evaluate("__arm()")
+    dt = 1000 / fps
+    for _ in range(int(warmup * fps)):
+        fr.evaluate(f"__step({dt})")
+    t0 = time.time()
+    for i in range(int(seconds * fps)):
+        fr.evaluate(f"__step({dt})")
+        page.screenshot(path = str(rec / f"f{i:04d}.jpg"), type = "jpeg", quality = 94, scale = "device")
+    log("record_ui", int(seconds * fps), "frames", f"in {time.time() - t0:.0f}s")
+
+
 def final_shots(page, title, view):
     page.goto(f"{BASE}/chat")
     page.wait_for_timeout(3000)
@@ -600,6 +638,10 @@ def final_shots(page, title, view):
     shot(page, "1-final-chat-and-kingdom")
     page.locator("iframe").last.screenshot(path = str(OUT / "2-canvas-closeup.png"), timeout = 180000)
     log("shot 2-canvas-closeup", f"cov={m['cov']:.2f}")
+    try:
+        record_ui(page)
+    except Exception as exc:
+        log("record_ui failed", type(exc).__name__, str(exc)[:300])
     drag(page, 45, 0)
     frame_scene(page, "final-b")
     scroll_chat_end(page)
@@ -664,6 +706,7 @@ def main():
         log("browser", kw, "software GL" if software else "GPU GL", "scale", dsf)
         ctx = browser.new_context(viewport = {"width": W, "height": H}, device_scale_factor = dsf, color_scheme = "light")
         ctx.add_init_script(seed())
+        ctx.add_init_script(FRAME_CLOCK)
         def fresh(old = None):
             # a generated page can exhaust the renderer; every try starts in a new tab
             if old is not None:
