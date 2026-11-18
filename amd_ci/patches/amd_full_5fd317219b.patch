@@ -1,0 +1,1482 @@
+diff --git a/studio/backend/core/training/worker.py b/studio/backend/core/training/worker.py
+index 2c06ee12d3..03da2a2e7d 100644
+--- a/studio/backend/core/training/worker.py
++++ b/studio/backend/core/training/worker.py
+@@ -4271,6 +4271,9 @@ def run_training_process(*, event_queue: Any, stop_queue: Any, config: dict) ->
+         "true" if sys.platform in ("win32", "darwin") else "false"
+     )
+     os.environ["PYTHONWARNINGS"] = "ignore"  # before imports
++    # The NF4 dequant cache (unsloth/kernels/dequant_cache.py) fills the GPU's free memory, which Studio reads
++    # to keep or load a chat model during training: off in the worker unless the user's environment sets it.
++    os.environ.setdefault("UNSLOTH_NF4_DEQUANT_CACHE", "0")
+     # Until unsloth is imported below; transformers is first imported well before that.
+     metadata_scan_cache = _install_metadata_scan_cache()
+ 
+diff --git a/tests/test_nf4_dequant_cache.py b/tests/test_nf4_dequant_cache.py
+new file mode 100644
+index 0000000000..39b0761c5c
+--- /dev/null
++++ b/tests/test_nf4_dequant_cache.py
+@@ -0,0 +1,310 @@
++# SPDX-License-Identifier: AGPL-3.0-only
++# Copyright 2026-present the Unsloth AI Inc. team. All rights reserved.
++
++"""NF4 dequant cache bookkeeping on CPU tensors with a faked memory reading: budget from the safe point,
++admission, hits, staleness, eviction under the margin, the out-of-memory fallback and the kill switch."""
++
++import pytest
++import torch
++from unsloth.kernels import dequant_cache as dc
++
++GiB = 2**30
++
++
++@pytest.fixture(autouse = True)
++def _fresh(monkeypatch):
++    monkeypatch.setattr(dc, "_MODE", "auto")
++    monkeypatch.setattr(dc, "_DISABLED", False)
++    monkeypatch.setattr(dc, "_auto_allowed", lambda: True)
++    monkeypatch.setattr(dc, "_ACTIVE", 1, raising = False)  # inside Trainer.train()
++    monkeypatch.setattr(dc, "_foreign_bytes", lambda index: 0, raising = False)
++    for name in (
++        "_TRANSIENT",
++        "_SEEN",
++        "_CALLS",
++        "_ROWS_SEEN",
++        "_ROWS_NEW",
++        "_FOREIGN",
++        "_CHECKED",
++    ):
++        getattr(dc, name, {}).clear()
++    dc.clear_dequant_cache()
++    dc.STATS.clear()
++    yield
++    dc.clear_dequant_cache()
++    for name in ("_TRANSIENT", "_SEEN", "_ROWS_SEEN", "_ROWS_NEW", "_FOREIGN"):
++        getattr(dc, name, {}).clear()
++
++
++def _memory(
++    monkeypatch,
++    usable,
++    total = 16 * GiB,
++    allocated = 3 * GiB,
++    peak = 4 * GiB,
++):
++    stats = {"allocated_bytes.all.current": allocated, "allocated_bytes.all.peak": peak}
++    monkeypatch.setattr(dc, "_usable", lambda index: (usable, total, stats))
++
++
++def _weight(n = 64):
++    W = torch.zeros(n, 1, dtype = torch.uint8)  # packed NF4 bytes: 2 values each
++    absmax = torch.ones(4)
++    return W, absmax
++
++
++def _decoder(calls, n = 64):
++    def decode(fresh):
++        calls.append(fresh)
++        return torch.full((8, 2 * n // 8), float(len(calls)), dtype = torch.bfloat16)
++
++    return decode
++
++
++def test_parse_mode():
++    assert (
++        dc.parse_mode("0") is None
++        and dc.parse_mode("off") is None
++        and dc.parse_mode("junk") is None
++    )
++    assert (
++        dc.parse_mode(None) == "auto"
++        and dc.parse_mode("auto") == "auto"
++        and dc.parse_mode("1") == "auto"
++    )
++    assert dc.parse_mode("2") == 2 * GiB and dc.parse_mode("-1") is None
++
++
++def test_budget_from_safe_point(monkeypatch):
++    _memory(monkeypatch, usable = 10 * GiB)
++    dc._SEEN.add(None)
++    dc._on_optimizer_step(None, (), {})
++    # usable - 2 x transient (peak - allocated) - margin (max(1 GiB, 5% of 16 GiB))
++    assert dc._BUDGET[None] == 10 * GiB - 2 * GiB - GiB
++
++
++def test_nothing_cached_before_first_step():
++    W, absmax = _weight()
++    calls = []
++    for _ in range(3):
++        dc._lookup(W, absmax, _decoder(calls), torch.bfloat16)
++    assert calls == [False, False, False] and dc.cached_count() == 0
++
++
++def test_admit_hit_transposed_and_stale(monkeypatch):
++    _memory(monkeypatch, usable = 10 * GiB)
++    dc._BUDGET[None] = GiB
++    W, absmax = _weight()
++    calls = []
++    first = dc._lookup(W, absmax, _decoder(calls), torch.bfloat16)
++    assert calls == [True] and dc.cached_count() == 1
++    again = dc._lookup(W, absmax, _decoder(calls), torch.bfloat16)
++    assert calls == [True] and again is first
++    # The backward passes W.t(): the cached [N, K] comes back transposed, like fast_dequantize.
++    back = dc._lookup(W.t(), absmax, _decoder(calls), torch.bfloat16)
++    assert calls == [True] and torch.equal(back, first.t())
++    W.add_(0)  # an in-place write bumps the version counter: decode again
++    dc._lookup(W, absmax, _decoder(calls), torch.bfloat16)
++    assert calls == [True, True] and dc.STATS["stale"] == 1
++
++
++def test_budget_caps_admission(monkeypatch):
++    _memory(monkeypatch, usable = 10 * GiB)
++    dc._BUDGET[None] = 128 * 2 + 1  # room for one 128-element bf16 weight
++    calls = []
++    for _ in range(2):
++        W, absmax = _weight()
++        dc._lookup(W, absmax, _decoder(calls), torch.bfloat16)
++    assert calls == [True, False] and dc.cached_count() == 1 and dc.STATS["declined"] == 1
++
++
++def test_guard_evicts_under_margin(monkeypatch):
++    _memory(monkeypatch, usable = 10 * GiB)
++    dc._BUDGET[None] = GiB
++    weights = [_weight() for _ in range(3)]
++    for W, absmax in weights:
++        dc._lookup(W, absmax, _decoder([]), torch.bfloat16)
++    assert dc.cached_count() == 3
++    _memory(monkeypatch, usable = 0)
++    for _ in range(dc._CHECK_EVERY):
++        dc._lookup(*weights[0], _decoder([]), torch.bfloat16)
++    assert dc.cached_count() == 0 and dc.STATS["evictions"] == 3 and dc._BUDGET[None] == 0
++
++
++def test_oom_while_admitting_disables(monkeypatch):
++    _memory(monkeypatch, usable = 10 * GiB)
++    dc._BUDGET[None] = GiB
++    W, absmax = _weight()
++    calls = []
++
++    def decode(fresh):
++        calls.append(fresh)
++        if fresh:
++            raise torch.cuda.OutOfMemoryError("fake")
++        return torch.zeros(8, 16, dtype = torch.bfloat16)
++
++    monkeypatch.setattr(torch.cuda, "empty_cache", lambda: None)
++    out = dc._lookup(W, absmax, decode, torch.bfloat16)
++    assert calls == [True, False] and out.shape == (8, 16)
++    assert dc._DISABLED and dc.cached_count() == 0 and dc.STATS["oom_clears"] == 1
++
++
++def test_kill_switch(monkeypatch):
++    monkeypatch.setattr(dc, "_MODE", None)
++    W, absmax = _weight()
++    assert not dc._eligible(W, torch.bfloat16)
++    assert not dc.traced_route(W, None)
++    dc._SEEN.add(None)
++    _memory(monkeypatch, usable = 10 * GiB)
++    dc._on_optimizer_step(None, (), {})
++    assert dc._BUDGET == {}
++
++
++def test_dead_weight_dropped_on_gc(monkeypatch):
++    import gc
++
++    _memory(monkeypatch, usable = 10 * GiB)
++    dc._BUDGET[None] = GiB
++    W, absmax = _weight()
++    dc._lookup(W, absmax, _decoder([]), torch.bfloat16)
++    assert dc.cached_count() == 1
++    del W
++    gc.collect()  # the gc callback frees the dense copy of a weight whose storage died
++    assert dc.cached_count() == 0 and dc.STATS["stale"] == 1
++
++
++def _admit_at_safe_point(monkeypatch, rows):
++    # One step with `rows`-row matmuls, then the safe point that measures it and sets the budget.
++    _memory(monkeypatch, usable = 10 * GiB)
++    W, absmax = _weight()
++    dc._lookup(W, absmax, _decoder([]), torch.bfloat16, rows)
++    dc._on_optimizer_step(None, (), {})
++    calls = []
++    dc._lookup(W, absmax, _decoder(calls), torch.bfloat16, rows)
++    assert calls == [True] and dc.cached_count() == 1
++    return W, absmax
++
++
++def test_longer_batch_than_measured_drops_cache(monkeypatch):
++    # The budget was measured on 128-row steps: a 4096-row batch (a long sequence late in training, a larger
++    # evaluation batch) has a transient nobody measured, so it runs with nothing cached, like the base code.
++    W, absmax = _admit_at_safe_point(monkeypatch, rows = 128)
++    calls = []
++    dc._lookup(W, absmax, _decoder(calls), torch.bfloat16, 128)
++    assert calls == [] and dc.cached_count() == 1  # same size: served from the cache
++    dc._lookup(W, absmax, _decoder(calls), torch.bfloat16, 4096)
++    assert calls == [False] and dc.cached_count() == 0 and dc._BUDGET[None] == 0
++    assert dc.STATS["rows_drops"] == 1
++    dc._lookup(W, absmax, _decoder(calls), torch.bfloat16, 128)
++    assert (
++        calls == [False, False] and dc.cached_count() == 0
++    )  # nothing re-admitted before the safe point
++    # The next safe point has measured the 4096-row step: caching resumes, also for 4096 rows.
++    dc._on_optimizer_step(None, (), {})
++    dc._lookup(W, absmax, _decoder(calls), torch.bfloat16, 4096)
++    assert calls == [False, False, True] and dc.cached_count() == 1
++
++
++def test_nothing_cached_outside_trainer_train(monkeypatch):
++    W, absmax = _admit_at_safe_point(monkeypatch, rows = 64)
++    monkeypatch.setattr(dc, "_ACTIVE", 0)  # a custom loop, or a step after train() returned
++    monkeypatch.setattr(torch.cuda, "empty_cache", lambda: None)
++    dc._on_optimizer_step(None, (), {})
++    assert dc.cached_count() == 0 and dc._BUDGET == {}
++
++
++def test_per_process_memory_fraction_caps_usable(monkeypatch):
++    # Studio's training VRAM budget: the allocator stops at fraction * total even with the card free.
++    stats = {"allocated_bytes.all.current": 3 * GiB, "reserved_bytes.all.current": 4 * GiB}
++    monkeypatch.setattr(torch.cuda, "mem_get_info", lambda index = None: (60 * GiB, 80 * GiB))
++    monkeypatch.setattr(torch.cuda, "memory_stats", lambda index = None: stats)
++    monkeypatch.setattr(dc, "_fraction", lambda index: 1.0)
++    assert dc._usable(0)[0] == 61 * GiB
++    monkeypatch.setattr(dc, "_fraction", lambda index: 0.1)  # 8 GiB allowed, 3 GiB allocated
++    assert dc._usable(0)[0] == 5 * GiB
++
++
++def test_other_process_on_the_gpu_turns_auto_off(monkeypatch):
++    W, absmax = _admit_at_safe_point(monkeypatch, rows = 64)
++    monkeypatch.setattr(torch.cuda, "empty_cache", lambda: None)
++    monkeypatch.setattr(
++        dc, "_foreign_bytes", lambda index: 3 * GiB
++    )  # e.g. a chat model loaded meanwhile
++    dc._on_optimizer_step(None, (), {})
++    assert dc.cached_count() == 0 and dc._BUDGET[None] == 0 and dc.STATS["foreign_off"] == 1
++
++
++def test_trainer_scope_hooks(monkeypatch):
++    transformers_trainer = pytest.importorskip("transformers.trainer")
++    from types import SimpleNamespace
++
++    assert dc.install_trainer_scope()
++    scope = [
++        c
++        for c in transformers_trainer.DEFAULT_CALLBACKS
++        if c.__name__ == "UnslothDequantCacheScope"
++    ]
++    assert len(scope) == 1
++    Trainer = transformers_trainer.Trainer
++    assert getattr(Trainer.train, "_unsloth_dq_scope", False)
++    assert getattr(Trainer.evaluate, "_unsloth_dq_scope", False)
++    handler = transformers_trainer.CallbackHandler([], None, None, None, None)
++    assert getattr(handler.add_callback, "_unsloth_dq_scope", False)
++    handler.add_callback(scope[0])
++    callback = handler.callbacks[-1]
++    assert callback.handler() is handler
++    monkeypatch.setattr(dc, "_ACTIVE", 0)
++    callback.on_train_begin(None, None, SimpleNamespace())
++    assert dc._ACTIVE == 1  # only known callbacks
++    # A user callback may allocate anything between optimizer steps: auto mode stays off for this run.
++    UserCallback = type(
++        "UserCallback", (transformers_trainer.TrainerCallback,), {"__module__": "__main__"}
++    )
++    handler.add_callback(UserCallback)
++    callback.on_train_begin(None, None, SimpleNamespace())
++    assert dc._ACTIVE == 0 and dc.STATS["user_callbacks_off"] == 1
++    monkeypatch.setattr(dc, "_MODE", float(GiB))  # an explicit GiB cap opts in anyway
++    callback.on_train_begin(None, None, SimpleNamespace())
++    assert dc._ACTIVE == 1
++    monkeypatch.setattr(dc, "_MODE", "auto")
++    _admit_at_safe_point(monkeypatch, rows = 64)
++    callback.on_step_end(None, None, SimpleNamespace(should_evaluate = True))  # evaluation comes next
++    assert dc.cached_count() == 0 and dc._BUDGET == {}
++    monkeypatch.setattr(torch.cuda, "empty_cache", lambda: None)
++    callback.on_train_end(None, None, SimpleNamespace())
++    assert dc._ACTIVE == 0
++
++
++def test_admission_keeps_the_transient_reserve(monkeypatch):
++    # Memory taken after the safe point (a callback's tensor, a second model) is not in the budget: an
++    # admission must still leave 2 x transient + margin usable.
++    _memory(monkeypatch, usable = 10 * GiB)  # transient 1 GiB (peak 4 - allocated 3)
++    dc._SEEN.add(None)
++    dc._on_optimizer_step(None, (), {})
++    assert dc._BUDGET[None] == 7 * GiB
++    _memory(monkeypatch, usable = 3 * GiB + 4096)  # 7 GiB allocated by someone else since then
++    calls = []
++    W, absmax = _weight()
++    dc._lookup(W, absmax, _decoder(calls), torch.bfloat16)  # 256 bytes fit above the 3 GiB reserve
++    assert calls == [True] and dc.cached_count() == 1 and dc._BUDGET[None] == 4096
++    W2, absmax2 = _weight(4096)  # 16 KiB do not
++    dc._lookup(W2, absmax2, _decoder(calls, 4096), torch.bfloat16)
++    assert calls == [True, False] and dc.cached_count() == 1 and dc.STATS["declined"] == 1
++
++
++def test_model_call_larger_than_measured_drops_cache_before_the_forward(monkeypatch):
++    # The pre-hook sees the input before the model allocates for it (a [1, 1, s, s] attention mask grows with
++    # the square of the sequence), so the cache is gone before that allocation, not at the first LoRA matmul.
++    dc._model_pre_hook(None, (), {"input_ids": torch.zeros(4, 16, dtype = torch.long)})
++    W, absmax = _admit_at_safe_point(monkeypatch, rows = 64)  # measured: 64 tokens, sequences of 16
++    dc._model_pre_hook(None, (), {"input_ids": torch.zeros(4, 16, dtype = torch.long)})
++    assert dc.cached_count() == 1
++    dc._model_pre_hook(
++        None, (), {"input_ids": torch.zeros(2, 32, dtype = torch.long)}
++    )  # same tokens, longer
++    assert dc.cached_count() == 0 and dc._BUDGET[None] == 0 and dc.STATS["shape_drops"] == 1
++    dc._model_pre_hook(None, (), {"input_ids": torch.zeros(2, 32, dtype = torch.long)})
++    dc._on_optimizer_step(None, (), {})
++    dc._lookup(W, absmax, _decoder([]), torch.bfloat16, 64)
++    dc._model_pre_hook(None, (), {"inputs_embeds": torch.zeros(2, 32, 8)})  # measured now: kept
++    assert dc.cached_count() == 1
+diff --git a/unsloth/kernels/dequant_cache.py b/unsloth/kernels/dequant_cache.py
+new file mode 100644
+index 0000000000..ddf7c46cb4
+--- /dev/null
++++ b/unsloth/kernels/dequant_cache.py
+@@ -0,0 +1,861 @@
++# SPDX-License-Identifier: AGPL-3.0-only
++# Copyright 2023-present Daniel Han-Chen & the Unsloth team. All rights reserved.
++
++"""VRAM-budgeted cache of dequantized frozen NF4 LoRA base weights.
++
++Under Unsloth gradient checkpointing a frozen NF4 linear is dequantized three times per micro-batch
++(no-grad forward, checkpoint replay, backward). The decode is deterministic, so keeping the 16-bit copy
++of as many weights as fit in otherwise idle VRAM is exact and removes those decodes.
++
++UNSLOTH_NF4_DEQUANT_CACHE:
++  auto (default) / 1   on, sized from free memory at every optimizer step (below), only inside a Trainer.train()
++                       whose callbacks all come from transformers / TRL / PEFT / accelerate / Unsloth; off while
++                       vLLM is loaded, several ranks share a GPU or another process uses it.
++  0 / off              off: every call site runs its original code.
++  <float>              on, at most that many GiB per device (also with vLLM loaded, another process on the GPU
++                       or user callbacks).
++Budget (the zoo moe_expert_cache design), measured at the safe point after each optimizer step, when the
++step's activations are freed: room = free + reserved-unused - 2 * transient - margin, with transient the
++largest step peak above the resident memory seen so far and margin max(1 GiB, 5% of the card). Free memory is
++also capped by torch.cuda.set_per_process_memory_fraction. Nothing is cached before the first optimizer step, and
++nothing outside transformers' Trainer.train(), so inference, evaluation-only runs and custom loops are untouched.
++Between optimizer steps only the trainer's own code and its callbacks run: auto mode requires every callback to
++come from a known library (user callbacks may allocate anything there), and drops the cache before evaluation.
++Safety: the budget only covers steps no larger than those already measured, so the cache is dropped (until the
++next safe point) when it is needed for anything else:
++  * a model call with more tokens or a longer sequence than any measured before the last safe point (a longer
++    batch, a larger evaluation or generation batch), seen by a forward pre-hook before the model allocates
++    anything (embeddings, attention masks); also any LoRA matmul with more rows than measured;
++  * Trainer.evaluate() / predict(), for_inference() and saving; the end of Trainer.train() also returns it to
++    the driver;
++  * auto mode only: another process holding more than the margin on the device, or growing by more than it.
++Weights are only admitted while room is left; every 8th hit re-reads free memory and drops the oldest entries
++while it is under the margin (and admits nothing more until the next safe point); an out-of-memory error while
++admitting drops the cache for the rest of the process. Entries die with their packed weight
++(storage weak reference, also swept after every gc collection), on any in-place change to it (version
++counter), at the end of SFTTrainer.train(), in for_inference() and before saving, and are never served on
++another stream or during CUDA graph capture.
++Only the LoRA kernels' own matmul sites read the cache, so the dense tensor never reaches other code. Eager
++they take the cached tensor; traced (per-block compile) they call an opaque op that does the lookup and the
++same GEMM, so the compiled graph does not depend on what is cached and nothing recompiles."""
++
++import collections
++import os
++import sys
++import threading
++import time
++from typing import List, Optional
++
++import torch
++
++__all__ = [
++    "STATS",
++    "cache_mode",
++    "clear_dequant_cache",
++    "cached_count",
++    "dequantize",
++    "traced_route",
++    "nf4_matmul",
++    "nf4_addmm_",
++    "nf4_lora_first",
++]
++
++STATS = collections.Counter()
++
++_OFF = ("0", "off", "false", "no", "none")
++_ON = ("", "1", "auto", "on", "true", "yes")
++MARGIN_MIN_BYTES = 1 << 30
++MARGIN_FRAC = 0.05
++TRANSIENT_SLACK = 2.0
++_CHECK_EVERY = 8
++
++
++def parse_mode(raw):
++    """UNSLOTH_NF4_DEQUANT_CACHE -> None (off), "auto", or a byte cap (float)."""
++    raw = (raw if raw is not None else "auto").strip().lower()
++    if raw in _OFF:
++        return None
++    if raw in _ON:
++        return "auto"
++    try:
++        gib = float(raw)
++    except ValueError:
++        return None
++    return gib * 2**30 if gib > 0 else None
++
++
++_MODE = parse_mode(os.environ.get("UNSLOTH_NF4_DEQUANT_CACHE"))
++
++
++def cache_mode():
++    return _MODE
++
++
++_lock = threading.RLock()
++# key (packed storage pointer, dtype) -> [storage weakref, version, absmax pointer, stream, dense [N, K]]
++_CACHE = collections.OrderedDict()
++_BUDGET = {}  # device index -> bytes the cache may hold (set at safe points only)
++_TRANSIENT = {}  # device index -> largest step peak above the resident memory seen so far
++_SEEN = set()  # device indices with eligible lookups
++_CALLS = collections.Counter()  # device index -> lookups since the last memory check
++_HELD = collections.Counter()  # device index -> bytes cached
++_DISABLED = False  # set for good after an out-of-memory error while anything was cached
++_ROWS_SEEN = {}  # device index -> most matmul rows of any lookup before the last safe point (budget covers these)
++_ROWS_NEW = {}  # device index -> most matmul rows since the last safe point
++_FOREIGN = {}  # device index -> memory other processes held at the first safe point
++_FRACTIONS = {}  # device index -> set_per_process_memory_fraction (torch without the getter)
++_ACTIVE = 0  # Trainer.train() calls running: nothing is cached outside them
++# device indices whose free memory was re-read at an admission since the last safe point
++_CHECKED = set()
++_SHAPE_SEEN = [0, 0]  # most tokens / longest sequence of a model input before the last safe point
++_SHAPE_NEW = [0, 0]  # the same since the last safe point
++_HOOKS = []  # forward pre-hooks on the trained model, removed when training ends
++
++
++def _storage_ref(W):
++    try:
++        from torch.multiprocessing.reductions import StorageWeakRef
++        return StorageWeakRef(W.untyped_storage())
++    except Exception:
++        return None
++
++
++def _raw_stream(index):
++    try:
++        return torch._C._cuda_getCurrentRawStream(index)
++    except Exception:
++        return None  # not a CUDA device (the bookkeeping unit tests run on CPU tensors)
++
++
++def _nbytes(dense):
++    return dense.numel() * dense.element_size()
++
++
++def _cached_bytes(index = None):
++    if index is not None:
++        return _HELD[index]
++    return sum(_HELD.values())
++
++
++def _put(key, entry):
++    old = _CACHE.pop(key, None)
++    if old is not None:
++        _HELD[old[4].device.index] -= _nbytes(old[4])
++    _CACHE[key] = entry
++    _HELD[entry[4].device.index] += _nbytes(entry[4])
++
++
++def _pop(key):
++    entry = _CACHE.pop(key, None)
++    if entry is not None:
++        _HELD[entry[4].device.index] -= _nbytes(entry[4])
++    return entry
++
++
++def cached_count():
++    return len(_CACHE)
++
++
++def clear_dequant_cache(oom = False, release = False):
++    """Drop every cached weight (and the budgets: they are recomputed at the next optimizer step).
++    release=True also returns the freed blocks to the driver, for other processes."""
++    with _lock:
++        held = bool(_CACHE)
++        _CACHE.clear()
++        _HELD.clear()
++        _BUDGET.clear()
++        _CHECKED.clear()
++        if oom:
++            STATS["oom_clears"] += 1
++        STATS["bytes"] = 0
++    if release and held:
++        try:
++            torch.cuda.empty_cache()
++        except Exception:
++            pass
++
++
++def _drop_device(index, reason):
++    """Drop index's entries and admit nothing more on it until the next safe point."""
++    with _lock:
++        if _CACHE:
++            _evict(index, 0)
++        _BUDGET[index] = 0
++        STATS[reason] += 1
++
++
++def _fraction(index):
++    """The caching allocator's set_per_process_memory_fraction for the device (1.0 when unset)."""
++    get = getattr(torch.cuda, "get_per_process_memory_fraction", None)
++    if get is not None:
++        try:
++            return float(get(index))
++        except Exception:
++            pass
++    return _FRACTIONS.get(index, 1.0)
++
++
++def _record_fraction_setter():
++    # torch without get_per_process_memory_fraction: remember what is set from now on.
++    if hasattr(torch.cuda, "get_per_process_memory_fraction"):
++        return
++    setter = getattr(torch.cuda, "set_per_process_memory_fraction", None)
++    if setter is None or getattr(setter, "_unsloth_dq_recorded", False):
++        return
++
++    def set_per_process_memory_fraction(fraction, device = None):
++        out = setter(fraction, device)
++        try:
++            index = torch.cuda._utils._get_device_index(device, optional = True)
++            _FRACTIONS[index] = float(fraction)
++        except Exception:
++            pass
++        return out
++
++    set_per_process_memory_fraction._unsloth_dq_recorded = True
++    torch.cuda.set_per_process_memory_fraction = set_per_process_memory_fraction
++    try:
++        torch.cuda.memory.set_per_process_memory_fraction = set_per_process_memory_fraction
++    except Exception:
++        pass
++
++
++_record_fraction_setter()
++
++
++def _margin(total):
++    return max(MARGIN_MIN_BYTES, int(MARGIN_FRAC * total))
++
++
++def _usable(index):
++    """(memory that can still be allocated on the device, total) or None."""
++    try:
++        free, total = torch.cuda.mem_get_info(index)
++        stats = torch.cuda.memory_stats(index)
++        allocated = stats.get("allocated_bytes.all.current", 0)
++        unused = stats.get("reserved_bytes.all.current", 0) - allocated
++        usable = free + max(unused, 0)
++        fraction = _fraction(index)
++        if fraction < 1.0:
++            # The allocator refuses to reserve past fraction * total whatever the driver has free; the margin
++            # is then a share of that capped card.
++            total = int(fraction * total)
++            usable = min(usable, total - allocated)
++        return usable, total, stats
++    except Exception:
++        return None
++
++
++def _foreign_bytes(index):
++    """Device memory held outside this process's caching allocator (other processes, CUDA contexts)."""
++    try:
++        free, total = torch.cuda.mem_get_info(index)
++        return max(total - free - torch.cuda.memory_reserved(index), 0)
++    except Exception:
++        return 0
++
++
++def _auto_allowed():
++    if "vllm" in sys.modules or os.environ.get("UNSLOTH_VLLM_STANDBY", "0") == "1":
++        return False
++    try:
++        local = int(os.environ.get("LOCAL_WORLD_SIZE", "1"))
++        if local > max(torch.cuda.device_count(), 1):
++            return False
++    except Exception:
++        pass
++    return True
++
++
++def _evict(
++    index,
++    target_bytes,
++    stat = "evictions",
++):
++    """Drop the oldest entries of `index` until it holds at most target_bytes."""
++    held = _cached_bytes(index)
++    for key in [k for k, e in _CACHE.items() if e[4].device.index == index]:
++        if held <= target_bytes:
++            break
++        held -= _nbytes(_pop(key)[4])
++        STATS[stat] += 1
++    STATS["bytes"] = _cached_bytes()
++
++
++def _on_optimizer_step(optimizer, args, kwargs):
++    """Safe point: the step's activations are freed; size every device's budget from what is free now."""
++    if _MODE is None or _DISABLED or not _SEEN:
++        return
++    if (_MODE == "auto" and not _auto_allowed()) or not _ACTIVE:
++        if _CACHE:
++            clear_dequant_cache(release = True)
++        return
++    with _lock:
++        for key in [k for k, e in _CACHE.items() if e[0].expired()]:
++            _pop(key)
++            STATS["stale"] += 1
++        _CHECKED.clear()
++        _SHAPE_SEEN[0] = max(_SHAPE_SEEN[0], _SHAPE_NEW[0])
++        _SHAPE_SEEN[1] = max(_SHAPE_SEEN[1], _SHAPE_NEW[1])
++        _SHAPE_NEW[0] = _SHAPE_NEW[1] = 0
++        for index in list(_SEEN):
++            # The budget below covers steps up to the largest matmul seen so far, no larger.
++            _ROWS_SEEN[index] = max(_ROWS_SEEN.get(index, 0), _ROWS_NEW.pop(index, 0))
++            measured = _usable(index)
++            if measured is None:
++                continue
++            usable, total, stats = measured
++            if _MODE == "auto":
++                # Another process on this GPU (a kept chat model, a server) may grow into what the cache
++                # takes: stay off while one holds more than the margin, or once one grew by more than it.
++                foreign = _foreign_bytes(index)
++                first = _FOREIGN.setdefault(index, foreign)
++                if foreign > _margin(total) or foreign - first > _margin(total):
++                    if _cached_bytes(index):
++                        _evict(index, 0)
++                        try:
++                            torch.cuda.empty_cache()
++                        except Exception:
++                            pass
++                    _BUDGET[index] = 0
++                    STATS["foreign_off"] += 1
++                    continue
++            allocated = stats.get("allocated_bytes.all.current", 0)
++            peak = stats.get("allocated_bytes.all.peak", 0)
++            transient = max(_TRANSIENT.get(index, 0), peak - allocated)
++            _TRANSIENT[index] = transient
++            held = _cached_bytes(index)
++            room = usable - int(TRANSIENT_SLACK * transient) - _margin(total)
++            budget = max(held + room, 0)
++            if _MODE != "auto":
++                budget = min(budget, int(_MODE))
++            if held > budget:
++                _evict(index, budget)
++            _BUDGET[index] = budget
++            STATS["safe_points"] += 1
++
++
++try:
++    from torch.optim.optimizer import register_optimizer_step_post_hook
++    register_optimizer_step_post_hook(_on_optimizer_step)
++except Exception:
++    pass
++
++
++def _sweep_after_gc(phase, info):
++    # `del model; gc.collect(); torch.cuda.empty_cache()` must also free the dense copies of its weights.
++    if phase != "stop" or not _CACHE:
++        return
++    with _lock:
++        for key in [k for k, e in _CACHE.items() if e[0].expired()]:
++            _pop(key)
++            STATS["stale"] += 1
++        STATS["bytes"] = _cached_bytes()
++
++
++import gc as _gc  # noqa: E402
++
++_gc.callbacks.append(_sweep_after_gc)
++
++
++def _guard(index):
++    """Every _CHECK_EVERY hits: drop the oldest cached weights while free memory is under the margin."""
++    _CALLS[index] += 1
++    if _CALLS[index] < _CHECK_EVERY:
++        return
++    _CALLS[index] = 0
++    try:
++        # The driver's free memory alone is cheap; only when it is short count the allocator's unused cache too.
++        # Under a per-process memory fraction the driver's free memory does not bound the allocator.
++        free, total = torch.cuda.mem_get_info(index)
++        if free >= _margin(total) and _fraction(index) >= 1.0:
++            return
++    except Exception:
++        pass
++    measured = _usable(index)
++    if measured is None:
++        return
++    usable, total, _ = measured
++    margin = _margin(total)
++    if usable >= margin:
++        return
++    with _lock:
++        held = _cached_bytes(index)
++        _evict(index, max(held - (margin - usable), 0))
++        # Do not refill what was just dropped before the next safe point re-measures.
++        _BUDGET[index] = min(_BUDGET.get(index, 0), _cached_bytes(index))
++
++
++def _eligible(W, quant_state_dtype):
++    return (
++        _MODE is not None
++        and not _DISABLED
++        and W.is_cuda
++        and not W.requires_grad
++        and quant_state_dtype in (torch.float16, torch.bfloat16, torch.float32)
++        and not torch.is_inference_mode_enabled()
++        and not torch.cuda.is_current_stream_capturing()
++    )
++
++
++def _lookup(
++    W,
++    absmax,
++    decode,
++    dtype,
++    rows = 0,
++):
++    """Dense [N, K] for the packed W (or its .t() view), from the cache or decode(); decode(fresh) returns the
++    oriented result of fast_dequantize. Returns the oriented tensor like fast_dequantize. rows: the matmul's
++    row count (tokens), which sizes the step's activations."""
++    index = W.device.index
++    if rows > _ROWS_NEW.get(index, 0):
++        _ROWS_NEW[index] = rows
++    if not _CACHE and _BUDGET.get(index, 0) <= 0:
++        _SEEN.add(index)
++        return decode(False)  # nothing cached and no budget (before the first optimizer step)
++    if rows > _ROWS_SEEN.get(index, 0):
++        # More tokens than any step the budget was measured on: its activations may need what the cache holds.
++        _drop_device(index, "rows_drops")
++        return decode(False)
++    # Hit path kept short: it runs for every frozen linear, three times per micro-batch.
++    entry = _CACHE.get((W.data_ptr(), dtype))
++    if entry is not None:
++        _guard(index)
++        if entry[1] == W._version and entry[3] == _raw_stream(index) and not entry[0].expired():
++            STATS["hits"] += 1
++            dense = entry[4]
++            return dense.t() if W.shape[0] == 1 else dense
++    return _miss(W, absmax, decode, dtype, index)
++
++
++def _miss(W, absmax, decode, dtype, index):
++    global _DISABLED
++    _SEEN.add(index)
++    key = (W.data_ptr(), dtype)
++    stream = _raw_stream(index)
++    with _lock:
++        entry = _CACHE.get(key)
++        if entry is not None and (
++            entry[0].expired() or entry[1] != W._version or entry[2] != absmax.data_ptr()
++        ):
++            _pop(key)  # reloaded / requantized / edited in place: decode again
++            STATS["stale"] += 1
++        STATS["misses"] += 1
++        budget = _BUDGET.get(index, 0)
++        if budget <= 0 or (entry is not None and key in _CACHE):
++            return decode(False)  # no budget, or cached for another stream
++        if index not in _CHECKED:
++            # Once per optimizer step, at its first admission: memory taken since the safe point (a callback's
++            # tensor, a second model) shrinks this step's budget, so the cache still leaves the reserve
++            # (2 x transient + margin) usable for the rest of the step. One reading per step, not per weight.
++            _CHECKED.add(index)
++            measured = _usable(index)
++            if measured is None:
++                _BUDGET[index] = 0
++                return decode(False)
++            usable, total, _ = measured
++            reserve = int(TRANSIENT_SLACK * _TRANSIENT.get(index, 0)) + _margin(total)
++            budget = max(min(budget, _cached_bytes(index) + usable - reserve), 0)
++            _BUDGET[index] = budget
++        need = W.numel() * 2 * (torch.finfo(dtype).bits // 8)
++        ref = _storage_ref(W) if _cached_bytes(index) + need <= budget else None
++        if ref is None:
++            STATS["declined"] += 1
++            return decode(False)
++        try:
++            out = decode(True)
++        except torch.cuda.OutOfMemoryError:
++            out = None
++        if out is None:
++            _DISABLED = True
++            clear_dequant_cache(oom = True)
++            torch.cuda.empty_cache()
++            return decode(False)
++        _put(key, [ref, W._version, absmax.data_ptr(), stream, out.t() if W.shape[0] == 1 else out])
++        STATS["admits"] += 1
++        STATS["bytes"] = _cached_bytes()
++        return out
++
++
++def _is_bnb_nf4(quant_state):
++    # bitsandbytes' QuantState class (not the legacy list form, not FP8 / INT4 / packed states), NF4 only.
++    cls = type(quant_state)
++    return (
++        cls.__name__ == "QuantState"
++        and cls.__module__.startswith("bitsandbytes")
++        and getattr(quant_state, "quant_type", None) == "nf4"
++    )
++
++
++def rows_of(X):
++    """Rows of the matmul X @ W.t() (tokens): what the activations of the step scale with."""
++    return X.numel() // X.shape[-1] if X.dim() > 1 and X.shape[-1] else X.numel()
++
++
++def dequantize(
++    W,
++    quant_state,
++    use_global_buffer = False,
++    dtype = None,
++    rows = 0,
++):
++    """fast_dequantize(W, quant_state, ...) for the LoRA kernels' matmul sites, from the cache when it
++    holds W. Eager only; callers must not write into the result. rows: rows_of(X) of the matmul."""
++    from .utils import fast_dequantize
++
++    if (
++        _MODE is None
++        or quant_state is None
++        or torch.compiler.is_compiling()
++        or not _is_bnb_nf4(quant_state)
++        or not _eligible(W, quant_state.dtype)
++    ):
++        return fast_dequantize(W, quant_state, use_global_buffer = use_global_buffer, dtype = dtype)
++
++    def decode(fresh):
++        if fresh:
++            return fast_dequantize(W, quant_state, use_global_buffer = False, dtype = dtype)
++        return fast_dequantize(W, quant_state, use_global_buffer = use_global_buffer, dtype = dtype)
++
++    return _lookup(W, quant_state.absmax, decode, quant_state.dtype, rows)
++
++
++# ----------------------------------------------------------------------------------------------------------
++# Traced callers: opaque ops doing the lookup and the GEMM, so the dense tensor never enters the graph (Inductor
++# may reuse a dead buffer, which must never be a cached weight) and the graph is the same whatever is cached.
++# Registered as plain CUDA kernels (no autograd wrapper: they are only called with grad off): their dispatch costs
++# less than the custom_op they replace.
++
++
++def _parts(quant_state):
++    from .utils import _unpack_quant_state
++    absmax, shape, dtype, blocksize, code, code2, absmax2, offset, blocksize2 = _unpack_quant_state(
++        quant_state
++    )
++    return absmax, code2, absmax2, offset, code, int(blocksize), int(blocksize2), list(shape), dtype
++
++
++def _dense_from_parts(
++    W, absmax, code2, absmax2, offset, code, blocksize, blocksize2, shape, dtype, rows
++):
++    def decode(fresh):
++        from .nf4 import dequantize_nf4
++        out = dequantize_nf4(
++            W, absmax, code2, absmax2, offset, code, blocksize, blocksize2, shape, dtype
++        )
++        return out.t() if W.shape[0] == 1 else out
++
++    if (
++        _MODE is None
++        or _DISABLED
++        or torch.is_inference_mode_enabled()
++        or torch.cuda.is_current_stream_capturing()
++    ):
++        return decode(False)
++    return _lookup(W, absmax, decode, dtype, rows)
++
++
++def traced_route(W, quant_state):
++    """True when a traced (Dynamo) caller should use the nf4_* ops below for this weight. Decided from
++    the module constant and the quant state type only, so it adds no guards that change during a run."""
++    if not _HAS_OPS or _MODE is None or quant_state is None or not _is_bnb_nf4(quant_state):
++        return False
++    from . import utils as _U
++
++    if not getattr(_U, "_USE_NF4_KERNELS", False):
++        return False
++    if quant_state.dtype not in (torch.float16, torch.bfloat16, torch.float32):
++        return False
++    if getattr(quant_state, "state2", None) is not None and not hasattr(
++        quant_state.state2, "absmax"
++    ):
++        return False
++    return (
++        torch.compiler.is_compiling()
++        and not torch.is_grad_enabled()
++        and isinstance(W, torch.Tensor)
++        and W.dtype == torch.uint8
++    )
++
++
++def _out_features(W, shape):
++    # X @ dense(W).t(): dense(W) is [N, K] for the packed weight and [K, N] for its .t() view.
++    return shape[1] if W.shape[0] == 1 else shape[0]
++
++
++def _matmul_impl(
++    X, W, absmax, code2, absmax2, offset, code, blocksize, blocksize2, shape, dtype, XA, Bt, alpha
++):
++    Wd = _dense_from_parts(
++        W, absmax, code2, absmax2, offset, code, blocksize, blocksize2, shape, dtype, X.shape[0]
++    )
++    if XA is None:
++        return torch.matmul(X, Wd.t())
++    if _lora_first_addmm is None:
++        _bind_lora_first()
++    return _lora_first_addmm(X, Wd.t(), XA, Bt, alpha)
++
++
++def _addmm_impl(
++    out, X, W, absmax, code2, absmax2, offset, code, blocksize, blocksize2, shape, dtype
++):
++    Wd = _dense_from_parts(
++        W, absmax, code2, absmax2, offset, code, blocksize, blocksize2, shape, dtype, X.shape[0]
++    )
++    out.addmm_(X, Wd.t())
++
++
++_HAS_OPS = False
++_lora_first_addmm = None
++try:
++    if hasattr(torch.ops.unsloth, "nf4_cached_matmul") and hasattr(
++        torch.ops.unsloth, "nf4_cached_addmm_"
++    ):
++        _HAS_OPS = (
++            True  # a re-executed module: the first definition (and its library) stays registered
++        )
++    else:
++        _LIB = torch.library.Library("unsloth", "FRAGMENT")
++        _PARTS_SCHEMA = (
++            "Tensor W, Tensor absmax, Tensor? code2, Tensor? absmax2, Tensor? offset, Tensor code, "
++            "int blocksize, int blocksize2, int[] shape, ScalarType dtype"
++        )
++        _LIB.define(
++            f"nf4_cached_matmul(Tensor X, {_PARTS_SCHEMA}, Tensor? XA, Tensor? Bt, float alpha) -> Tensor"
++        )
++        _LIB.define(f"nf4_cached_addmm_(Tensor(a!) out, Tensor X, {_PARTS_SCHEMA}) -> ()")
++        _LIB.impl("nf4_cached_matmul", _matmul_impl, "CUDA")
++        _LIB.impl("nf4_cached_addmm_", _addmm_impl, "CUDA")
++
++        @torch.library.register_fake("unsloth::nf4_cached_matmul", lib = _LIB)
++        def _(
++            X,
++            W,
++            absmax,
++            code2,
++            absmax2,
++            offset,
++            code,
++            blocksize,
++            blocksize2,
++            shape,
++            dtype,
++            XA,
++            Bt,
++            alpha,
++        ):
++            return X.new_empty((X.shape[0], _out_features(W, shape)))
++
++        @torch.library.register_fake("unsloth::nf4_cached_addmm_", lib = _LIB)
++        def _(out, X, W, absmax, code2, absmax2, offset, code, blocksize, blocksize2, shape, dtype):
++            return None
++
++        _HAS_OPS = True
++except Exception:
++    _HAS_OPS = False
++
++
++def _bind_lora_first():
++    global _lora_first_addmm
++    if _lora_first_addmm is None:
++        from .utils import _lora_first_addmm as fn
++        _lora_first_addmm = fn
++
++
++def nf4_matmul(
++    X,
++    W,
++    quant_state,
++    XA = None,
++    Bt = None,
++    alpha = 1.0,
++):
++    """Traced X @ fast_dequantize(W).t() (XA None) or _lora_first_addmm(X, dense.t(), XA, Bt, alpha)."""
++    if X.dim() != 2:
++        shape = X.shape
++        out = nf4_matmul(X.reshape(-1, shape[-1]), W, quant_state, XA, Bt, alpha)
++        return out.view(*shape[:-1], out.shape[-1])
++    return torch.ops.unsloth.nf4_cached_matmul(X, W, *_parts(quant_state), XA, Bt, float(alpha))
++
++
++def nf4_addmm_(out, X, W, quant_state):
++    """Traced out.addmm_(X, fast_dequantize(W).t()); returns out."""
++    torch.ops.unsloth.nf4_cached_addmm_(out, X, W, *_parts(quant_state))
++    return out
++
++
++def nf4_lora_first(X, W, quant_state, XA, Bt, alpha):
++    return nf4_matmul(X, W, quant_state, XA, Bt, alpha)
++
++
++# ----------------------------------------------------------------------------------------------------------
++# Trainer scope: the budget is only set between on_train_begin and the end of Trainer.train(); evaluation and
++# prediction run without the cache (their batches were never measured), and the end of training returns the
++# cache's memory to the driver. A default callback carries the scope (wrappers other code puts around
++# Trainer.train cannot bypass it); the train() wrapper also ends it when training raises.
++
++
++def _end_train():
++    global _ACTIVE
++    _ACTIVE = 0
++    while _HOOKS:
++        try:
++            _HOOKS.pop().remove()
++        except Exception:
++            pass
++    clear_dequant_cache(release = True)
++
++
++def _input_shape(args, kwargs):
++    """(tokens, sequence length) of a causal LM call, from input_ids or inputs_embeds."""
++    x = kwargs.get("input_ids")
++    embeds = x is None
++    if embeds:
++        x = kwargs.get("inputs_embeds")
++    if x is None and args:
++        x, embeds = args[0], False
++    if not isinstance(x, torch.Tensor) or x.dim() < 1:
++        return None
++    if embeds:
++        if x.dim() < 2:
++            return None
++        return x.numel() // max(x.shape[-1], 1), x.shape[-2]
++    return x.numel(), x.shape[-1]
++
++
++def _model_pre_hook(module, args, kwargs):
++    # Runs before the model allocates anything for this call (embeddings, attention masks that grow with the
++    # square of the sequence): a call larger than every step the budget was measured on drops the cache now.
++    shape = _input_shape(args, kwargs)
++    if shape is None:
++        return
++    tokens, length = shape
++    if tokens > _SHAPE_NEW[0]:
++        _SHAPE_NEW[0] = tokens
++    if length > _SHAPE_NEW[1]:
++        _SHAPE_NEW[1] = length
++    if (tokens > _SHAPE_SEEN[0] or length > _SHAPE_SEEN[1]) and (
++        _CACHE or any(b > 0 for b in _BUDGET.values())
++    ):
++        for index in list(_BUDGET):
++            _drop_device(index, "shape_drops")
++
++
++_KNOWN_CALLBACK_PACKAGES = frozenset(
++    ("transformers", "trl", "peft", "accelerate", "unsloth", "unsloth_zoo")
++)
++
++
++def _user_callbacks(callbacks):
++    """Callbacks defined outside the libraries whose between-step code is known not to allocate GPU memory
++    (their generation goes through for_inference, their evaluation through Trainer.evaluate)."""
++    return [
++        c for c in callbacks if type(c).__module__.split(".")[0] not in _KNOWN_CALLBACK_PACKAGES
++    ]
++
++
++def _make_callback():
++    from transformers.trainer_callback import TrainerCallback
++    class UnslothDequantCacheScope(TrainerCallback):
++        handler = None  # weak reference to the CallbackHandler holding this instance
++
++        def on_train_begin(self, args, state, control, **kwargs):
++            global _ACTIVE
++            handler = self.handler() if self.handler is not None else None
++            if handler is None:
++                _ACTIVE = 0  # cannot see the other callbacks
++            elif _MODE == "auto" and _user_callbacks(handler.callbacks):
++                # A user callback runs between optimizer steps and may allocate anything there.
++                _ACTIVE = 0
++                STATS["user_callbacks_off"] += 1
++            else:
++                _ACTIVE = 1
++            model = kwargs.get("model")
++            if _ACTIVE and isinstance(model, torch.nn.Module) and not _HOOKS:
++                try:
++                    _HOOKS.append(
++                        model.register_forward_pre_hook(_model_pre_hook, with_kwargs = True)
++                    )
++                except Exception:
++                    _ACTIVE = 0  # cannot see the input sizes before the model allocates for them
++
++        def on_step_end(self, args, state, control, **kwargs):
++            if control.should_evaluate:
++                clear_dequant_cache()  # evaluation follows this step: no budget until the next safe point
++
++        def on_epoch_end(self, args, state, control, **kwargs):
++            if control.should_evaluate:
++                clear_dequant_cache()
++
++        def on_train_end(self, args, state, control, **kwargs):
++            _end_train()
++
++    return UnslothDequantCacheScope
++
++
++def install_trainer_scope():
++    try:
++        import transformers.trainer as T
++    except Exception:
++        return False
++    import functools
++
++    import weakref
++    from transformers.trainer_callback import CallbackHandler
++
++    Trainer = T.Trainer
++    callbacks = getattr(T, "DEFAULT_CALLBACKS", None)
++    if isinstance(callbacks, list) and not any(
++        getattr(c, "__name__", "") == "UnslothDequantCacheScope" for c in callbacks
++    ):
++        callbacks.append(_make_callback())
++
++    add_callback = CallbackHandler.add_callback
++    if not getattr(add_callback, "_unsloth_dq_scope", False):
++
++        @functools.wraps(add_callback)
++        def scoped_add_callback(self, callback):
++            out = add_callback(self, callback)
++            for cb in self.callbacks:
++                if type(cb).__name__ == "UnslothDequantCacheScope" and cb.handler is None:
++                    cb.handler = weakref.ref(self)
++            return out
++
++        scoped_add_callback._unsloth_dq_scope = True
++        CallbackHandler.add_callback = scoped_add_callback
++
++    train = Trainer.train
++    if not getattr(train, "_unsloth_dq_scope", False):
++
++        @functools.wraps(train)
++        def scoped_train(self, *args, **kwargs):
++            try:
++                return train(self, *args, **kwargs)
++            finally:
++                _end_train()
++
++        scoped_train._unsloth_dq_scope = True
++        Trainer.train = scoped_train
++
++    def uncached(method):
++        @functools.wraps(method)
++        def run(self, *args, **kwargs):
++            clear_dequant_cache()
++            return method(self, *args, **kwargs)
++
++        run._unsloth_dq_scope = True
++        return run
++
++    for name in ("evaluate", "predict"):
++        method = getattr(Trainer, name, None)
++        if method is not None and not getattr(method, "_unsloth_dq_scope", False):
++            setattr(Trainer, name, uncached(method))
++    return True
++
++
++if _MODE is not None:
++    try:
++        install_trainer_scope()
++    except Exception:
++        pass
+diff --git a/unsloth/kernels/fast_lora.py b/unsloth/kernels/fast_lora.py
+index e15f5f7c4b..1f18f979e4 100644
+--- a/unsloth/kernels/fast_lora.py
++++ b/unsloth/kernels/fast_lora.py
+@@ -29,6 +29,7 @@ from .utils import (
+     torch_amp_custom_bwd,
+ )
+ from . import rms_layernorm as _rms_layernorm
++from . import dequant_cache as _dq
+ from .fp8_lora import has_fp8_dgrad
+ 
+ _is_compiling = torch.compiler.is_compiling
+@@ -328,6 +329,27 @@ def _add_lora_dX(dX, y_dB, A, S, mask, p):
+         dX.add_(_dropout_replay(y_dB @ A.t(), mask, p, S))
+ 
+ 
++def _base_dgrad_accum(dX, dY, W, W_quant):
++    # dX += dY @ base weight: fast_dequantize(W.t()).t() is the weight, read from the dequant cache when it holds it.
++    if _dq.traced_route(W, W_quant):
++        return _dq.nf4_addmm_(dX, dY, W.t(), W_quant)
++    W = _dq.dequantize(W.t(), W_quant, dtype = dY.dtype, rows = _dq.rows_of(dY))
++    return addmm_(dX, dY, W.t())
++
++
++def _base_dgrad(
++    dY,
++    W,
++    W_quant,
++    out = None,
++):
++    # dY @ base weight into a new tensor (or out, eager only).
++    if out is None and _dq.traced_route(W, W_quant):
++        return _dq.nf4_matmul(dY, W.t(), W_quant)
++    W = _dq.dequantize(W.t(), W_quant, dtype = dY.dtype, rows = _dq.rows_of(dY))
++    return torch.matmul(dY, W.t(), out = out)
++
++
+ def _grad_needed(ctx, index):
+     # A ctx without the flags (handcrafted) computes every gradient.
+     needs = getattr(ctx, "needs_input_grad", None)
+@@ -714,14 +736,12 @@ class LoRA_MLP(torch.autograd.Function):
+             if has_fp8_dgrad(upW_quant):
+                 dX = upW_quant.dgrad_accum(df, upW, dX)
+             else:
+-                upW = fast_dequantize(upW.t(), upW_quant, dtype = df.dtype)
+-                addmm_(dX, df, upW.t())
++                _base_dgrad_accum(dX, df, upW, upW_quant)
+             del upW
+             if has_fp8_dgrad(gateW_quant):
+                 dX = gateW_quant.dgrad_accum(de, gateW, dX)
+             else:
+-                gateW = fast_dequantize(gateW.t(), gateW_quant, dtype = de.dtype)
+-                addmm_(dX, de, gateW.t())
++                _base_dgrad_accum(dX, de, gateW, gateW_quant)
+             del gateW
+             d_gateBias = d_upBias = None
+             d_downBias = _lora_bias_grad(dY, downS) if ctx.biases[2] else None
+@@ -777,17 +797,17 @@ class LoRA_MLP(torch.autograd.Function):
+         if has_fp8_dgrad(upW_quant):
+             dX = upW_quant.dgrad(df, upW)
+         else:
+-            upW = fast_dequantize(upW.t(), upW_quant, dtype = df.dtype)
+             # Eager only: AOT autograd rejects a backward mutating a forward input that requires grad.
+-            dX = torch.matmul(df, upW.t(), out = X if ctx.inplace and not _is_compiling() else None)
++            dX = _base_dgrad(
++                df, upW, upW_quant, out = X if ctx.inplace and not _is_compiling() else None
++            )
+             del upW
+         _add_lora_dX(dX, up_dB, upA, upS, up_mask, up_p)
+ 
+         if has_fp8_dgrad(gateW_quant):
+             dX.add_(gateW_quant.dgrad(de, gateW))
+         else:
+-            gateW = fast_dequantize(gateW.t(), gateW_quant, dtype = de.dtype)
+-            addmm_(dX, de, gateW.t())
++            _base_dgrad_accum(dX, de, gateW, gateW_quant)
+             del gateW
+         _add_lora_dX(dX, gate_dB, gateA, gateS, gate_mask, gate_p)
+ 
+@@ -1166,13 +1186,10 @@ class LoRA_QKV(torch.autograd.Function):
+             for W_, W_quant_, dY_ in ((QW, QW_quant, dQ), (KW, KW_quant, dK), (VW, VW_quant, dV)):
+                 if has_fp8_dgrad(W_quant_):
+                     dX = W_quant_.dgrad_accum(dY_, W_, dX)
++                elif W_quant_ is None:
++                    addmm_(dX, dY_, W_)
+                 else:
+-                    W_ = (
+-                        W_.t()
+-                        if W_quant_ is None
+-                        else fast_dequantize(W_.t(), W_quant_, dtype = dY_.dtype)
+-                    )
+-                    addmm_(dX, dY_, W_.t())
++                    _base_dgrad_accum(dX, dY_, W_, W_quant_)
+                 del W_
+             return (
+                 dX.view(batch, seq_len, hd),
+@@ -1221,24 +1238,23 @@ class LoRA_QKV(torch.autograd.Function):
+         if has_fp8_dgrad(QW_quant):
+             dX = QW_quant.dgrad(dQ, QW)
+         else:
+-            QW = fast_dequantize(QW.t(), QW_quant, dtype = dQ.dtype)
+-            dX = torch.matmul(dQ, QW.t(), out = X if ctx.inplace and not _is_compiling() else None)
++            dX = _base_dgrad(
++                dQ, QW, QW_quant, out = X if ctx.inplace and not _is_compiling() else None
++            )
+             del QW
+         _add_lora_dX(dX, q_dB, QA, QS, Q_mask, Q_p)
+ 
+         if has_fp8_dgrad(KW_quant):
+             dX.add_(KW_quant.dgrad(dK, KW))
+         else:
+-            KW = fast_dequantize(KW.t(), KW_quant, dtype = dK.dtype)
+-            addmm_(dX, dK, KW.t())
++            _base_dgrad_accum(dX, dK, KW, KW_quant)
+             del KW
+         _add_lora_dX(dX, k_dB, KA, KS, K_mask, K_p)
+ 
+         if has_fp8_dgrad(VW_quant):
+             dX.add_(VW_quant.dgrad(dV, VW))
+         else:
+-            VW = fast_dequantize(VW.t(), VW_quant, dtype = dV.dtype)
+-            addmm_(dX, dV, VW.t())
++            _base_dgrad_accum(dX, dV, VW, VW_quant)
+             del VW
+         _add_lora_dX(dX, v_dB, VA, VS, V_mask, V_p)
+ 
+@@ -1415,15 +1431,13 @@ class LoRA_W(torch.autograd.Function):
+             if has_fp8_dgrad(W_quant):
+                 dX = W_quant.dgrad_accum(dY, W, dX)
+             else:
+-                W = fast_dequantize(W.t(), W_quant, dtype = dY.dtype)
+-                addmm_(dX, dY, W.t())
++                _base_dgrad_accum(dX, dY, W, W_quant)
+             del W
+         else:
+             if has_fp8_dgrad(W_quant):
+                 dX = W_quant.dgrad(dY, W)
+             else:
+-                W = fast_dequantize(W.t(), W_quant, dtype = dY.dtype)
+-                dX = dY @ W.t()
++                dX = _base_dgrad(dY, W, W_quant)
+             del W
+             _add_lora_dX(dX, y_dB, A, S, mask, ctx.dropout_p)
+ 
+diff --git a/unsloth/kernels/utils.py b/unsloth/kernels/utils.py
+index 45e354892a..d95b44d741 100644
+--- a/unsloth/kernels/utils.py
++++ b/unsloth/kernels/utils.py
+@@ -2122,6 +2122,9 @@ def _shares_storage(out, *tensors):
+         return True
+ 
+ 
++from . import dequant_cache as _dequant_cache
++
++
+ def matmul_lora(
+     X,
+     W,
+@@ -2204,12 +2207,34 @@ def matmul_lora(
+             # Eager only: a traced caller buffer cannot be checked for aliasing (_shares_storage). Dequantize
+             # first: the caller's buffer may share storage with the quant state (absmax, code, ...).
+             if W_quant is not None:
+-                W = fast_dequantize(W, W_quant, use_global_buffer = use_global_buffer, dtype = dtype)
++                W = _dequant_cache.dequantize(
++                    W,
++                    W_quant,
++                    use_global_buffer = use_global_buffer,
++                    dtype = dtype,
++                    rows = X.shape[0],
++                )
+             out = _accumulated(addmm_(out, XA, B, alpha = s, beta = 0), out.addmm_(X, W.t()))
++        elif (
++            W_quant is not None
++            and _HAS_LORA_FIRST_OP
++            and type(s) in (int, float)
++            and _is_dynamo_compiling()
++            and not _exporting()
++            and _dequant_cache.traced_route(W, W_quant)
++        ):
++            # The traced op below, with the base weight from the dequant cache (or decoded) inside the op.
++            out = _dequant_cache.nf4_lora_first(X, W, W_quant, XA, B, s)
+         else:
+             # Unquantized, fast_dequantize returns W as is (FP8 never takes this branch).
+             if W_quant is not None:
+-                W = fast_dequantize(W, W_quant, use_global_buffer = use_global_buffer, dtype = dtype)
++                W = _dequant_cache.dequantize(
++                    W,
++                    W_quant,
++                    use_global_buffer = use_global_buffer,
++                    dtype = dtype,
++                    rows = X.shape[0],
++                )
+             if not _is_compiling():
+                 out = _lora_first_addmm(X, W.t(), XA, B, s)
+             elif (
+@@ -2225,8 +2250,12 @@ def matmul_lora(
+                 out = torch.addmm(XA.new_zeros(1), XA, B, beta = 0, alpha = s)
+                 out = torch.addmm(out, X, W.t())
+         A = None
++    elif out is None and _dequant_cache.traced_route(W, W_quant):
++        out = _dequant_cache.nf4_matmul(X, W, W_quant)
+     else:
+-        W = fast_dequantize(W, W_quant, use_global_buffer = use_global_buffer, dtype = dtype)
++        W = _dequant_cache.dequantize(
++            W, W_quant, use_global_buffer = use_global_buffer, dtype = dtype, rows = X.shape[0]
++        )
+         out = torch_matmul(X, W.t(), out = out)
+     if W_quant is not None:
+         del W
+diff --git a/unsloth/models/llama.py b/unsloth/models/llama.py
+index 86dfc177d8..ba42a74ca1 100644
+--- a/unsloth/models/llama.py
++++ b/unsloth/models/llama.py
+@@ -5773,6 +5773,10 @@ class FastLlamaModel:
+             )
+         _tensor_parallel_for_inference(model)
+         restore_fp8_lora_for_inference(model)
++        # Training's NF4 dequant cache (kernels/dequant_cache.py) would hold memory generation may need.
++        from ..kernels.dequant_cache import clear_dequant_cache
++
++        clear_dequant_cache()
+ 
+         def _for_inference(m):
+             if hasattr(m, "gradient_checkpointing"):
+diff --git a/unsloth/models/vision.py b/unsloth/models/vision.py
+index ca2d58ebf8..1bd7a38b7d 100644
+--- a/unsloth/models/vision.py
++++ b/unsloth/models/vision.py
+@@ -6371,6 +6371,10 @@ class FastBaseModel:
+             )
+         _tensor_parallel_for_inference(model)
+         restore_fp8_lora_for_inference(model)
++        # Training's NF4 dequant cache (kernels/dequant_cache.py) would hold memory generation may need.
++        from ..kernels.dequant_cache import clear_dequant_cache
++
++        clear_dequant_cache()
+ 
+         def _for_inference(m):
+             if hasattr(m, "gradient_checkpointing"):
+diff --git a/unsloth/save.py b/unsloth/save.py
+index b491f40049..b5a5539ab6 100644
+--- a/unsloth/save.py
++++ b/unsloth/save.py
+@@ -1632,6 +1632,10 @@ def unsloth_save_model(
+     datasets: Optional[List[str]] = None,
+ ):
+     _refuse_mtp_variant(model, variant)
++    # Merging needs the memory the training-time NF4 dequant cache held.
++    from .kernels.dequant_cache import clear_dequant_cache
++
++    clear_dequant_cache()
+     if push_to_hub and _attached_mtp_head(model) is not None:
+         return _push_with_mtp_head(dict(locals()))
+ 
+diff --git a/unsloth/trainer.py b/unsloth/trainer.py
+index 48eacc5d9c..e56310f2d9 100644
+--- a/unsloth/trainer.py
++++ b/unsloth/trainer.py
+@@ -2470,7 +2470,11 @@ def _patch_sft_trainer_auto_packing(trl_module):
+                         _unsloth_reset_stray_compile_cache(self)
+                     except Exception:
+                         pass
+-                    return _orig_train(*train_args, **train_kwargs)
++                    try:
++                        return _orig_train(*train_args, **train_kwargs)
++                    finally:
++                        # Inference / saving after training get the memory the NF4 dequant cache held.
++                        _release_dequant_cache()
+ 
+                 self.train = _train_with_reset
+                 self._unsloth_train_reset_wrapped = True
+@@ -2481,6 +2485,13 @@ def _patch_sft_trainer_auto_packing(trl_module):
+     sft_trainer._unsloth_auto_packing_wrapped = True
+ 
+ 
++def _release_dequant_cache():
++    import sys
++    module = sys.modules.get("unsloth.kernels.dequant_cache")
++    if module is not None:
++        module.clear_dequant_cache()
++
++
+ def _patch_trl_trainer():
+     import trl
+ 
