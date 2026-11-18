@@ -17,15 +17,20 @@ OUT.mkdir(parents = True, exist_ok = True)
 MODEL = os.environ.get("MODEL", "qwen3.6-moe-35b-a3b-FLM")
 NEW_NAME = os.environ.get("NEW_NAME", "Qwen3.6-35B-A3B-NPU2")
 PROMPT = (
-    "using html with embedded JavaScript with three.js make a cool spinning 3D triangle lattice: a big equilateral "
-    "triangle filled with a triangular lattice of glowing dots (about 15 dots per side), every neighbouring pair "
-    "connected by a thin stick, so it reads as a triangle mesh. Give it soft-body physics: treat the dots as masses "
-    "and the sticks as springs, pin the three corners, and let a gentle wave or wind ripple through the mesh so it "
-    "flexes and settles while the whole thing slowly spins; keep the simulation stable (small fixed time step, damping, clamped forces) so it never collapses or explodes. Make it look polished: a soft light gradient background "
-    "(not black), dots and sticks coloured with a smooth gradient across the triangle, good lighting with soft "
-    "shadows, and frame the camera so the triangle fills most of the view. Use one self-contained HTML file with "
-    "three.js r128 and OrbitControls from a CDN, size the renderer from window.innerWidth and window.innerHeight and "
-    "update it on resize, and keep any on-screen text small in a corner."
+    "using html with embedded JavaScript with three.js make a beautiful, modern spinning triangle lattice: a big "
+    "equilateral triangle filled with a triangular lattice of dots (about 12 dots per side), every neighbouring pair "
+    "connected by a stick. The triangle faces the camera and spins smoothly in place around the axis pointing at the "
+    "camera, like a slowly turning wheel, so it always reads as a flat triangle. Make the sticks thick rounded tubes "
+    "(about half the dot radius) and the dots glossy spheres, so it looks chunky and clean, not wireframe. Add a "
+    "gentle soft-body ripple: dots are masses, sticks are springs, the three corners are pinned, and a soft wave "
+    "pushes the mesh a little toward and away from the viewer; keep the simulation stable (small fixed time step, "
+    "damping, clamped forces) so it never collapses or explodes. Colours: a nice pastel palette (mint, lavender, "
+    "peach, sky blue) blended smoothly across the triangle, on a deep slate-blue gradient background so the pastels "
+    "have strong contrast and pop; soft lighting with a subtle rim light. Antialiasing on, renderer pixel ratio from "
+    "window.devicePixelRatio, smooth 60 fps animation driven by requestAnimationFrame time. Frame the camera so the "
+    "triangle fills most of the view. Use one self-contained HTML file with three.js r128 and OrbitControls from a "
+    "CDN, size the renderer from window.innerWidth and window.innerHeight and update it on resize, and keep any "
+    "on-screen text small in a corner."
 )
 W, H = 1440, 900
 ERRORS = []
