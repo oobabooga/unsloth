@@ -92,10 +92,16 @@ def fetch(url: str, dest: Path) -> dict:
         return {"url": url, "cached": True, "bytes": dest.stat().st_size}
     t0 = time.time()
     curl = "curl.exe" if WIN else "curl"
-    rc = subprocess.run([curl, "-sS", "--fail", "-L", "--retry", "5", "--retry-delay", "5", "-o", str(dest) + ".part",
-                         url], env = clean_env()).returncode
+    rcs = []
+    for attempt in range(4):  # a transient reset (curl 56) is not retried by --retry alone
+        rc = subprocess.run([curl, "-sS", "--fail", "-L", "--retry", "5", "--retry-delay", "5", "--retry-all-errors",
+                             "-o", str(dest) + ".part", url], env = clean_env()).returncode
+        rcs.append(rc)
+        if rc == 0:
+            break
+        time.sleep(20)
     if rc != 0:
-        return {"url": url, "error": f"curl rc={rc}"}
+        return {"url": url, "error": f"curl rc={rcs}"}
     os.replace(str(dest) + ".part", dest)
     return {"url": url, "bytes": dest.stat().st_size, "seconds": round(time.time() - t0, 1)}
 
