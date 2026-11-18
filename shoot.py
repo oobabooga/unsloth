@@ -593,8 +593,8 @@ FRAME_CLOCK = """(() => { if (window.top === window) return;
 })();"""
 
 
-def record_ui(page, seconds = 8, fps = 30, warmup = 1.5):
-    """Frames of the whole page while the preview animates on a fixed clock -> OUT/ui-rec/f0000.jpg..."""
+def record_ui(page, seconds = 22, fps = 30, warmup = 1.5):
+    """Base page shot plus preview-only PNG frames on a fixed clock (OUT/ui-rec), long enough to cut a clean loop."""
     fr = None
     for f in page.frames[1:]:
         try:
@@ -607,6 +607,10 @@ def record_ui(page, seconds = 8, fps = 30, warmup = 1.5):
         return
     rec = OUT / "ui-rec"
     rec.mkdir(exist_ok = True)
+    ifr = page.locator("iframe").last
+    box = ifr.bounding_box()
+    page.screenshot(path = str(rec / "base.png"))
+    (rec / "box.json").write_text(json.dumps({"box": box, "viewport": {"width": W, "height": H}, "fps": fps}))
     fr.evaluate("__arm()")
     dt = 1000 / fps
     for _ in range(int(warmup * fps)):
@@ -614,8 +618,8 @@ def record_ui(page, seconds = 8, fps = 30, warmup = 1.5):
     t0 = time.time()
     for i in range(int(seconds * fps)):
         fr.evaluate(f"__step({dt})")
-        page.screenshot(path = str(rec / f"f{i:04d}.jpg"), type = "jpeg", quality = 94, scale = "device")
-    log("record_ui", int(seconds * fps), "frames", f"in {time.time() - t0:.0f}s")
+        ifr.screenshot(path = str(rec / f"f{i:04d}.png"), timeout = 60000)
+    log("record_ui", int(seconds * fps), "frames", f"in {time.time() - t0:.0f}s", json.dumps(box))
 
 
 def final_shots(page, title, view):
