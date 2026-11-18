@@ -1,0 +1,354 @@
+diff --git a/studio/backend/core/inference/diffusion_transformer_quant.py b/studio/backend/core/inference/diffusion_transformer_quant.py
+index bfa572e42f..9555b25556 100644
+--- a/studio/backend/core/inference/diffusion_transformer_quant.py
++++ b/studio/backend/core/inference/diffusion_transformer_quant.py
+@@ -1414,18 +1414,30 @@ def _rocm_cuda(target: Any) -> bool:
+ _FAMILY_RDNA_AUTO_W8A8: dict[str, str] = _profile_table("rdna_auto_w8a8", quant = True)
+ 
+ 
++def _rdna_compile_tier_proven(target: Any) -> bool:
++    """Whether the compiled RDNA int8 tier may be chosen on this host. Linux: yes (measured there; the regional compile
++    probe still runs when the tier engages). Elsewhere (Windows ROCm) only once that probe has passed on this card,
++    so a failed or unanswerable probe keeps the eager weight-only path. Kill switch UNSLOTH_DIFFUSION_ROCM_COMPILE=0."""
++    if _sys.platform.startswith("linux"):
++        return True
++    try:
++        from .diffusion_rocm_compile import rocm_block_compile_works
++        return bool(rocm_block_compile_works(getattr(target, "ordinal", None)))
++    except Exception:  # noqa: BLE001 - an unanswerable probe keeps the eager path
++        return False
++
++
+ def rdna_auto_w8a8_reason(target: Any, family: Optional[str]) -> Optional[str]:
+     """Measured reason AUTO picks W8A8 for ``family`` on ROCm RDNA, else None. Kill switch UNSLOTH_NATIVE_INT8_ACT=0."""
+     reason = _FAMILY_RDNA_AUTO_W8A8.get(str(family or "").strip().lower())
+     if reason is None or not _rocm_cuda(target) or not native_quant_host(target):
+         return None
+-    # Linux only: Windows ROCm has no compile tier.
+-    if not _sys.platform.startswith("linux"):
+-        return None
+     if int8_act_disabled() or not rocm_rdna_w8a8_ready(getattr(target, "ordinal", None)):
+         return None
+     if native_quant_scheme(target, TQ_INT8, family = family) != TQ_INT8:
+         return None
++    if not _rdna_compile_tier_proven(target):
++        return None
+     return reason
+ 
+ 
+@@ -1447,12 +1459,12 @@ def rdna_explicit_int8_reason(target: Any, family: Optional[str]) -> Optional[st
+     eager int8 is slower than bf16 on gfx1151 for every measured family. Kill switch UNSLOTH_NATIVE_INT8_ACT=0."""
+     if not _rocm_cuda(target) or not native_quant_host(target):
+         return None
+-    if not _sys.platform.startswith("linux"):
+-        return None
+     if int8_act_disabled() or not rocm_rdna_w8a8_ready(getattr(target, "ordinal", None)):
+         return None
+     if native_quant_scheme(target, TQ_INT8, family = family) != TQ_INT8:
+         return None
++    if not _rdna_compile_tier_proven(target):
++        return None
+     return "an explicit int8 request on RDNA is measured compiled"
+ 
+ 
+diff --git a/studio/backend/core/inference/sd_cpp_args.py b/studio/backend/core/inference/sd_cpp_args.py
+index dfe1d78d39..76e382d737 100644
+--- a/studio/backend/core/inference/sd_cpp_args.py
++++ b/studio/backend/core/inference/sd_cpp_args.py
+@@ -209,8 +209,9 @@ def native_speed_flags(
+     """sd-cli speed flags for a native speed mode (empty for off / None). Separate from offload:
+     ``--diffusion-fa`` is a win in its own right. De-duplicated against offload at the call site.
+     ``backend_args``: the other argv flags (``--backend`` picks the device); ``accelerator``: build class or None.
+-    ``binary``: on builds listing ``--conv-direct`` (master-963+) a rejected direct conv is sent as ``--conv-direct off``,
+-    since an omitted flag means auto there (direct conv on for HIP MMA / Vulkan regardless of this policy)."""
++    ``binary``: on builds listing ``--conv-direct`` (master-963+) a rejected direct conv is sent explicitly
++    (``rejected_conv_direct_mode``: ``off``, or ``off,vae=auto`` on Vulkan), since an omitted flag means auto there
++    (direct conv on for HIP MMA / Vulkan regardless of this policy)."""
+     mode = (speed_mode or NATIVE_SPEED_OFF).strip().lower()
+     if mode in ("", NATIVE_SPEED_OFF):
+         return []
+@@ -219,7 +220,11 @@ def native_speed_flags(
+         if not conv_direct_wanted(args, accelerator):
+             user_set = any(f in _CONV_DIRECT_FLAGS for f in args)
+             if not user_set and binary and sd_cpp_supports_conv_direct_mode(binary):
+-                return ["--diffusion-fa", "--conv-direct", "off"]
++                return [
++                    "--diffusion-fa",
++                    "--conv-direct",
++                    rejected_conv_direct_mode(args, accelerator),
++                ]
+             return ["--diffusion-fa"]
+         return ["--diffusion-fa", "--diffusion-conv-direct"]
+     raise ValueError(f"native speed_mode must be one of {NATIVE_SPEED_MODES}, got '{speed_mode}'")
+@@ -243,6 +248,54 @@ def speed_flags_without(speed: Sequence[str], offload: Sequence[str]) -> list[st
+     return out
+ 
+ 
++# VAE devices whose own direct-conv decision Studio keeps when it rejects direct conv for the denoiser. Vulkan: the
++# fork's auto runs direct conv2d in the VAE only after its output check against im2col passes (3D convs and every
++# other module stay im2col), measured faster and smaller in VAE decodes on RADV and AMD's Windows driver; CPU: the
++# row-run direct kernels, bit-identical to im2col. HIP is not listed: its auto picks implicit GEMM, never faster on
++# gfx1151, so it keeps the global off.
++_VAE_CONV_DIRECT_AUTO_BACKENDS = ("vulkan", "cpu")
++
++
++def _vae_backend(backend_args: Sequence[str], accelerator: Optional[str]) -> Optional[str]:
++    """The backend the VAE gets: ``--vae-on-cpu``, else a ``vae=`` assignment beats a bare default, else
++    ``accelerator``."""
++    args = list(backend_args)
++    if "--vae-on-cpu" in args:
++        return "cpu"
++    explicit = default = None
++    for spec in (args[i + 1] for i, f in enumerate(args[:-1]) if f == "--backend"):
++        for part in str(spec).split(","):
++            key, sep, value = part.strip().partition("=")
++            if not sep:
++                default = key or default
++            elif key.strip().lower() == "vae":
++                explicit = value.strip()
++    return explicit or default or accelerator
++
++
++def rejected_conv_direct_mode(
++    backend_args: Sequence[str] = (), accelerator: Optional[str] = None
++) -> str:
++    """``--conv-direct`` value when Studio's policy rejects direct conv: ``off,vae=auto`` (denoiser and ControlNet
++    off, the VAE keeps the fork's per-device decision) when the denoiser runs on Vulkan and the VAE on Vulkan or CPU,
++    else ``off``. The module syntax arrived with ``--conv-direct`` itself (sd.cpp #2134), so a build that lists the
++    flag accepts it. ``UNSLOTH_SD_CPP_CONV_DIRECT=0`` (kill switch) and Metal send ``off``."""
++    import os
++
++    forced = (os.environ.get("UNSLOTH_SD_CPP_CONV_DIRECT") or "").strip().lower()
++    if forced in ("0", "off", "false", "no") or _runs_on_apple_metal(backend_args):
++        return "off"
++    args = list(backend_args)
++    diffusion = _diffusion_backend(
++        [args[i + 1] for i, f in enumerate(args[:-1]) if f == "--backend"]
++    )
++    diffusion = (diffusion or accelerator or "").strip().lower().rstrip("0123456789")
++    vae = (_vae_backend(args, accelerator) or "").strip().lower().rstrip("0123456789")
++    if diffusion == "vulkan" and vae in _VAE_CONV_DIRECT_AUTO_BACKENDS:
++        return "off,vae=auto"
++    return "off"
++
++
+ def sd_cpp_supports_conv_direct_mode(binary: str) -> bool:
+     """True when ``binary --help`` lists ``--conv-direct``. Fails closed (older builds reject the unknown flag)."""
+     import os
+diff --git a/studio/backend/tests/test_diffusion_flux3_rdna_shared_quant.py b/studio/backend/tests/test_diffusion_flux3_rdna_shared_quant.py
+index 8de081c6c6..258755548d 100644
+--- a/studio/backend/tests/test_diffusion_flux3_rdna_shared_quant.py
++++ b/studio/backend/tests/test_diffusion_flux3_rdna_shared_quant.py
+@@ -212,8 +212,14 @@ def test_explicit_w8a8_reason_follows_the_explicit_compile_gates(rocm, monkeypat
+     monkeypatch.setattr(tq, "rocm_rdna_w8a8_ready", lambda *_a: False)
+     assert tq.rdna_explicit_w8a8_reason(_target(), "flux.3-klein") is None
+     monkeypatch.setattr(tq, "rocm_rdna_w8a8_ready", lambda *_a: True)
++    # Windows ROCm: the regional compile probe decides (a failed probe keeps the eager weight-only path).
++    from core.inference import diffusion_rocm_compile as rc
++
+     monkeypatch.setattr(tq._sys, "platform", "win32")
++    monkeypatch.setattr(rc, "rocm_block_compile_works", lambda *_a: False)
+     assert tq.rdna_explicit_w8a8_reason(_target(), "flux.3-klein") is None
++    monkeypatch.setattr(rc, "rocm_block_compile_works", lambda *_a: True)
++    assert tq.rdna_explicit_w8a8_reason(_target(), "flux.3-klein")
+ 
+ 
+ def test_explicit_w8a8_reason_is_rocm_only(monkeypatch):
+diff --git a/studio/backend/tests/test_diffusion_native_quant.py b/studio/backend/tests/test_diffusion_native_quant.py
+index f768068320..2f88d35ec8 100644
+--- a/studio/backend/tests/test_diffusion_native_quant.py
++++ b/studio/backend/tests/test_diffusion_native_quant.py
+@@ -228,6 +228,7 @@ def test_rdna_explicit_int8_reason_covers_every_family_with_the_same_gates(rocm,
+     monkeypatch.setattr(tq, "rocm_rdna_w8a8_ready", lambda *_a: True)
+     monkeypatch.setitem(tq._FAMILY_SCHEME_DENY, "toy-family", frozenset({tq.TQ_INT8}))
+     assert tq.rdna_explicit_int8_reason(_target(), "toy-family") is None
++    _compile_probe(monkeypatch, False)
+     monkeypatch.setattr(tq._sys, "platform", "win32")
+     assert tq.rdna_explicit_int8_reason(_target(), "flux.3-klein") is None
+ 
+@@ -243,12 +244,77 @@ def test_rdna_auto_w8a8_ships_only_for_the_measured_families():
+     assert set(tq._FAMILY_RDNA_AUTO_W8A8) == {"qwen-image", "qwen-image-2.1"}
+ 
+ 
+-def test_rdna_auto_w8a8_reason_is_linux_only(rocm, monkeypatch):
++def _compile_probe(monkeypatch, verdict):
++    """Stub the ROCm regional compile probe; returns the list of ordinals it was asked about."""
++    from core.inference import diffusion_rocm_compile as rc
++
++    asked: list = []
++
++    def probe(device = None):
++        asked.append(device)
++        if isinstance(verdict, BaseException):
++            raise verdict
++        return verdict
++
++    monkeypatch.setattr(rc, "rocm_block_compile_works", probe)
++    return asked
++
++
++@pytest.mark.parametrize("platform", ["win32", "cygwin"])
++@pytest.mark.parametrize(
++    "verdict,expect", [(True, True), (False, False), (RuntimeError("probe"), False)]
++)
++def test_rdna_tiers_off_linux_follow_the_compile_probe(
++    rocm, monkeypatch, platform, verdict, expect
++):
++    # Windows ROCm: the compiled RDNA int8 tiers engage only once the regional compile probe passed on this card.
+     monkeypatch.delenv(nq.NATIVE_INT8_ACT_ENV, raising = False)
+     monkeypatch.setattr(tq, "rocm_rdna_w8a8_ready", lambda *_a: True)
+     monkeypatch.setitem(tq._FAMILY_RDNA_AUTO_W8A8, "toy-family", "measured")
++    monkeypatch.setattr(tq._sys, "platform", platform)
++    asked = _compile_probe(monkeypatch, verdict)
++    target = types.SimpleNamespace(device = "cuda", dtype = torch.bfloat16, ordinal = 0)
++    assert (tq.rdna_auto_w8a8_reason(target, "toy-family") == "measured") is expect
++    assert (tq.rdna_explicit_int8_reason(target, "flux.3-klein") is not None) is expect
++    assert (tq.rdna_explicit_w8a8_reason(target, "flux.3-klein") is not None) is expect
++    assert asked and set(asked) == {0}
++
++
++def test_rdna_tiers_off_linux_check_the_cheap_gates_before_probing(rocm, monkeypatch):
++    # A host whose RDNA kernels are not ready (or the kill switch) never pays for the compile probe.
+     monkeypatch.setattr(tq._sys, "platform", "win32")
++    asked = _compile_probe(monkeypatch, True)
++    monkeypatch.setitem(tq._FAMILY_RDNA_AUTO_W8A8, "toy-family", "measured")
++    monkeypatch.setattr(tq, "rocm_rdna_w8a8_ready", lambda *_a: False)
++    assert tq.rdna_auto_w8a8_reason(_target(), "toy-family") is None
++    assert tq.rdna_explicit_int8_reason(_target(), "toy-family") is None
++    monkeypatch.setattr(tq, "rocm_rdna_w8a8_ready", lambda *_a: True)
++    monkeypatch.setenv(nq.NATIVE_INT8_ACT_ENV, "0")
+     assert tq.rdna_auto_w8a8_reason(_target(), "toy-family") is None
++    assert tq.rdna_explicit_int8_reason(_target(), "toy-family") is None
++    assert asked == []
++
++
++def test_rdna_tiers_on_linux_never_run_the_probe_at_decision_time(rocm, monkeypatch):
++    # Linux keeps its measured behaviour: the probe still runs when the compile tier engages, not here.
++    monkeypatch.delenv(nq.NATIVE_INT8_ACT_ENV, raising = False)
++    monkeypatch.setattr(tq._sys, "platform", "linux")
++    monkeypatch.setattr(tq, "rocm_rdna_w8a8_ready", lambda *_a: True)
++    monkeypatch.setitem(tq._FAMILY_RDNA_AUTO_W8A8, "toy-family", "measured")
++    asked = _compile_probe(monkeypatch, False)
++    assert tq.rdna_auto_w8a8_reason(_target(), "toy-family") == "measured"
++    assert tq.rdna_explicit_int8_reason(_target(), "toy-family") is not None
++    assert asked == []
++
++
++def test_rdna_compile_probe_kill_switch_keeps_windows_eager(rocm, monkeypatch):
++    from core.inference import diffusion_rocm_compile as rc
++
++    monkeypatch.delenv(nq.NATIVE_INT8_ACT_ENV, raising = False)
++    monkeypatch.setattr(tq._sys, "platform", "win32")
++    monkeypatch.setattr(tq, "rocm_rdna_w8a8_ready", lambda *_a: True)
++    monkeypatch.setenv(rc.ENV, "0")
++    assert tq.rdna_explicit_int8_reason(_target(), "flux.3-klein") is None
+ 
+ 
+ def test_rdna_auto_w8a8_reason_is_rocm_only(nvidia, monkeypatch):
+diff --git a/studio/backend/tests/test_sd_cpp_conv_direct_off.py b/studio/backend/tests/test_sd_cpp_conv_direct_off.py
+index 0b79ec60db..7d02f37683 100644
+--- a/studio/backend/tests/test_sd_cpp_conv_direct_off.py
++++ b/studio/backend/tests/test_sd_cpp_conv_direct_off.py
+@@ -1,7 +1,8 @@
+ # SPDX-License-Identifier: AGPL-3.0-only
+ # Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
+ 
+-"""Direct conv rejected by Studio's policy must reach sd.cpp as an explicit ``--conv-direct off``.
++"""Direct conv rejected by Studio's policy must reach sd.cpp as an explicit ``--conv-direct off`` (``off,vae=auto``
++on Vulkan, where the VAE keeps the fork's own output-checked decision).
+ 
+ sd.cpp master-963+ reads an omitted ``--conv-direct`` as auto, and auto turns direct conv on for implicit-GEMM
+ backends (HIP MMA; Vulkan when its timing probe wins), so leaving the legacy flag out no longer means off."""
+@@ -54,8 +55,10 @@ def _pair(cmd, flag):
+     return cmd[cmd.index(flag) + 1] if flag in cmd else None
+ 
+ 
+-@pytest.mark.parametrize("accelerator", ["rocm", "vulkan", "hip"])
+-def test_rejected_backend_sends_explicit_off_to_an_auto_build(tmp_path, accelerator):
++@pytest.mark.parametrize(
++    "accelerator,mode", [("rocm", "off"), ("vulkan", "off,vae=auto"), ("hip", "off")]
++)
++def test_rejected_backend_sends_explicit_off_to_an_auto_build(tmp_path, accelerator, mode):
+     binary = _fake_binary(tmp_path, "sd-server", _NEW_HELP)
+     cmd = build_sd_cpp_server_command(
+         binary = binary,
+@@ -66,10 +69,78 @@ def test_rejected_backend_sends_explicit_off_to_an_auto_build(tmp_path, accelera
+         accelerator = accelerator,
+     )
+     assert "--diffusion-fa" in cmd
+-    assert _pair(cmd, "--conv-direct") == "off"
++    assert _pair(cmd, "--conv-direct") == mode
+     assert "--diffusion-conv-direct" not in cmd
+ 
+ 
++@pytest.mark.parametrize(
++    "backend_args,accelerator,mode",
++    [
++        # Vulkan denoiser: the VAE keeps the fork's output-checked per-device decision.
++        ([], "vulkan", "off,vae=auto"),
++        (["--backend", "Vulkan0"], None, "off,vae=auto"),
++        (["--backend", "diffusion=Vulkan0,te=Vulkan0,vae=Vulkan0"], "vulkan", "off,vae=auto"),
++        (["--backend", "diffusion=Vulkan0,te=cpu,vae=cpu"], "vulkan", "off,vae=auto"),
++        (["--vae-on-cpu"], "vulkan", "off,vae=auto"),
++        # HIP VAE: auto would pick implicit GEMM, never faster on gfx1151.
++        (["--backend", "diffusion=Vulkan0,vae=ROCm0"], "vulkan", "off"),
++        # HIP denoiser: unchanged global off, whatever runs the VAE.
++        ([], "rocm", "off"),
++        (["--backend", "diffusion=ROCm0,vae=cpu"], "rocm", "off"),
++        (["--backend", "ROCm0"], "vulkan", "off"),
++    ],
++)
++def test_rejected_mode_keeps_the_vae_decision_on_vulkan_only(
++    tmp_path, backend_args, accelerator, mode
++):
++    binary = _fake_binary(tmp_path, "sd-cli", _NEW_HELP)
++    assert native_speed_flags("default", backend_args, accelerator, binary) == [
++        "--diffusion-fa",
++        "--conv-direct",
++        mode,
++    ]
++    assert sd_cpp_args.rejected_conv_direct_mode(backend_args, accelerator) == mode
++
++
++def test_force_off_is_the_kill_switch_for_the_vae_decision(tmp_path, monkeypatch):
++    binary = _fake_binary(tmp_path, "sd-cli", _NEW_HELP)
++    monkeypatch.setenv("UNSLOTH_SD_CPP_CONV_DIRECT", "0")
++    assert native_speed_flags("default", [], "vulkan", binary) == [
++        "--diffusion-fa",
++        "--conv-direct",
++        "off",
++    ]
++
++
++def test_metal_keeps_the_global_off(tmp_path, monkeypatch):
++    binary = _fake_binary(tmp_path, "sd-cli", _NEW_HELP)
++    monkeypatch.setattr("sys.platform", "darwin")
++    monkeypatch.setattr(sd_cpp_args, "apple_silicon_machine", lambda: True)
++    monkeypatch.setattr(sd_cpp_args, "metal_is_paravirtual", lambda: False)
++    assert sd_cpp_args.rejected_conv_direct_mode([], "vulkan") == "off"
++
++
++def test_vulkan_engine_generate_sends_the_vae_decision(tmp_path, monkeypatch):
++    import core.inference.sd_cpp_engine as sd_cpp_engine
++    from core.inference.sd_cpp_engine import SdCppEngine
++
++    binary = _fake_binary(tmp_path, "sd-cli", _NEW_HELP)
++    monkeypatch.setattr(sd_cpp_engine, "binary_accelerator", lambda b: "vulkan")
++    captured = {}
++    eng = SdCppEngine(binary = binary)
++    monkeypatch.setattr(eng, "_require_binary", lambda: binary)
++    monkeypatch.setattr(eng, "_prepare_out", lambda p: p)
++    monkeypatch.setattr(eng, "_run", lambda cmd, *a, **k: captured.setdefault("cmd", cmd))
++    eng.generate(
++        SdCppModelFiles(diffusion_model = "/m/x.gguf"),
++        SdCppGenParams(prompt = "x"),
++        output_path = str(tmp_path / "x.png"),
++        native_speed = "default",
++    )
++    assert _pair(captured["cmd"], "--conv-direct") == "off,vae=auto"
++    assert captured["cmd"].count("--conv-direct") == 1
++
++
+ def test_force_off_override_is_explicit_on_cuda(tmp_path, monkeypatch):
+     binary = _fake_binary(tmp_path, "sd-cli", _NEW_HELP)
+     assert native_speed_flags("max", [], "cuda", binary) == [
