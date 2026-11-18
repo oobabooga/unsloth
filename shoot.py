@@ -22,9 +22,10 @@ PROMPT = (
     "connected by a stick. The triangle faces the camera and spins smoothly in place around the axis pointing at the "
     "camera, like a slowly turning wheel, so it always reads as a flat triangle. Make the sticks thick rounded tubes "
     "(about half the dot radius) and the dots glossy spheres, so it looks chunky and clean, not wireframe. Add a "
-    "gentle soft-body ripple: dots are masses, sticks are springs, the three corners are pinned, and a soft wave "
-    "pushes the mesh a little toward and away from the viewer; keep the simulation stable (small fixed time step, "
-    "damping, clamped forces) so it never collapses or explodes. Colours: a nice pastel palette (mint, lavender, "
+    "gentle ripple that looks like a soft cloth mesh: move each dot toward and away from the viewer with a smooth "
+    "sine wave travelling across the triangle (a closed-form formula of position and time, no physics simulation), "
+    "the three corners stay still, and update the sticks every frame so they follow the dots. "
+    "Colours: a nice pastel palette (mint, lavender, "
     "peach, sky blue) blended smoothly across the triangle, on a deep slate-blue gradient background so the pastels "
     "have strong contrast and pop; soft lighting with a subtle rim light. Antialiasing on, renderer pixel ratio from "
     "window.devicePixelRatio, smooth 60 fps animation driven by requestAnimationFrame time. Frame the camera so the "
@@ -536,8 +537,7 @@ def attempt(page, n):
         ask = (f"The page throws this error: {err}. Please fix it and send the complete corrected HTML file."
                if err else
                "The preview shows almost nothing: the lattice is not visible, only a few stray dots. Fix it so the "
-               "whole triangle mesh is clearly visible, fills most of the view and the physics stays stable (small "
-               "time step, clamp the forces), and send the complete corrected HTML file.")
+               "whole triangle mesh is clearly visible and fills most of the view, and send the complete corrected HTML file.")
         page.get_by_placeholder("Ask anything").click()
         page.keyboard.type(ask, delay = 6)
         page.wait_for_timeout(400)
