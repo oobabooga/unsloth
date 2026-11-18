@@ -519,6 +519,30 @@ def attempt(page, n):
     log(tag, f"reply done in {time.time() - t0:.0f}s, badge", page.get_by_text("tok/s").first.inner_text())
     page.wait_for_timeout(800)
     r = present(page, tag)
+    fixes = 0
+    while r and not r["clean"] and r.get("errs") and fixes < 2:
+        # most failures are one typo; ask the model to fix it in the same chat, like a user would
+        fixes += 1
+        shot(page, f"{tag}-fix{fixes}-before")
+        for b in page.get_by_role("button", name = "Close tab").all():
+            if b.is_visible():
+                b.click()
+                break
+        page.wait_for_timeout(1500)
+        nbadge = page.get_by_text("tok/s").count()
+        err = "; ".join(e for e in r["errs"] if not e.startswith("banner:"))[:200] or r["errs"][0][:200]
+        page.get_by_placeholder("Ask anything").click()
+        page.keyboard.type(f"The page throws this error: {err}. Please fix it and send the complete corrected HTML file, "
+                           "keeping every voxel touching with no gaps.", delay = 6)
+        page.wait_for_timeout(400)
+        page.keyboard.press("Enter")
+        log(tag, f"fix{fixes} sent:", err)
+        t0 = time.time()
+        while page.get_by_text("tok/s").count() <= nbadge and time.time() - t0 < 1500:
+            page.wait_for_timeout(5000)
+        log(tag, f"fix{fixes} reply done in {time.time() - t0:.0f}s, badge", page.get_by_text("tok/s").last.inner_text())
+        page.wait_for_timeout(800)
+        r = present(page, f"{tag}-fix{fixes}")
     if not r or not r["clean"]:
         shot(page, f"{tag}-rejected")
         try:

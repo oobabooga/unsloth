@@ -1,4 +1,4 @@
-name: AMD DevLab NPU blog stills, voxel kingdom x30 tries (main 4ef06c9 + #18107 + #18196)
+name: AMD DevLab NPU blog stills, voxel kingdom + auto-fix, 2x8 tries (main 4ef06c9 + #18107 + #18196)
 
 on:
   push:
@@ -9,11 +9,11 @@ permissions: {}
 jobs:
   shoot:
     runs-on: [self-hosted, Linux, strix-halo, devlab-dispatch]
-    timeout-minutes: 300
+    timeout-minutes: 360
     strategy:
       fail-fast: false
       matrix:
-        shard: [a, b, c]
+        shard: [d, e]
     env:
       BASE_SHA: 4ef06c9992eca6bc5d560bb8d1666e5995a04d44
       STACK_SHA: 7ca16ae8f610f838a6598c6624fbcaeda31f4e03
@@ -80,7 +80,7 @@ jobs:
 
       - name: Try 01
         continue-on-error: true
-        timeout-minutes: 30
+        timeout-minutes: 50
         shell: bash {0}
         run: |
           mkdir -p "$W/out/try-01"
@@ -98,7 +98,7 @@ jobs:
 
       - name: Try 02
         continue-on-error: true
-        timeout-minutes: 30
+        timeout-minutes: 50
         shell: bash {0}
         run: |
           mkdir -p "$W/out/try-02"
@@ -116,7 +116,7 @@ jobs:
 
       - name: Try 03
         continue-on-error: true
-        timeout-minutes: 30
+        timeout-minutes: 50
         shell: bash {0}
         run: |
           mkdir -p "$W/out/try-03"
@@ -134,7 +134,7 @@ jobs:
 
       - name: Try 04
         continue-on-error: true
-        timeout-minutes: 30
+        timeout-minutes: 50
         shell: bash {0}
         run: |
           mkdir -p "$W/out/try-04"
@@ -152,7 +152,7 @@ jobs:
 
       - name: Try 05
         continue-on-error: true
-        timeout-minutes: 30
+        timeout-minutes: 50
         shell: bash {0}
         run: |
           mkdir -p "$W/out/try-05"
@@ -170,7 +170,7 @@ jobs:
 
       - name: Try 06
         continue-on-error: true
-        timeout-minutes: 30
+        timeout-minutes: 50
         shell: bash {0}
         run: |
           mkdir -p "$W/out/try-06"
@@ -188,7 +188,7 @@ jobs:
 
       - name: Try 07
         continue-on-error: true
-        timeout-minutes: 30
+        timeout-minutes: 50
         shell: bash {0}
         run: |
           mkdir -p "$W/out/try-07"
@@ -206,7 +206,7 @@ jobs:
 
       - name: Try 08
         continue-on-error: true
-        timeout-minutes: 30
+        timeout-minutes: 50
         shell: bash {0}
         run: |
           mkdir -p "$W/out/try-08"
@@ -220,42 +220,6 @@ jobs:
         with:
           name: castle-${{ matrix.shard }}-try-08
           path: ${{ runner.temp }}/npu-voxel-${{ github.run_id }}-${{ matrix.shard }}/out/try-08/
-          if-no-files-found: ignore
-
-      - name: Try 09
-        continue-on-error: true
-        timeout-minutes: 30
-        shell: bash {0}
-        run: |
-          mkdir -p "$W/out/try-09"
-          TRIES=1 PLAYWRIGHT_BROWSERS_PATH="$W/pw-browsers" BASE="http://127.0.0.1:$PORT" OUT="$W/out/try-09" \
-            "$W/pwvenv/bin/python" "$RUNNER_TEMP/shoot.py" 2>&1 | grep -vF "$PW" | tee "$W/out/try-09/log.txt"
-          exit "${PIPESTATUS[0]}"
-
-      - uses: actions/upload-artifact@v4
-        if: always()
-        continue-on-error: true
-        with:
-          name: castle-${{ matrix.shard }}-try-09
-          path: ${{ runner.temp }}/npu-voxel-${{ github.run_id }}-${{ matrix.shard }}/out/try-09/
-          if-no-files-found: ignore
-
-      - name: Try 10
-        continue-on-error: true
-        timeout-minutes: 30
-        shell: bash {0}
-        run: |
-          mkdir -p "$W/out/try-10"
-          TRIES=1 PLAYWRIGHT_BROWSERS_PATH="$W/pw-browsers" BASE="http://127.0.0.1:$PORT" OUT="$W/out/try-10" \
-            "$W/pwvenv/bin/python" "$RUNNER_TEMP/shoot.py" 2>&1 | grep -vF "$PW" | tee "$W/out/try-10/log.txt"
-          exit "${PIPESTATUS[0]}"
-
-      - uses: actions/upload-artifact@v4
-        if: always()
-        continue-on-error: true
-        with:
-          name: castle-${{ matrix.shard }}-try-10
-          path: ${{ runner.temp }}/npu-voxel-${{ github.run_id }}-${{ matrix.shard }}/out/try-10/
           if-no-files-found: ignore
 
       - name: Studio log tail
