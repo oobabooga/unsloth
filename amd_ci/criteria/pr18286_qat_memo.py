@@ -136,6 +136,12 @@ def table(obs):
                          f"{c.get('fake_quantized_linears')} | {ls} | {c.get('finite_losses')} | {c.get('eval_logits_finite')} | "
                          f"{mem(c.get('memo_after_train'))} | {mem(c.get('memo_after_eval'))} | "
                          f"{' '.join(str(c.get('error') or '').split())[:200]} |")
+    lines += ["", "test_compile_trace_unchanged control (same fullgraph trace, int8-int4 QAT LoRA block):", "",
+              "| state | memo | memo module | traced | frame_count | equal | error |", "|---|---|---|---|---|---|---|"]
+    for name in ("base", "head"):
+        for tag, r in sorted(((obs.get(name) or {}).get("compile_ctl") or {}).items()):
+            lines.append(f"| {name} | {tag} | {r.get('memo_module')} | {r.get('traced')} | {r.get('frame_count')} | {r.get('equal')} | "
+                         f"{' '.join(str(r.get('trace_error') or r.get('error') or '').split())[:260]} |")
     h = obs.get("head") or {}
     if h:
         p = problems(h)

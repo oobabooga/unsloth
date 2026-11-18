@@ -32,10 +32,10 @@ HERE = Path(__file__).resolve().parent
 BASE_SHA = "40cbeb7c5f03b559e564b2d41f514e67388a8dc9"
 PATCH = HERE / "pr18286_head_be911c3.diff"
 TEST = "tests/test_qat_weight_memo.py"
-NEED = ("torchao", "peft", "unsloth_zoo", "trl", "transformers", "datasets", "accelerate")
+NEED = ("torchao", "peft", "unsloth_zoo", "trl", "transformers", "datasets", "accelerate", "bitsandbytes")
 PIP_SPECS = ["torchao>=0.15.0", "unsloth_zoo>=2026.11.6", "transformers", "trl", "peft", "accelerate", "datasets",
              "sentencepiece", "protobuf", "hf_transfer", "safetensors", "typer", "rich", "pydantic", "pyyaml", "tyro",
-             "nest-asyncio", "diffusers"]
+             "nest-asyncio", "diffusers", "bitsandbytes"]
 
 ap = argparse.ArgumentParser()
 ap.add_argument("--state", required = True)
@@ -76,8 +76,11 @@ def pin():
     steps.append(("checkout", *git("-c", "advice.detachedHead=false", "checkout", "-q", "-f", "--detach", BASE_SHA)))
     steps.append(("clean", *git("clean", "-fdq", "--", "unsloth", "tests")))
     if a.state == "head":
-        steps.append(("apply_cached", *git("apply", "--cached", "--whitespace=nowarn", str(PATCH))))
-        rc, files = git("apply", "--numstat", str(PATCH))
+        # actions/checkout on Windows converts the branch's .diff to CRLF; the index blobs are LF.
+        lf = work / PATCH.name
+        lf.write_bytes(PATCH.read_bytes().replace(b"\r\n", b"\n"))
+        steps.append(("apply_cached", *git("apply", "--cached", "--whitespace=nowarn", str(lf))))
+        rc, files = git("apply", "--numstat", str(lf))
         paths = [ln.split("\t")[-1] for ln in files.splitlines() if "\t" in ln]
         steps.append(("checkout_index", *git("checkout-index", "-f", "--", *paths)))
     rc, tree = git("write-tree")
@@ -174,6 +177,20 @@ save()
 obs["test"] = run_tests()
 save()
 obs["cells"] = {"default": cell("default", {})}
+save()
+# Control for test_compile_trace_unchanged: the same fullgraph trace with no memo (base) / memo off and on (head).
+obs["compile_ctl"] = {}
+for tag, extra in ((("nomemo", {}),) if a.state == "base" else (("memo_off", {"UNSLOTH_QAT_WEIGHT_MEMO": "0"}), ("memo_auto", {}))):
+    f = work / f"ctl_{tag}.json"
+    try:
+        p = subprocess.run([a.python, str(HERE / "pr18286_compile_ctl.py"), str(f)], cwd = work, capture_output = True, text = True,
+                           encoding = "utf-8", errors = "replace", env = env_for({"UNSLOTH_COMPILE_LOCATION": str(work / "ucache_c"), **extra}),
+                           timeout = 900)
+        r = json.loads(f.read_text(encoding = "utf-8")) if f.is_file() else {"error": (p.stdout + p.stderr)[-1500:]}
+        r["rc"] = p.returncode
+    except subprocess.TimeoutExpired:
+        r = {"error": "timeout"}
+    obs["compile_ctl"][tag] = r
 save()
 if a.state == "head":
     obs["cells"]["memo_off"] = cell("memo_off", {"UNSLOTH_QAT_WEIGHT_MEMO": "0"})
