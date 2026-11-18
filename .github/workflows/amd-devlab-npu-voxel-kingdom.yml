@@ -1,4 +1,4 @@
-name: AMD DevLab NPU blog stills, voxel kingdom + auto-fix, 2x8 tries (main 4ef06c9 + #18107 + #18196)
+name: AMD DevLab NPU blog stills, voxel kingdom spinning triangle lattice, auto-fix, 2x8 tries (main 4ef06c9 + #18107 + #18196)
 
 on:
   push:
@@ -92,7 +92,7 @@ jobs:
         if: always()
         continue-on-error: true
         with:
-          name: castle-${{ matrix.shard }}-try-01
+          name: lattice-${{ matrix.shard }}-try-01
           path: ${{ runner.temp }}/npu-voxel-${{ github.run_id }}-${{ matrix.shard }}/out/try-01/
           if-no-files-found: ignore
 
@@ -110,7 +110,7 @@ jobs:
         if: always()
         continue-on-error: true
         with:
-          name: castle-${{ matrix.shard }}-try-02
+          name: lattice-${{ matrix.shard }}-try-02
           path: ${{ runner.temp }}/npu-voxel-${{ github.run_id }}-${{ matrix.shard }}/out/try-02/
           if-no-files-found: ignore
 
@@ -128,7 +128,7 @@ jobs:
         if: always()
         continue-on-error: true
         with:
-          name: castle-${{ matrix.shard }}-try-03
+          name: lattice-${{ matrix.shard }}-try-03
           path: ${{ runner.temp }}/npu-voxel-${{ github.run_id }}-${{ matrix.shard }}/out/try-03/
           if-no-files-found: ignore
 
@@ -146,7 +146,7 @@ jobs:
         if: always()
         continue-on-error: true
         with:
-          name: castle-${{ matrix.shard }}-try-04
+          name: lattice-${{ matrix.shard }}-try-04
           path: ${{ runner.temp }}/npu-voxel-${{ github.run_id }}-${{ matrix.shard }}/out/try-04/
           if-no-files-found: ignore
 
@@ -164,7 +164,7 @@ jobs:
         if: always()
         continue-on-error: true
         with:
-          name: castle-${{ matrix.shard }}-try-05
+          name: lattice-${{ matrix.shard }}-try-05
           path: ${{ runner.temp }}/npu-voxel-${{ github.run_id }}-${{ matrix.shard }}/out/try-05/
           if-no-files-found: ignore
 
@@ -182,7 +182,7 @@ jobs:
         if: always()
         continue-on-error: true
         with:
-          name: castle-${{ matrix.shard }}-try-06
+          name: lattice-${{ matrix.shard }}-try-06
           path: ${{ runner.temp }}/npu-voxel-${{ github.run_id }}-${{ matrix.shard }}/out/try-06/
           if-no-files-found: ignore
 
@@ -200,7 +200,7 @@ jobs:
         if: always()
         continue-on-error: true
         with:
-          name: castle-${{ matrix.shard }}-try-07
+          name: lattice-${{ matrix.shard }}-try-07
           path: ${{ runner.temp }}/npu-voxel-${{ github.run_id }}-${{ matrix.shard }}/out/try-07/
           if-no-files-found: ignore
 
@@ -218,7 +218,7 @@ jobs:
         if: always()
         continue-on-error: true
         with:
-          name: castle-${{ matrix.shard }}-try-08
+          name: lattice-${{ matrix.shard }}-try-08
           path: ${{ runner.temp }}/npu-voxel-${{ github.run_id }}-${{ matrix.shard }}/out/try-08/
           if-no-files-found: ignore
 

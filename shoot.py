@@ -17,20 +17,15 @@ OUT.mkdir(parents = True, exist_ok = True)
 MODEL = os.environ.get("MODEL", "qwen3.6-moe-35b-a3b-FLM")
 NEW_NAME = os.environ.get("NEW_NAME", "Qwen3.6-35B-A3B-NPU2")
 PROMPT = (
-    "using html with embedded JavaScript with 3js make a voxel art model of a medieval kingdom, please dont just "
-    "make it out of blocks i want real voxels and a nice scene to demo with good lighting, good grass and trees "
-    "and paths and the kingdom buildings."
-    " Make the scene big and rich: a stone castle with curtain walls, corner towers and a gatehouse on a low hill, "
-    "a clear dirt road from the gate down through a village of at least six houses with different roofs, a river "
-    "with a bridge or a pond, and lots of trees (at least 100) in varied greens, plus bushes, rocks and flowers. "
-    "Use one self-contained HTML file with three.js r128 and OrbitControls from a CDN, size the renderer from "
-    "window.innerWidth and window.innerHeight and update it correctly on resize, frame the camera so the whole "
-    "kingdom fills the view at a 3/4 angle, and keep any on-screen text small in a corner. Build every structure "
-    "and tree from many small voxel cubes, never from single large boxes, and keep the whole kingdom on one "
-    "connected island of terrain. Voxels must touch with no gaps (cube size equal to the grid spacing) so the "
-    "ground, walls and roofs read as solid surfaces, and give every building a clear shape with walls, a roof "
-    "and a door. Keep it light enough for a browser tab: one InstancedMesh per colour, only the top layer of "
-    "ground, and under about 200,000 voxels in total."
+    "using html with embedded JavaScript with three.js make a cool spinning 3D triangle lattice: a big equilateral "
+    "triangle filled with a triangular lattice of glowing dots (about 15 dots per side), every neighbouring pair "
+    "connected by a thin stick, so it reads as a triangle mesh. Give it soft-body physics: treat the dots as masses "
+    "and the sticks as springs, pin the three corners, and let a gentle wave or wind ripple through the mesh so it "
+    "flexes and settles while the whole thing slowly spins. Make it look polished: a soft light gradient background "
+    "(not black), dots and sticks coloured with a smooth gradient across the triangle, good lighting with soft "
+    "shadows, and frame the camera so the triangle fills most of the view. Use one self-contained HTML file with "
+    "three.js r128 and OrbitControls from a CDN, size the renderer from window.innerWidth and window.innerHeight and "
+    "update it on resize, and keep any on-screen text small in a corner."
 )
 W, H = 1440, 900
 ERRORS = []
