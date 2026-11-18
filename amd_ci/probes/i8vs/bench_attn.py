@@ -79,6 +79,7 @@ def main() -> int:
                            'layer split), all in one plan')
     ap.add_argument("--model-gen", default = "{}", help = "JSON overriding every family's generation params")
     ap.add_argument("--prompts", type = int, default = 2)
+    ap.add_argument("--model-arms", default = "", help = "keep only these arm letters, e.g. D,U,N,K (default: all)")
     ap.add_argument("--backend", default = "", help = "Studio backend dir (default ROOT/src/unsloth/studio/backend)")
     ap.add_argument("--python", default = "", help = "Studio venv python (default ROOT/studio_py.txt, else this one)")
     a = ap.parse_args()
@@ -150,8 +151,15 @@ def main() -> int:
                 for arm in f["arms"]:
                     if var.get("gpu_ids"):
                         arm["load"] = {**arm.get("load", {}), "gpu_ids": var["gpu_ids"]}
+                    if var.get("load"):
+                        arm["load"] = {**arm.get("load", {}), **var["load"]}
                     if var.get("env"):
                         arm["env"] = {**arm.get("env", {}), **var["env"]}
+                if a.model_arms:
+                    keep = set(a.model_arms.split(","))
+                    f["arms"] = [x for x in f["arms"] if x["tag"].rstrip("0123456789") in keep]
+                    tags = {x["tag"] for x in f["arms"]}
+                    f["pairs"] = [pr for pr in f["pairs"] if set(pr.split(":")) <= tags]
                 if var.get("tag"):
                     f["name"] = f"{name}{var['tag']}"
                 fams.append(f)
@@ -170,6 +178,12 @@ def main() -> int:
         for p in mout.glob("scores_*.json"):
             res["models"]["scores"][p.stem[7:]] = json.loads(p.read_text())
         save()
+    # 3b. Studio's persisted verdicts (per card, with the ordinal each entry's gpu_uuid maps to here)
+    pdj = OUT / "persisted_verdicts.json"
+    sh([spy, "-u", str(HERE / "persist_dump.py"), "--out", str(pdj), str(R / "kb_home"), str(R / "studio_home")],
+       OUT / "_logs" / "persist_dump.log", env = env)
+    res["persisted"] = json.loads(pdj.read_text()) if pdj.exists() else {"error": "persist_dump produced nothing"}
+    save()
     # 4. markdown
     import e2e_table
     import kb_summary
@@ -207,6 +221,18 @@ def main() -> int:
             md.append(f"| {r['shape']} | {r['card']} | {b['int8']}/{b['native']}{' (cached)' if b['verdict_already_cached'] else ''} | "
                       f"{r['verdict']['ok']} / {r['verdict']['impl']} | {f_['int8']}/{f_['native']} | {r['out_device']} | "
                       f"{r['acc']['cos']} | {r['acc']['rel_l1']} | {all(r['pass'].values())} |")
+        md.append("")
+    pers = res.get("persisted") or {}
+    if pers.get("files"):
+        md.append("## Persisted INT8 verdicts (Studio probe cache, per card)\n")
+        md.append("| file | card ordinal | gpu | capability | decisions | ok / impl per key |")
+        md.append("|---|---|---|---|---|---|")
+        for f in pers["files"]:
+            for e in f.get("entries", []):
+                ks = "; ".join(f"{k}: {(v or {}).get('ok')}/{(v or {}).get('impl')}" if isinstance(v, dict) else f"{k}: {v}"
+                               for k, v in list(e["decisions"].items())[:8])
+                md.append(f"| {Path(f['path']).parent.parent.name}/{Path(f['path']).name} | {e['ordinal']} | {e['gpu_name']} | "
+                          f"{e['capability']} | {e['n_decisions']} | {ks} |")
         md.append("")
     if a.models and (OUT / "models").exists():
         md.append("## Models end to end\n")

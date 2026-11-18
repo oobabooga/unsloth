@@ -25,6 +25,9 @@ def main() -> int:
     ap.add_argument("--out", required = True)
     ap.add_argument("--models", default = "")
     ap.add_argument("--kb-args", default = "")
+    ap.add_argument("--kb-subset", action = "store_true", help = "bf16, head_dim 64/128, heads 24/56, 4k-16k tokens")
+    ap.add_argument("--model-steps", type = int, default = 0)
+    ap.add_argument("--model-arms", default = "")
     a = ap.parse_args()
     out = Path(a.out)
     if a.state != "head":
@@ -39,8 +42,13 @@ def main() -> int:
     cmd = [sys.executable, "-u", str(HERE / "i8vs" / "bench_attn.py"), "--root", str(root), "--out", str(bout),
            "--backend", str(Path(a.checkout) / "studio" / "backend"), "--python", sys.executable, "--mgpu", "off",
            "--prompts", "1"]
-    if a.kb_args:
-        cmd += ["--kb-args", a.kb_args]
+    kb = a.kb_args or ("--dtypes bfloat16 --head-dims 64,128 --heads 24,56 --tokens 4096,8192,16384" if a.kb_subset else "")
+    if kb:
+        cmd += [f"--kb-args={kb}"]
+    if a.model_steps:
+        cmd += ["--model-gen", json.dumps({"steps": a.model_steps})]
+    if a.model_arms:
+        cmd += ["--model-arms", a.model_arms]
     if a.models:
         cmd += ["--models", a.models]
     rc = subprocess.run(cmd).returncode
