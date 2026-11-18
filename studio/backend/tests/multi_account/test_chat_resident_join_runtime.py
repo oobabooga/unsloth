@@ -59,12 +59,15 @@ class StrictLlama(FakeLlama):
             and (intent.hf_variant or "").lower() == VARIANT.lower()
         )
 
-    def adopt_load_intent_if_matched(self, intent):
+    def load_intent_satisfied(self, intent):
         resident = self.last_load_intent
-        matched = self.matches_load_source(intent) and (
+        return self.matches_load_source(intent) and (
             intent.n_parallel,
             intent.tensor_parallel,
         ) == (resident.n_parallel, resident.tensor_parallel)
+
+    def adopt_load_intent_if_matched(self, intent):
+        matched = self.load_intent_satisfied(intent)
         if matched:
             self.adopted.append(intent)
         return matched
@@ -220,3 +223,140 @@ def test_a_retired_loader_is_not_seeded_back(strict, accounts):
     access.retire_resident_shares(accounts["bob"].account_id)
     assert load(accounts["alice"]).status == "already_loaded"
     assert access._resident_sharers["chat"] == {accounts["alice"].account_id}
+
+
+@pytest.mark.parametrize("prior_preview", [False, True])
+@pytest.mark.parametrize(
+    "path, claim_resident",
+    [
+        ("/v1/chat/completions", True),
+        ("/v1/messages/count_tokens", False),
+        ("/v1/completions", False),
+    ],
+)
+def test_configured_alias_refuses_capacity_relaxed_join(
+    monkeypatch, strict, accounts, prior_preview, path, claim_resident
+):
+    # The real loader's ordinary shared-runtime join cannot count as applying an explicit alias config.
+    from dataclasses import replace
+    from fastapi import HTTPException
+    from core.inference import local_model_resolver as resolver
+    from utils import openai_auto_switch_settings as settings
+    from utils.model_aliases import MODEL_ALIAS_CONFIG_SCOPE_KEY
+
+    strict.last_load_intent = replace(
+        strict.last_load_intent, n_ctx = 2048, cache_type_kv = "q4_0", speculative_type = "off"
+    )
+    strict._requested_spec_mode = "off"
+    strict._loaded_by_user_action = True
+    prior_marker = RESIDENT if prior_preview else None
+    monkeypatch.setattr(inference, "_preview_resident_ident", prior_marker)
+    prior_sharers = set(access._resident_sharers.get("chat", ()))
+    target = f"{RESIDENT}:{VARIANT}"
+    config = {"max_seq_length": 98304, "kv_cache_dtype": "q5_1", "speculative_type": "off"}
+    monkeypatch.setattr(settings, "get_openai_auto_switch_enabled", lambda: True)
+    monkeypatch.setattr(
+        resolver, "resolve_local_gguf", lambda *a, **k: (RESIDENT, VARIANT, RESIDENT)
+    )
+    request = SimpleNamespace(
+        app = SimpleNamespace(state = SimpleNamespace(llama_parallel_slots = 1)),
+        scope = {
+            MODEL_ALIAS_CONFIG_SCOPE_KEY: {
+                "model": target,
+                "load_config": config,
+                "unsupported": False,
+            }
+        },
+        state = SimpleNamespace(),
+        url = SimpleNamespace(path = path),
+    )
+    with pytest.raises(HTTPException) as exc:
+        run_as(
+            accounts["alice"],
+            lambda: asyncio.run(
+                inference._maybe_auto_switch_model(
+                    target, request, accounts["alice"].username, claim_resident = claim_resident
+                )
+            ),
+        )
+    assert exc.value.status_code == 409
+    assert strict.last_load_intent.n_ctx == 2048
+    assert strict.last_load_intent.cache_type_kv == "q4_0"
+    assert not strict.unloaded
+    assert strict._loaded_by_user_action is True
+    assert inference._get_preview_resident() == prior_marker
+    assert access._resident_sharers.get("chat", set()) == prior_sharers
+    if not prior_preview:
+        with pytest.raises(HTTPException) as preview:
+            run_as(
+                accounts["alice"],
+                lambda: asyncio.run(
+                    inference.load_model_for_preview(
+                        LoadRequest(model_path = "/outputs/another-checkpoint"),
+                        request,
+                        accounts["alice"].username,
+                    )
+                ),
+            )
+        assert preview.value.status_code == 503
+        assert "Unload it before using this preview" in preview.value.detail
+        assert not strict.unloaded
+
+
+@pytest.mark.parametrize("resident_diffusion", [False, True])
+def test_configured_alias_refuses_a_diffusion_target_before_replacing(
+    monkeypatch, strict, accounts, resident_diffusion
+):
+    # The diffusion runner ignores the alias settings and records no load intent: refuse before teardown.
+    from fastapi import HTTPException
+
+    class StopBeforeLaunch(Exception):
+        pass
+
+    def stop(*a, **k):
+        raise StopBeforeLaunch()
+
+    async def diffusion_placement(*a, **k):
+        return inference._LoadPlacement(None, None, False, True)
+
+    monkeypatch.setattr(
+        inference.ModelConfig, "from_identifier", lambda *a, **k: SimpleNamespace(is_gguf = True)
+    )
+    monkeypatch.setattr(inference, "_require_resolved_base_access", lambda *a, **k: None)
+    monkeypatch.setattr(inference, "_resolve_inherited_extra_args", lambda *a, **k: None)
+    monkeypatch.setattr(inference, "_prepare_load_placement", diffusion_placement)
+    monkeypatch.setattr(inference, "_validate_reasoning_budget_preflight", stop)
+    strict.is_diffusion = resident_diffusion
+    request = LoadRequest(
+        model_path = RESIDENT,
+        gguf_variant = VARIANT if resident_diffusion else "Q8_0",
+        n_parallel = 2,
+        tensor_parallel = True,
+    )
+    fastapi_request = SimpleNamespace(
+        app = SimpleNamespace(state = SimpleNamespace(llama_parallel_slots = 1))
+    )
+
+    def run():
+        return run_as(
+            accounts["alice"],
+            lambda: asyncio.run(
+                inference._load_model_impl(
+                    request, fastapi_request, current_subject = accounts["alice"].username
+                )
+            ),
+        )
+
+    # Without an alias configuration the same request continues toward the launch.
+    if resident_diffusion:
+        assert run().status == "already_loaded"
+    else:
+        with pytest.raises(HTTPException) as reached:
+            run()
+        assert isinstance(reached.value.__cause__ or reached.value.__context__, StopBeforeLaunch)
+    request._alias_load = True
+    with pytest.raises(HTTPException) as exc:
+        run()
+    assert exc.value.status_code == 400
+    assert "DiffusionGemma" in exc.value.detail
+    assert not strict.unloaded
