@@ -529,7 +529,8 @@ def attempt(page, n):
                 b.click()
                 break
         page.wait_for_timeout(1500)
-        nbadge = page.get_by_text("tok/s").count()
+        cards = lambda: page.get_by_text("HTML preview", exact = True).count()
+        ncards = cards()
         err = "; ".join(e for e in r["errs"] if not e.startswith("banner:"))[:200] or r["errs"][0][:200]
         page.get_by_placeholder("Ask anything").click()
         page.keyboard.type(f"The page throws this error: {err}. Please fix it and send the complete corrected HTML file, "
@@ -538,8 +539,19 @@ def attempt(page, n):
         page.keyboard.press("Enter")
         log(tag, f"fix{fixes} sent:", err)
         t0 = time.time()
-        while page.get_by_text("tok/s").count() <= nbadge and time.time() - t0 < 1500:
+        # only the newest reply shows a tok/s badge: wait for a new preview card, then a badge below it
+        while time.time() - t0 < 1500:
             page.wait_for_timeout(5000)
+            if cards() <= ncards:
+                continue
+            badge = page.get_by_text("tok/s").last
+            try:
+                cb = page.get_by_text("HTML preview", exact = True).last.bounding_box()
+                bb = badge.bounding_box() if badge.count() and badge.is_visible() else None
+            except Exception:
+                continue
+            if bb and cb and bb["y"] > cb["y"]:
+                break
         log(tag, f"fix{fixes} reply done in {time.time() - t0:.0f}s, badge", page.get_by_text("tok/s").last.inner_text())
         page.wait_for_timeout(800)
         r = present(page, f"{tag}-fix{fixes}")
