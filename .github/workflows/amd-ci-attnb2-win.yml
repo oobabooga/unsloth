@@ -149,6 +149,12 @@ jobs:
           & $py -m pip install -q --no-deps "torchao==0.17.0" "unsloth_zoo" lpips
           & $py -m pip install -q --no-deps "transformers==5.5.4" "diffusers==0.42.1" "peft==0.18.1" "accelerate==1.15.0" "huggingface_hub==1.33.0" "tokenizers==0.22.2" "safetensors==0.8.0"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          # Studio's setup.ps1 pairs ROCm torch 2.11 / 2.12 with triton-windows>=3.8,<3.9 (Get-TritonWindowsRocmSpec);
+          # without it the INT8 kernel's Triton path cannot run and every verdict fails.
+          & $py -m pip install -q "triton-windows>=3.8,<3.9"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & $py -c "import triton, triton.language; print('triton', triton.__version__)"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           & $py -c "import torch, diffusers, transformers; print('torch', torch.__version__, 'hip', torch.version.hip, 'avail', torch.cuda.is_available(), 'diffusers', diffusers.__version__, 'transformers', transformers.__version__)"
           & $py "$env:GITHUB_WORKSPACE\amd_ci\lib\gate.py" --require rocm gpu --expect-arch gfx1151 `
             --min-gpus 1 --out "$env:AMD_CI_WORK\out\host_torch.json"
