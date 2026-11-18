@@ -3810,6 +3810,247 @@ from utils.current_date_prompt_settings import (
 if TYPE_CHECKING:
     import numpy as np
 
+
+def _raise_alias_configuration_conflict(request: Request) -> None:
+    raise HTTPException(
+        status_code = 409,
+        detail = error_body_for_path(
+            getattr(getattr(request, "url", None), "path", ""),
+            "The requested alias configuration is not loaded. Automatic switching "
+            "requires permission to load this model and a compatible, unshared runtime.",
+            status = 409,
+            code = "model_configuration_not_loaded",
+            param = "model",
+        ),
+    )
+
+
+async def _alias_config_for_request(
+    model: Any,
+    request: Request,
+    *,
+    external: bool = False,
+) -> dict:
+    """The launch settings of the configured alias this request named, or {} for anything else."""
+    from utils.model_aliases import request_alias_entry
+
+    entry = request_alias_entry(getattr(request, "scope", None), model)
+    if entry is None:
+        return {}
+    path = getattr(getattr(request, "url", None), "path", "")
+    if entry["unsupported"]:
+        raise HTTPException(
+            status_code = 409,
+            detail = error_body_for_path(
+                path,
+                "This alias has launch settings saved by a newer version of Unsloth Studio. "
+                "Update Studio, or edit the alias in Settings.",
+                status = 409,
+                code = "model_configuration_unsupported",
+                param = "model",
+            ),
+        )
+    from utils.multi_model_settings import get_multi_model_mode
+
+    if (
+        external
+        or _connection_model_ref(model) is not None
+        or path.rstrip("/").endswith("/embeddings")
+        or await asyncio.to_thread(get_multi_model_mode) != "off"
+    ):
+        raise HTTPException(
+            status_code = 400,
+            detail = "Configured aliases require local GGUF text generation with Keep multiple models loaded Off.",
+        )
+    return entry["load_config"]
+
+
+def _alias_load_kwargs(
+    target_id: str, variant: Optional[str], override_id: str, alias_config: dict
+) -> tuple[dict, dict]:
+    """``(override, LoadRequest kwargs)`` for a configured alias: the model's saved launch settings
+    with the alias's on top. Shared by the switch and the reuse check so both judge one request."""
+    from utils.openai_auto_switch_settings import (
+        model_override_load_kwargs,
+        resolve_override_for_load,
+    )
+
+    _key, override = resolve_override_for_load(target_id, override_id, variant, alias_config)
+    kwargs = {
+        "model_path": target_id,
+        "gguf_variant": variant,
+        **model_override_load_kwargs(override, is_gguf = True),
+    }
+    # Explicit, never inherited: the launch must not depend on what the resident was started with.
+    kwargs["llama_extra_args"] = list(kwargs.get("llama_extra_args") or [])
+    return override, kwargs
+
+
+async def _drop_stale_override_gpu_ids(
+    load_kwargs: dict, index_kind: Optional[str], label: str
+) -> None:
+    """A saved gpu_ids pin naming GPUs this process cannot address is dropped rather than 400 the
+    load. ``index_kind`` is the stored pin's index space; None for a pin sent in this process's."""
+    saved_gpu_ids = load_kwargs.get("gpu_ids")
+    if saved_gpu_ids and not await _override_gpu_ids_still_resolve(saved_gpu_ids, index_kind):
+        # Stale pin (GPU removed, another host, or a backend change renumbering these ids).
+        load_kwargs.pop("gpu_ids", None)
+        load_kwargs.pop("tensor_split", None)
+        logger.warning(
+            "Dropping saved gpu_ids %s for %s: not available here.", saved_gpu_ids, label
+        )
+
+
+def _alias_launch_key(load_kwargs: dict) -> str:
+    """A configured alias launch as one comparable value: target and launch settings, no credentials."""
+    fields = _REPLAY_LOAD_FIELDS | {"model_path", "gguf_variant"}
+    return json.dumps(
+        {key: load_kwargs[key] for key in sorted(load_kwargs) if key in fields}, default = str
+    )
+
+
+async def _alias_launch_satisfied(
+    load_kwargs: dict,
+    override: dict,
+    fastapi_request: Optional[Request],
+    expected_identifier: Optional[str] = None,
+) -> bool:
+    """Whether the resident llama-server already runs this alias launch, judged by the loader's own
+    reuse check. Identity is the caller's to establish (``expected_identifier``: the resident the
+    caller identified); this compares launch settings only."""
+    from core.inference.chat_templates import resolve_effective_chat_template_override
+
+    backend = get_llama_cpp_backend()
+    # One snapshot: catalog reads are not held off teardown, which clears these as we compare.
+    model_identifier = backend.model_identifier
+    if (
+        not backend.is_loaded
+        or not model_identifier
+        or getattr(backend, "is_diffusion", False)
+        or (expected_identifier is not None and model_identifier != expected_identifier)
+    ):
+        return False
+    from utils.openai_auto_switch_settings import stored_gpu_index_kind
+
+    load_kwargs = dict(load_kwargs)
+    await _drop_stale_override_gpu_ids(
+        load_kwargs,
+        stored_gpu_index_kind(override) if "gpu_ids" in override else None,
+        model_identifier,
+    )
+
+    def still_resident() -> bool:
+        return backend.is_loaded and backend.model_identifier == model_identifier
+
+    # The runtime this alias launch started (and its automatic recoveries) serves it, whatever the
+    # loader normalized while launching; the comparison below judges runtimes started otherwise.
+    recorded = getattr(backend, "alias_launch_key", None)
+    if recorded == (model_identifier, _alias_launch_key(load_kwargs)) and still_resident():
+        return True
+
+    def satisfied() -> bool:
+        # Off the loop: building the intent runs drafter discovery, which reads the model's directory.
+        if not still_resident():
+            return False
+        try:
+            request, _extras = _normalize_launch_flags(LoadRequest(**load_kwargs))
+        except HTTPException:
+            # Saved flags the loader refuses cannot be running; a request for the alias reports them.
+            return False
+        try:
+            intent = _active_gguf_intent(
+                request,
+                backend,
+                model_identifier = model_identifier,
+                # As _load_model_impl resolves it, so a bundled family template compares equal.
+                chat_template_override = resolve_effective_chat_template_override(
+                    model_identifier = model_identifier,
+                    user_override = request.chat_template_override,
+                ),
+                n_parallel = _resolve_parallel_slots(request, fastapi_request),
+                native_grant_backed = False,
+            )
+            matched = backend.load_intent_satisfied(intent)
+        except (AttributeError, TypeError):
+            # A runtime torn down mid-comparison is no match; anything else is a real error.
+            if still_resident():
+                raise
+            return False
+        return matched and still_resident()
+
+    return await asyncio.to_thread(satisfied)
+
+
+async def _configured_alias_resident_satisfies(
+    requested_model: str, alias_config: dict, fastapi_request: Optional[Request]
+) -> bool:
+    """Whether the resident model is the alias target running the alias's launch settings."""
+    backend = get_llama_cpp_backend()
+    # One snapshot of the resident: resolution awaits, and an unload or swap may land meanwhile.
+    resident = (
+        backend.model_identifier,
+        backend.hf_variant,
+        getattr(backend, "_openai_advertised_id", None),
+    )
+    if not backend.is_loaded or not resident[0]:
+        return False
+    named_resident = await asyncio.to_thread(_loaded_satisfies, requested_model)
+    from core.inference.local_model_resolver import (
+        local_gguf_pinned_variant,
+        resolve_local_gguf_for_switch,
+        resolve_trusted_cached_local_gguf,
+    )
+    from core.inference.openai_auto_download import looks_like_quant, split_model_ref
+
+    resolved = resolve_trusted_cached_local_gguf(requested_model, include_companion_scope = True)
+    if resolved is None:
+        resolved = await asyncio.to_thread(
+            resolve_local_gguf_for_switch, requested_model, include_companion_scope = True
+        )
+    if not backend.is_loaded or backend.model_identifier != resident[0]:
+        return False
+    if resolved is None:
+        if not named_resident:
+            return False
+        # Loaded from outside the scan roots, so no index row: the resident names its own target.
+        resolved = (resident[0], resident[1], resident[2] or resident[0])
+    target_id, variant, override_id = resolved[:3]
+    _, requested_variant = split_model_ref(requested_model)
+    pinned_variant = local_gguf_pinned_variant(requested_model, allow_scan = False)
+    bare = not looks_like_quant(requested_variant) and pinned_variant is None
+    if not named_resident:
+        # A file loaded by path shares no spelling with its indexed directory: match the artifact and,
+        # for a pinned alias, the quant, as the plain-name preflight does.
+        index_base = requested_model.rpartition(":")[0] or requested_model
+        if not await asyncio.to_thread(_resolves_to_resident, target_id, llama_only = True):
+            return False
+        if not bare and not await asyncio.to_thread(
+            _resident_quant_is, pinned_variant or variant, index_base
+        ):
+            return False
+    if bare:
+        # A bare alias accepts the resident quant, not just the resolver's preferred one.
+        variant = resident[1] or variant
+    override, load_kwargs = _alias_load_kwargs(target_id, variant, override_id, alias_config)
+    return await _alias_launch_satisfied(
+        load_kwargs, override, fastapi_request, expected_identifier = resident[0]
+    )
+
+
+async def _validate_configured_alias_request(
+    request: Request, _subject: str = Depends(get_current_subject)
+) -> None:
+    from utils.model_aliases import MODEL_ALIAS_CONFIG_SCOPE_KEY
+    if request.scope.get(MODEL_ALIAS_CONFIG_SCOPE_KEY):
+        body = await request.json()
+        if isinstance(body, dict):
+            await _alias_config_for_request(
+                body.get("model"),
+                request,
+                external = bool(body.get("provider_id") or body.get("provider_type")),
+            )
+
+
 router = APIRouter()
 # Unsloth-only router (not mounted on /v1 OpenAI-compat).
 studio_router = APIRouter()
@@ -8395,6 +8636,8 @@ def _note_replay_launch(llama_backend, request: LoadRequest) -> None:
     owned = model_override_load_kwargs(override, is_gguf = True)
     fields = (request.model_fields_set & _REPLAY_LOAD_FIELDS) - owned.keys()
     llama_backend.replay_launch = request.model_dump(include = fields)
+    # Any load replaces the runtime a configured alias recorded; the alias switch records its own after.
+    llama_backend.alias_launch_key = None
 
 
 def _replay_load_kwargs(launch, override_kwargs) -> dict[str, Any]:
@@ -8672,6 +8915,82 @@ def _should_strip_tensor_split(request: LoadRequest) -> bool:
         getattr(request, "gpu_memory_mode", "auto") == "manual"
         and getattr(request, "gpu_layers", -1) >= 0
     )
+
+
+def _normalize_launch_flags(request: LoadRequest) -> tuple[LoadRequest, Optional[list[str]]]:
+    """``(request, extras)`` as the loader reads them before deciding anything: validated
+    pass-through flags (a managed-flag collision 400s before any model work), a --reasoning-budget
+    promoted to its field, and under Manual GPU memory -ngl / -ts promoted to gpu_layers /
+    tensor_split with the offload flags stripped. Shared with the configured-alias reuse check so
+    both judge the same request."""
+    try:
+        extra_llama_args = validate_extra_args(request.llama_extra_args)
+    except ValueError as exc:
+        # Keep the curated validation message (names the flag); just strip paths.
+        logger.warning("inference.validate_extra_args_failed: %s", exc)
+        raise HTTPException(
+            status_code = 400,
+            detail = redact_native_paths(str(exc)),
+        )
+    # Restore None so inheritance can tell 'omitted' from explicit [].
+    extra_llama_args: Optional[list[str]] = (
+        None if request.llama_extra_args is None else extra_llama_args
+    )
+
+    _reasoning_updates = {}
+    _reasoning_budget_override = parse_reasoning_budget_override(extra_llama_args)
+    if _reasoning_budget_override is not None:
+        _reasoning_updates["reasoning_budget"] = _reasoning_budget_override
+    _reasoning_message_override = parse_reasoning_budget_message_override(extra_llama_args)
+    if _reasoning_message_override is not None:
+        _reasoning_updates["reasoning_budget_message"] = _reasoning_message_override
+
+    # Manual owns offload flags: promote -ngl/-ts into fields before stripping.
+    if request.gpu_memory_mode == "manual" and extra_llama_args:
+        _manual_updates: dict[str, Any] = {}
+        _gpu_layers_override = parse_gpu_layers_override(extra_llama_args)
+        if _gpu_layers_override is not None:
+            _manual_updates["gpu_layers"] = _gpu_layers_override
+        # Reserialize only where the launcher rewrites the ratio (_should_strip_tensor_split); Auto layers drop both copies before argv. Return 400, not 500.
+        _resolved_layers = (
+            _gpu_layers_override
+            if _gpu_layers_override is not None
+            else getattr(request, "gpu_layers", -1)
+        )
+        try:
+            _tensor_split_override = parse_tensor_split_override(
+                extra_llama_args, reserialized = _resolved_layers >= 0
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code = 400, detail = redact_native_paths(str(exc))) from exc
+        if _tensor_split_override is not None:
+            _manual_updates["tensor_split"] = _tensor_split_override
+        if _manual_updates:
+            request = request.model_copy(update = _manual_updates)
+        _stripped_explicit = strip_shadowing_flags(
+            extra_llama_args,
+            strip_context = False,
+            strip_cache = False,
+            strip_spec = False,
+            strip_template = False,
+            strip_split_mode = False,
+            strip_tensor_split = _should_strip_tensor_split(request),
+            strip_offload = True,
+        )
+        if _stripped_explicit != extra_llama_args:
+            logger.info(
+                "Manual GPU memory owns the offload flags; stripping them "
+                "from explicit llama_extra_args: %s -> %s",
+                extra_llama_args,
+                _stripped_explicit,
+            )
+            extra_llama_args = _stripped_explicit
+
+    # Downstream (incl. already-loaded comparison) must see the normalized list.
+    request = request.model_copy(update = {"llama_extra_args": extra_llama_args})
+    if _reasoning_updates:
+        request = request.model_copy(update = _reasoning_updates)
+    return request, extra_llama_args
 
 
 def _strip_inherited_extras(
@@ -9556,6 +9875,29 @@ def _target_accepts_audio_input(load_path: str) -> bool:
     except Exception as exc:
         logger.debug("auto-switch: audio probe failed for %s: %s", load_path, exc)
         return True
+
+
+def _alias_disables_projector(
+    load_kwargs: dict,
+    target_id: str,
+    variant: Optional[str],
+    companion_roots: tuple[str, ...],
+    needs_image: bool,
+) -> bool:
+    from core.inference.llama_cpp import _extra_args_device
+
+    extra_args = load_kwargs.get("llama_extra_args")
+    if extra_args_disable_mmproj(extra_args):
+        return True
+    if not load_kwargs.get("disable_vision"):
+        return False
+    if needs_image:
+        return True
+    # Vision off keeps audio-only projectors; a custom --mmproj wins over discovery.
+    custom = _extra_args_device(extra_args, {"--mmproj", "-mm"})
+    if custom is not None:
+        return not _projector_survives_vision_off(custom)
+    return _target_is_vision(target_id, variant, True, companion_roots)
 
 
 def _names_video_token(config) -> bool:
@@ -11702,6 +12044,18 @@ async def _maybe_auto_switch_model(
     the chat route, the only one an NPU model serves; ``npu_request_check``
     refuses a request an NPU target would reject once loaded, given its catalog entry.
     """
+    alias_config = await _alias_config_for_request(requested_model, fastapi_request)
+
+    async def _alias_resident_satisfies() -> bool:
+        return await _configured_alias_resident_satisfies(
+            requested_model, alias_config, fastapi_request
+        )
+
+    async def _config_requires_switch() -> None:
+        # Exits that never load: a configured alias is served only by a resident already running it.
+        if alias_config and not await _alias_resident_satisfies():
+            _raise_alias_configuration_conflict(fastapi_request)
+
     # A text-only GGUF reads tool-result images as a note, so only audio or video needs its mmproj.
     gguf_requires_vision = (
         (require_audio_input or require_video) if tool_images_only else require_vision
@@ -11734,6 +12088,7 @@ async def _maybe_auto_switch_model(
         elif account_access.resident_hidden("chat", _loaded_slot_ident()):
             raise HTTPException(status_code = 404, detail = "Model not found")
     if routed is not None:
+        await _config_requires_switch()
         return
 
     async def _refuse_foreign_resident() -> None:
@@ -11820,6 +12175,7 @@ async def _maybe_auto_switch_model(
         return
     # Preview route opts out so callers cannot switch away from the pinned checkpoint.
     if _auto_switch_opted_out(fastapi_request):
+        await _config_requires_switch()
         return
     if (
         named_model
@@ -11831,6 +12187,7 @@ async def _maybe_auto_switch_model(
         if not await asyncio.to_thread(_loaded_identity_satisfies, named_model):
             raise HTTPException(status_code = 404, detail = "Model not found")
         await _refuse_foreign_resident()
+        await _config_requires_switch()
         if claim_resident:
             _claim_slot_for_non_preview(fastapi_request)
         return
@@ -11869,13 +12226,18 @@ async def _maybe_auto_switch_model(
         # Reject before claiming the slot.
         await _reject_unservable_model(requested_model, fastapi_request)
         await _refuse_foreign_resident()
+        await _config_requires_switch()
         # Auto-switch off: this non-preview turn uses the resident model, claim it.
         if claim_resident:
             _claim_slot_for_non_preview(fastapi_request)
         return
 
     # Check resident state before the filesystem index; rebuilding it can take seconds.
-    if auto_switch_on and await asyncio.to_thread(_loaded_identity_satisfies, requested_model):
+    if (
+        auto_switch_on
+        and await asyncio.to_thread(_loaded_identity_satisfies, requested_model)
+        and (not alias_config or await _alias_resident_satisfies())
+    ):
         await _refuse_foreign_resident()
         warm_index_soon()
         if claim_resident:
@@ -11887,11 +12249,25 @@ async def _maybe_auto_switch_model(
         auto_switch_on = False
         if not idle_unload_is_configured():
             await _reject_unservable_model(requested_model, fastapi_request)
+            await _config_requires_switch()
             return
+
+    if alias_config and not auto_switch_on:
+        # Switching off never loads for a configured alias, an idle-unload restore included: only a
+        # resident already running its launch serves it.
+        await _refuse_foreign_resident()
+        await _config_requires_switch()
+        if claim_resident:
+            _claim_slot_for_non_preview(fastapi_request)
+        return
 
     from core.inference.npu_backend import is_npu_model_path
 
     if auto_switch_on and named_model and is_npu_model_path(named_model):
+        if alias_config:
+            raise HTTPException(
+                status_code = 400, detail = "Configured aliases require a local GGUF text model."
+            )
         # Refused before the switch, so a request the NPU cannot serve never evicts the resident model.
         await _refuse_unservable_npu_switch(
             named_model,
@@ -11946,6 +12322,15 @@ async def _maybe_auto_switch_model(
                     requested_model,
                     include_companion_scope = True,
                 )
+        if resolved is None and alias_config:
+            # A resident outside the scan index has no row but may already run this alias.
+            if await _alias_resident_satisfies():
+                if claim_resident:
+                    _claim_slot_for_non_preview(fastapi_request)
+                return
+            raise HTTPException(
+                status_code = 404, detail = "Configured alias target is not available locally."
+            )
         if resolved is None:
             # A "<run>/checkpoint-N" name looks like a Hub id; the reject below refuses it instead.
             trained = (
@@ -12028,6 +12413,10 @@ async def _maybe_auto_switch_model(
             and not looks_like_audio_cpp(target_id)
             and await asyncio.to_thread(local_target_is_gguf, target_id, override_id)
         )
+        if alias_config and not target_is_gguf:
+            raise HTTPException(
+                status_code = 400, detail = "Configured aliases require a local GGUF text model."
+            )
         gguf_companion_roots: tuple[str, ...] = ()
         if target_is_gguf:
             if resolved is None:
@@ -12126,7 +12515,18 @@ async def _maybe_auto_switch_model(
             if getattr(target_backend, "_openai_advertised_id", None) != override_id:
                 target_backend._openai_advertised_id = override_id
 
-        if _already_serving():
+        async def _serving_request() -> bool:
+            if not _already_serving():
+                return False
+            if not alias_config:
+                return True
+            resident_variant = (backend.hf_variant or variant) if bare else variant
+            override, load_kwargs = _alias_load_kwargs(
+                target_id, resident_variant, override_id, alias_config
+            )
+            return await _alias_launch_satisfied(load_kwargs, override, fastapi_request)
+
+        if await _serving_request():
             # Claiming it stops a later preview swapping it out from under an active OpenAI caller.
             if claim_resident:
                 _set_preview_resident(None)
@@ -12365,7 +12765,7 @@ async def _maybe_auto_switch_model(
                             ollama_same_system = await asyncio.to_thread(
                                 _same_ollama_system, target_id, backend
                             )
-                        if _already_serving():
+                        if await _serving_request():
                             if claim_resident:
                                 _set_preview_resident(None)
                             _record_serving_alias()
@@ -12391,9 +12791,35 @@ async def _maybe_auto_switch_model(
                         )
 
                         # Shared candidate order so the settings panel reads the same row.
-                        _override_key, override = resolve_override_for_load(
-                            target_id, override_id, variant
-                        )
+                        if alias_config:
+                            override, alias_kwargs = _alias_load_kwargs(
+                                target_id, variant, override_id, alias_config
+                            )
+                            if (
+                                target_requires_vision or require_audio_input
+                            ) and await asyncio.to_thread(
+                                _alias_disables_projector,
+                                alias_kwargs,
+                                target_id,
+                                variant,
+                                gguf_companion_roots,
+                                target_requires_image or require_video,
+                            ):
+                                raise HTTPException(
+                                    status_code = 400,
+                                    detail = error_body_for_path(
+                                        switch_path,
+                                        f"{rejection_prefix}The configured alias disables the projector "
+                                        f"required for the {modality_label} input in this request.",
+                                        status = 400,
+                                        code = "invalid_value",
+                                        param = "model",
+                                    ),
+                                )
+                        else:
+                            _override_key, override = resolve_override_for_load(
+                                target_id, override_id, variant
+                            )
                         if require_speech and resolved is not None and speech_budget is not None:
                             target_context = await asyncio.to_thread(
                                 _target_effective_context_length,
@@ -12422,13 +12848,20 @@ async def _maybe_auto_switch_model(
                                         param = "input",
                                     ),
                                 )
-                        load_kwargs = {"model_path": target_id, "gguf_variant": variant}
-                        override_kwargs = model_override_load_kwargs(
-                            override, is_gguf = target_is_gguf
-                        )
-                        if stashed_intent is not None and target_is_gguf:
-                            load_kwargs.update(_replay_load_kwargs(stashed_intent, override_kwargs))
-                        load_kwargs.update(override_kwargs)
+                        if alias_config:
+                            # The alias's own launch, not a replay of whatever idle-unload freed.
+                            load_kwargs = dict(alias_kwargs)
+                            override_kwargs = alias_kwargs
+                        else:
+                            load_kwargs = {"model_path": target_id, "gguf_variant": variant}
+                            override_kwargs = model_override_load_kwargs(
+                                override, is_gguf = target_is_gguf
+                            )
+                            if stashed_intent is not None and target_is_gguf:
+                                load_kwargs.update(
+                                    _replay_load_kwargs(stashed_intent, override_kwargs)
+                                )
+                            load_kwargs.update(override_kwargs)
                         if caller_hf_token:
                             load_kwargs["hf_token"] = caller_hf_token
                         if remote_code_fingerprint:
@@ -12438,25 +12871,22 @@ async def _maybe_auto_switch_model(
                             )
                         if beside:
                             load_kwargs["alongside"] = True
-                        saved_gpu_ids = load_kwargs.get("gpu_ids")
-                        if saved_gpu_ids and not await _override_gpu_ids_still_resolve(
-                            saved_gpu_ids,
+                        await _drop_stale_override_gpu_ids(
+                            load_kwargs,
                             # A replayed pin was sent in this process's index space.
                             stored_gpu_index_kind(override)
                             if "gpu_ids" in override_kwargs
                             else None,
-                        ):
-                            # Stale pin (GPU removed, another host, or a backend change
-                            # renumbering these ids): drop it rather than 400 the load.
-                            load_kwargs.pop("gpu_ids", None)
-                            load_kwargs.pop("tensor_split", None)
-                            logger.warning(
-                                "Dropping saved gpu_ids %s for %s: not available here.",
-                                saved_gpu_ids,
-                                override_id,
-                            )
+                            override_id,
+                        )
+                        # The alias request this launch serves: a retry without the saved GPU pin still
+                        # runs it, so reuse must find it by this key.
+                        launched_alias_key = (
+                            _alias_launch_key(load_kwargs) if alias_config else None
+                        )
                         # Call the impl directly: we hold the lifecycle gate the /load route takes (deadlock).
                         # Deferred claim: base preview ownership on what is actually resident, in a finally.
+                        _switch_prior_resident = _loaded_slot_ident()
                         _switch_prior_marker = _get_preview_resident()
                         _switch_loaded_ok = False
                         try:
@@ -12475,6 +12905,7 @@ async def _maybe_auto_switch_model(
 
                             async def _switch_load(load_request: LoadRequest) -> None:
                                 nonlocal target_backend
+                                load_request._alias_load = bool(alias_config)
                                 if not beside:
                                     await _load_model_impl(
                                         load_request,
@@ -12538,14 +12969,27 @@ async def _maybe_auto_switch_model(
                                 load_request._override_alias_id = override_id
                                 await _switch_load(load_request)
                             _switch_loaded_ok = True
+                            if launched_alias_key is not None:
+                                # Reuse reads this, not the loader's normalized state (_alias_launch_satisfied).
+                                target_backend.alias_launch_key = (
+                                    target_backend.model_identifier,
+                                    launched_alias_key,
+                                )
                             # publish the completed load before a late cancellation is observed.
                             target_backend._openai_advertised_id = override_id
                             target_backend._loaded_by_user_action = False
                             _raise_if_generation_cancelled()
                         finally:
                             if not claim_resident:
-                                if _switch_loaded_ok or _loaded_slot_ident() == target_id:
-                                    _set_preview_resident(_loaded_slot_ident())
+                                resident = _loaded_slot_ident()
+                                # A failed same-model attempt cannot change existing ownership.
+                                if _switch_loaded_ok or (
+                                    resident == target_id
+                                    and not _same_loaded_identifier(
+                                        _switch_prior_resident, resident
+                                    )
+                                ):
+                                    _set_preview_resident(resident)
                                 else:
                                     _set_preview_resident(_switch_prior_marker)
                 finally:
@@ -19485,77 +19929,10 @@ async def _load_model_impl(
     gguf_load_stack = ExitStack()
     token_rejections = gguf_load_stack.enter_context(collecting_hub_token_rejections())
     try:
-        # Validate up front so a managed-flag collision 400s before any model work.
-        try:
-            extra_llama_args = validate_extra_args(request.llama_extra_args)
-        except ValueError as exc:
-            # Keep the curated validation message (names the flag); just strip paths.
-            logger.warning("inference.validate_extra_args_failed: %s", exc)
-            raise HTTPException(
-                status_code = 400,
-                detail = redact_native_paths(str(exc)),
-            )
-        # Restore None so inheritance can tell 'omitted' from explicit [].
-        extra_llama_args: Optional[list[str]] = (
-            None if request.llama_extra_args is None else extra_llama_args
-        )
+        request, extra_llama_args = _normalize_launch_flags(request)
         _refuse_managed_custom_projector(
             extra_llama_args, request.model_path, request._override_alias_id, request.gguf_variant
         )
-
-        _reasoning_updates = {}
-        _reasoning_budget_override = parse_reasoning_budget_override(extra_llama_args)
-        if _reasoning_budget_override is not None:
-            _reasoning_updates["reasoning_budget"] = _reasoning_budget_override
-        _reasoning_message_override = parse_reasoning_budget_message_override(extra_llama_args)
-        if _reasoning_message_override is not None:
-            _reasoning_updates["reasoning_budget_message"] = _reasoning_message_override
-
-        # Manual owns offload flags: promote -ngl/-ts into fields before stripping.
-        if request.gpu_memory_mode == "manual" and extra_llama_args:
-            _manual_updates: dict[str, Any] = {}
-            _gpu_layers_override = parse_gpu_layers_override(extra_llama_args)
-            if _gpu_layers_override is not None:
-                _manual_updates["gpu_layers"] = _gpu_layers_override
-            # Reserialize only where the launcher rewrites the ratio (_should_strip_tensor_split); Auto layers drop both copies before argv. Return 400, not 500.
-            _resolved_layers = (
-                _gpu_layers_override
-                if _gpu_layers_override is not None
-                else getattr(request, "gpu_layers", -1)
-            )
-            try:
-                _tensor_split_override = parse_tensor_split_override(
-                    extra_llama_args, reserialized = _resolved_layers >= 0
-                )
-            except ValueError as exc:
-                raise HTTPException(status_code = 400, detail = redact_native_paths(str(exc))) from exc
-            if _tensor_split_override is not None:
-                _manual_updates["tensor_split"] = _tensor_split_override
-            if _manual_updates:
-                request = request.model_copy(update = _manual_updates)
-            _stripped_explicit = strip_shadowing_flags(
-                extra_llama_args,
-                strip_context = False,
-                strip_cache = False,
-                strip_spec = False,
-                strip_template = False,
-                strip_split_mode = False,
-                strip_tensor_split = _should_strip_tensor_split(request),
-                strip_offload = True,
-            )
-            if _stripped_explicit != extra_llama_args:
-                logger.info(
-                    "Manual GPU memory owns the offload flags; stripping them "
-                    "from explicit llama_extra_args: %s -> %s",
-                    extra_llama_args,
-                    _stripped_explicit,
-                )
-                extra_llama_args = _stripped_explicit
-
-        # Downstream (incl. already-loaded comparison) must see the normalized list.
-        request = request.model_copy(update = {"llama_extra_args": extra_llama_args})
-        if _reasoning_updates:
-            request = request.model_copy(update = _reasoning_updates)
 
         resolved_ollama_path = await _lease_ollama_model_ref(
             request,
@@ -19655,20 +20032,28 @@ async def _load_model_impl(
                 == tuple(request._gguf_companion_roots)
                 and getattr(llama_backend, "_openai_gguf_companion_state", ())
                 == gguf_companion_state
-                and (
-                    llama_backend.adopt_load_intent_if_matched(intent)
-                    # Another account's capacity mismatch is its defaults, not a reconfig (#12365).
-                    or (
-                        replacing
-                        and account_access.joins_resident_runtime(
-                            "chat", llama_backend.model_identifier
-                        )
-                        and llama_backend.components_match_intent(intent)
-                    )
-                )
                 and getattr(llama_backend, "_audio_probed", True)
             ):
                 return None
+            if request._alias_load and getattr(llama_backend, "is_diffusion", False):
+                raise HTTPException(
+                    status_code = 400,
+                    detail = "Configured aliases are not supported for DiffusionGemma models.",
+                )
+            if not llama_backend.adopt_load_intent_if_matched(intent):
+                # Another account's capacity mismatch is its defaults, not a reconfig (#12365).
+                if not (
+                    replacing
+                    and account_access.joins_resident_runtime(
+                        "chat", llama_backend.model_identifier
+                    )
+                    and llama_backend.components_match_intent(intent)
+                ):
+                    return None
+                if request._alias_load:
+                    # A configured alias names those settings: joining would serve others, and
+                    # reloading would reconfigure a runtime another account shares.
+                    _raise_alias_configuration_conflict(fastapi_request)
             api_monitor.discard(_load_event)
             logger.info("Model already loaded (GGUF): %s, skipping reload", model_log_label)
             # A no-op Unsloth load of a preview-owned checkpoint still claims it.
@@ -19883,6 +20268,12 @@ async def _load_model_impl(
 
         # Invalid GPU IDs must fail before the training coexistence guard.
         placement = await _prepare_load_placement(config, request, extra_llama_args)
+        if request._alias_load and placement.diffusion_kind is True:
+            # The diffusion runner records no load intent, so the alias could never match after loading.
+            raise HTTPException(
+                status_code = 400,
+                detail = "Configured aliases are not supported for DiffusionGemma models.",
+            )
         # Ahead of the diffusion drop: an explicit reasoning flag is a refusal, not a no-op.
         await _validate_reasoning_budget_preflight(
             config, placement.diffusion_kind, extra_llama_args, request
@@ -32481,7 +32872,7 @@ async def _collect_chat_completion(lines, model: str):
     return JSONResponse(body)
 
 
-@router.post("/chat/completions")
+@router.post("/chat/completions", dependencies = [Depends(_validate_configured_alias_request)])
 @account_access.gpu_busy_route
 async def openai_chat_completions(
     payload: ChatCompletionRequest,
@@ -38652,14 +39043,29 @@ async def loaded_inference_models(current_subject: str = Depends(get_current_sub
     return {"object": "list", "data": [{**entry, "loaded": True} for entry in models]}
 
 
-async def _openai_catalog_with_aliases(quant_pins: bool = False) -> list[dict]:
-    from utils.model_aliases import alias_model_objects
+async def _openai_catalog_with_aliases(
+    quant_pins: bool = False, fastapi_request: Optional[Request] = None
+) -> list[dict]:
+    from utils.model_aliases import alias_model_objects, get_model_aliases
 
     if quant_pins:
         objects = await _openai_catalog_objects(quant_pins = True)
     else:
         objects = await _openai_catalog_objects()
-    aliases = await asyncio.to_thread(alias_model_objects, objects, _pinned_quant_row)
+    # Residency only when a request would be served without a reload, by the same check.
+    satisfied = set()
+    if get_llama_cpp_backend().is_loaded:
+        for alias in get_model_aliases():
+            if alias.get("load_config") and await _configured_alias_resident_satisfies(
+                alias["model"], alias["load_config"], fastapi_request
+            ):
+                satisfied.add(alias["name"].lower())
+    aliases = await asyncio.to_thread(
+        alias_model_objects,
+        objects,
+        _pinned_quant_row,
+        lambda alias: alias["name"].lower() in satisfied,
+    )
     # The rewrite gives an alias precedence, so a same-named model row would never be served.
     shadowed = {row["id"].lower() for row in aliases}
     return [o for o in objects if str(o.get("id", "")).lower() not in shadowed] + aliases
@@ -38674,7 +39080,9 @@ async def _openai_catalog_with_aliases(quant_pins: bool = False) -> list[dict]:
 @router.get("/models")
 @in_scan_memo
 async def openai_list_models(
-    output_modalities: Optional[str] = None, current_subject: str = Depends(get_current_subject)
+    output_modalities: Optional[str] = None,
+    current_subject: str = Depends(get_current_subject),
+    request: Request = None,
 ):
     """
     OpenAI-compatible model listing endpoint (``GET /v1/models``).
@@ -38685,10 +39093,17 @@ async def openai_list_models(
     """
     wanted = {m.strip() for m in (output_modalities or "").split(",")}
     if not wanted & {"all", "decisions"}:
-        return {"object": "list", "data": await _openai_catalog_with_aliases(quant_pins = True)}
+        return {
+            "object": "list",
+            "data": await _openai_catalog_with_aliases(quant_pins = True, fastapi_request = request),
+        }
     from routes.systemone import decision_model_objects
 
-    data = [] if wanted == {"decisions"} else await _openai_catalog_with_aliases(quant_pins = True)
+    data = (
+        []
+        if wanted == {"decisions"}
+        else await _openai_catalog_with_aliases(quant_pins = True, fastapi_request = request)
+    )
     data += await asyncio.to_thread(decision_model_objects)
     return {"object": "list", "data": data}
 
@@ -38752,7 +39167,11 @@ def _quant_pin_object(listed: dict, variant: str, resident_quants) -> dict:
 
 
 @router.get("/models/{model_id:path}")
-async def openai_retrieve_model(model_id: str, current_subject: str = Depends(get_current_subject)):
+async def openai_retrieve_model(
+    model_id: str,
+    current_subject: str = Depends(get_current_subject),
+    request: Request = None,
+):
     """
     OpenAI-compatible single-model retrieval endpoint (``GET /v1/models/{id}``).
 
@@ -38785,7 +39204,7 @@ async def openai_retrieve_model(model_id: str, current_subject: str = Depends(ge
         ):
             return _with_openai_residency({**entry, "loaded": True})
 
-    objects = await _openai_catalog_with_aliases()
+    objects = await _openai_catalog_with_aliases(fastapi_request = request)
     for model in objects:
         # Case-insensitive to match the resolver, which lowercases its index.
         mid = model.get("id")
@@ -39494,7 +39913,7 @@ async def _mlx_completions(request, current_subject, backend, body: dict, refusa
     }
 
 
-@router.post("/completions")
+@router.post("/completions", dependencies = [Depends(_validate_configured_alias_request)])
 @account_access.gpu_busy_route
 async def openai_completions(request: Request, current_subject: str = Depends(get_current_subject)):
     """
@@ -40340,7 +40759,7 @@ def _embeddings_input_present(body: dict) -> bool:
     return inp is not None
 
 
-@router.post("/embeddings")
+@router.post("/embeddings", dependencies = [Depends(_validate_configured_alias_request)])
 @account_access.gpu_busy_route
 async def openai_embeddings(request: Request, current_subject: str = Depends(get_current_subject)):
     """OpenAI-compatible embeddings: the resident embedding GGUF when one is loaded,
@@ -43039,7 +43458,7 @@ async def _responses_stream(
     )
 
 
-@router.post("/responses")
+@router.post("/responses", dependencies = [Depends(_validate_configured_alias_request)])
 @account_access.gpu_busy_route
 async def openai_responses(
     payload: ResponsesRequest,
@@ -44372,7 +44791,7 @@ def _count_chat_context_tokens(backend, payload, messages, tools, template_kwarg
     return total, parts, rendered.get("prompt")
 
 
-@router.post("/chat/count_tokens")
+@router.post("/chat/count_tokens", dependencies = [Depends(_validate_configured_alias_request)])
 async def chat_count_tokens(
     payload: ChatCountTokensRequest,
     current_subject: str = Depends(get_current_subject),
@@ -45185,7 +45604,7 @@ async def _anthropic_messages_via_connection(
     return JSONResponse(_anthropic_message_from_events([event async for event in events]))
 
 
-@router.post("/messages/count_tokens")
+@router.post("/messages/count_tokens", dependencies = [Depends(_validate_configured_alias_request)])
 async def anthropic_count_tokens(
     payload: AnthropicMessagesRequest,
     request: Request,
@@ -45845,7 +46264,7 @@ async def _anthropic_in_process_messages(
     return _monitor_anthropic_response(response, monitor_id, context_length, cancel_event)
 
 
-@router.post("/messages")
+@router.post("/messages", dependencies = [Depends(_validate_configured_alias_request)])
 @account_access.gpu_busy_route
 async def anthropic_messages(
     payload: AnthropicMessagesRequest,

@@ -373,6 +373,60 @@ def test_runtime_recovery_reloads_without_mtp(monkeypatch):
     assert b._mtp_runtime_fallback_in_progress is False
 
 
+def test_runtime_recovery_preserves_auto_alias_configuration(monkeypatch):
+    # Recovery commits an Off snapshot but keeps Auto as the requested mode, so the loader's reuse
+    # check still serves an Auto alias from the recovered server instead of reloading every request.
+    import asyncio
+    import routes.inference as inference
+    from utils import openai_auto_switch_settings as settings
+
+    backend = _recovery_backend()
+    backend._tensor_parallel = False
+    backend._model_identifier = "owner/repo"
+    backend._hf_variant = "Q4_K_M"
+    backend._healthy = True
+    backend._requested_n_ctx = 4096
+    backend._requested_n_parallel = 1
+    backend._requested_cache_types = ("q4_0", "q4_0")
+    backend._requested_spec_mode = "auto"
+    backend._requested_extra_args = []
+    backend._last_load_intent = replace(
+        backend.last_load_intent,
+        hf_variant = "Q4_K_M",
+        n_ctx = 4096,
+        n_parallel = 1,
+        cache_type_kv = "q4_0",
+        tensor_parallel = False,
+    )
+
+    def load_fallback(intent):
+        backend._last_load_intent = intent
+        backend._requested_spec_mode = intent.speculative_type
+        return True
+
+    monkeypatch.setattr(backend, "load_model", load_fallback)
+    assert backend._maybe_recover_from_mtp_crash(RuntimeError("peer closed")) is True
+    deadline = time.monotonic() + 5
+    while backend._mtp_runtime_fallback_in_progress and time.monotonic() < deadline:
+        time.sleep(0.02)
+    assert backend._mtp_runtime_fallback_in_progress is False
+    assert backend.last_load_intent.speculative_type == "off"
+    assert backend.requested_spec_mode == "auto"
+
+    monkeypatch.setattr(inference, "get_llama_cpp_backend", lambda: backend)
+    monkeypatch.setattr(settings, "get_model_overrides", lambda: {})
+
+    def satisfied(config):
+        override, kwargs = inference._alias_load_kwargs(
+            "owner/repo", "Q4_K_M", "owner/repo", config
+        )
+        return asyncio.run(inference._alias_launch_satisfied(kwargs, override, None))
+
+    config = {"max_seq_length": 4096, "kv_cache_dtype": "q4_0", "speculative_type": "auto"}
+    assert satisfied(config)
+    assert not satisfied({**config, "speculative_type": "off"})
+
+
 @pytest.mark.parametrize(
     "mutate",
     [
