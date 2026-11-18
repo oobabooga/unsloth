@@ -9,10 +9,36 @@ export function resolveEstimateContext(
   skipResidentFallback = false,
 ): number {
   if (skipResidentFallback) {
-    // Manual + Auto layers and builtin presets both resolve to 0; pricing the resident context quotes the old fit.
+    // An Auto GGUF load resolves to 0; pricing the resident context quotes the old fit.
     return customContextLength && customContextLength > 0 ? customContextLength : 0;
   }
   return customContextLength ?? activeLoadedContext ?? 0;
+}
+
+/** The resident context performLoad keeps under Manual fixed layers (`--fit off` would launch at
+ *  native), or null. An unset per-model mode is the standing preference, as in the load. */
+export function fixedLayerContextPin({
+  isGguf,
+  gpuMemoryMode,
+  standingGpuMemoryMode,
+  gpuLayers,
+  customContextLength,
+  activeLoadedContext,
+}: {
+  isGguf: boolean;
+  gpuMemoryMode: "auto" | "manual" | null | undefined;
+  standingGpuMemoryMode: "auto" | "manual";
+  gpuLayers: number | null | undefined;
+  customContextLength: number | null | undefined;
+  activeLoadedContext: number | null;
+}): number | null {
+  const fixedLayers =
+    (gpuMemoryMode ?? standingGpuMemoryMode) === "manual" &&
+    gpuLayers != null &&
+    gpuLayers >= 0;
+  return isGguf && fixedLayers && customContextLength == null
+    ? activeLoadedContext
+    : null;
 }
 
 export function resolveMlxEstimateContext(contextPin: number | null): number {
