@@ -31,6 +31,64 @@ GAP_FIX = (
 )
 
 
+DESIGN = [
+    "Now improve the design so it reads as a real kingdom: a clear stone castle with crenellated curtain walls, "
+    "four corner towers with pointed roofs and a gatehouse with a gate. Keep every voxel touching with no gaps, "
+    "and send the complete updated HTML file.",
+    "Add a proper village: at least eight houses with walls, pitched roofs in different colours, doors and "
+    "windows, grouped near the castle. Keep everything solid with no gaps and send the complete HTML file.",
+    "Connect it all with paths: a dirt road from the castle gate through the village, with smaller paths to the "
+    "houses. Keep it solid with no gaps and send the complete HTML file.",
+    "Add a river that clearly reads as water, running across the island, with a wooden bridge where the road "
+    "crosses it. Keep it solid with no gaps and send the complete HTML file.",
+    "Make the landscape richer: many more trees in varied greens, bushes, rocks and flowers, on solid gap-free "
+    "terrain with grass, dirt and stone. Send the complete HTML file.",
+    "Final polish: frame the camera so the castle, village, road and river fill the view at a 3/4 angle, keep "
+    "the on-screen text small in a corner, and keep every voxel touching. Send the complete HTML file.",
+]
+FRESH = (
+    ORIGINAL_PROMPT.split(" Make the scene big and rich")[0]
+    + " Make it a dense, high-detail voxel scene: small cubes and lots of them, every cube touching its neighbours "
+    "with no gaps so all surfaces read solid. A stone castle with crenellated curtain walls, towers with pointed "
+    "roofs, a keep and a gatehouse with a gate; a village of at least eight houses with doors, windows and roofs in "
+    "different colours; a dirt road from the castle gate through the village; a river with a wooden bridge; solid "
+    "terrain with grass, dirt and stone; lots of trees, bushes, rocks and flowers. One self-contained HTML file with "
+    "three.js r128 and OrbitControls from a CDN, one InstancedMesh per colour, only the top layer of ground, up to "
+    "about 300,000 voxels; size the renderer from window.innerWidth and window.innerHeight and handle resize; frame "
+    "the camera so the kingdom fills the view at a 3/4 angle; keep on-screen text small in a corner."
+)
+MAX_TURNS = 16
+
+
+def good(summary):
+    r = summary.get("result") or {}
+    return bool(r.get("ok") and r.get("clean"))
+
+
+def next_action(st):
+    """The queued plan: re-ask once on a broken turn, walk the design list, go fresh after two bad turns, then final."""
+    turns = st.get("turns", [])
+    last = turns[-1] if turns else {}
+    if len(turns) >= MAX_TURNS or (st.get("design", 0) >= len(DESIGN) and good(last)):
+        return "final", None
+    if not good(last):
+        st["bad"] = st.get("bad", 0) + 1
+        if st["bad"] >= 3 and not st.get("went_fresh"):
+            st["went_fresh"] = True
+            st["bad"] = 0
+            st["design"] = 0
+            return "fresh", FRESH
+        if st["bad"] >= 3:
+            return "final", None
+        errs = "; ".join((last.get("result") or {}).get("errs") or [])[:300]
+        why = f"it throws: {errs}" if errs else "it does not render a scene in the preview"
+        return "send", f"That version doesn't work, {why}. Please fix it and send the complete corrected HTML file, keeping every voxel touching with no gaps."
+    st["bad"] = 0
+    i = st.get("design", 0)
+    st["design"] = i + 1
+    return "send", DESIGN[i]
+
+
 def state():
     return json.loads(STATE.read_text()) if STATE.exists() else {"seq": 0}
 
@@ -150,7 +208,8 @@ def judge_and_shoot(page, tag, st):
     (OUT / f"{tag}-reply.md").write_text(text_of(last))
     scroll_chat_end(page)
     r = present(page, tag)
-    summary = {"tag": tag, "thread": tid, "result": r}
+    summary = {"tag": tag, "thread": tid, "result": r,
+               "card": page.get_by_role("button", name = "Open HTML preview preview").count() - 1}
     if r and r.get("ok"):
         view, m = pick_view(page, tag)
         st["view"] = view
@@ -178,7 +237,11 @@ def judge_and_shoot(page, tag, st):
 
 
 def final(page, st):
-    tid = st["tid"]
+    goods = [t for t in st.get("turns", []) if good(t)] or [t for t in st.get("turns", []) if (t.get("result") or {}).get("ok")]
+    pickt = goods[-1] if goods else (st.get("turns") or [{}])[-1]
+    tid = pickt.get("thread", st["tid"])
+    st["view"] = pickt.get("view", 0)
+    log("FINAL from", pickt.get("tag"), tid)
     delete_threads([t["id"] for t in threads() if t["id"] != tid])
     open_thread(page, tid)
     r = present(page, "final")
@@ -220,14 +283,10 @@ def run(k):
         if st.get("done"):
             log("already done")
             return
-        seq, cmd = wait_command(st["seq"])
-        if seq is None:
-            log("no command in time; ending")
-            st["done"] = True
-            save(st)
-            return
-        st["seq"] = seq
+        kind, text = next_action(st)
         save(st)
+        cmd = {"send": f"send {text}", "fresh": f"fresh {text}", "final": "final"}[kind]
+        log("PLAN", tag, cmd[:300])
     with sync_playwright() as p:
         browser, kw, software = pick_browser(p)
         ctx = browser.new_context(viewport = {"width": W, "height": H}, device_scale_factor = 1 if software else 2,
