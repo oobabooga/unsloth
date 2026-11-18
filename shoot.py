@@ -697,6 +697,12 @@ def main():
                     shot(page, f"try{n}-failure")
                     r = {"clean": False}
                 new = [t for t in threads() if t["id"] not in before]
+                for t in new:
+                    try:
+                        msgs = call("GET", f"/api/chat/threads/{t['id']}/messages", token = TOKEN)
+                        (OUT / f"try{n}-messages.json").write_text(json.dumps(msgs, indent = 1), encoding = "utf-8")
+                    except Exception as exc:
+                        log("messages dump failed", str(exc)[:200])
                 log(f"try{n}", "RESULT", json.dumps(r)[:300], "chats", [t["id"] for t in new])
                 if r.get("clean") and new:
                     results[new[0]["id"]] = (r, new[0].get("title") or "")
