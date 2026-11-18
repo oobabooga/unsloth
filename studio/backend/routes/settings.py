@@ -5080,6 +5080,7 @@ SIDEBAR_NAV_ITEM_DEFAULTS = {
     "api": False,
     "tasks": False,
     "translate": False,
+    "characters": False,
 }
 
 MAX_SIDEBAR_NAV_INPUT_ITEMS = 4 * len(SIDEBAR_NAV_ITEM_DEFAULTS)
@@ -5124,6 +5125,7 @@ SidebarNavItemId = Literal[
     "api",
     "tasks",
     "translate",
+    "characters",
 ]
 
 

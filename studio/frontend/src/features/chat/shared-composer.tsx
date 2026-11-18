@@ -2607,6 +2607,8 @@ export function SharedComposer({
   const plusMenuNodes: Record<PlusMenuItemId, ReactNode> = {
     // Compare runs no research, so the item has nothing to offer here.
     deepResearch: null,
+    // A compare pane is one model per side, never a character chat.
+    characters: null,
     browserUse: <BrowserAgentMenuItem />,
     computerUse: <ComputerUseMenuItem />,
     chatWithFiles: (
