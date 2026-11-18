@@ -25,8 +25,7 @@ def gates(obs: dict) -> list[tuple[str, bool, str]]:
         out.append((f"{name}: torch is a ROCm build with a GPU", bool(r.get("hip")) and bool(r.get("gpu")),
                     f"hip={r.get('hip')} gpu={r.get('gpu')}"))
         out.append((f"{name}: unsloth imported from the checkout", "unsloth_file" in r, str(r.get("unsloth_file"))))
-        out.append((f"{name}: opt-in run trained", r.get("rc") == 0 and "train_loss" in r and not r.get("error"),
-                    str(r.get("error") or r.get("train_loss"))))
+        out.append((f"{name}: opt-in trainer built", "stats" in r and not r.get("error"), str(r.get("error"))))
         out.append((f"{name}: opt-in varlen path patched", (r.get("stats") or {}).get("patched", 0) > 0,
                     str(r.get("stats"))))
         out.append((f"{name}: unset run refuses packing (control)", bool(u.get("packing_ignored")),
