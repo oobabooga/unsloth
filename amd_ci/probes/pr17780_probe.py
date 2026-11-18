@@ -46,7 +46,8 @@ def save():
 
 
 def sha(p: Path) -> str:
-    return hashlib.sha256(p.read_bytes()).hexdigest()
+    # line endings normalised: a Windows git checkout (autocrlf) stores the same test with CRLF
+    return hashlib.sha256(p.read_bytes().replace(b"\r\n", b"\n")).hexdigest()
 
 
 try:
@@ -75,7 +76,8 @@ imp = (
     "open(sys.argv[1], 'w', encoding='utf-8').write(json.dumps(r))\n"
 )
 try:
-    p = subprocess.run([a.python, "-c", imp, str(imp_out)], cwd = ck, env = env, capture_output = True, text = True,
+    # UNSLOTH_IS_PRESENT=1: unsloth_zoo's import guard, for this standalone check only (no unsloth import here)
+    p = subprocess.run([a.python, "-c", imp, str(imp_out)], cwd = ck, env = dict(env, UNSLOTH_IS_PRESENT = "1"), capture_output = True, text = True,
                        timeout = 600)
     obs["imports"] = json.loads(imp_out.read_text(encoding = "utf-8")) if imp_out.exists() else {"error": p.stderr[-1500:]}
 except subprocess.TimeoutExpired:
