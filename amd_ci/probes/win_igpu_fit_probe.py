@@ -206,6 +206,47 @@ def run_config(server: Path, model: Path, name: str, args: list[str], logdir: Pa
     return res
 
 
+def trim_test(model: Path) -> dict:
+    """Map the GGUF, touch every page, then VirtualUnlock the unlocked range: Windows documents that
+    this drops the pages from the working set (they stay as standby cache)."""
+    k = ctypes.WinDLL("kernel32", use_last_error = True)
+    k.CreateFileW.restype = wt.HANDLE
+    k.CreateFileMappingW.restype = wt.HANDLE
+    k.MapViewOfFile.restype = ctypes.c_void_p
+    k.MapViewOfFile.argtypes = [wt.HANDLE, wt.DWORD, wt.DWORD, wt.DWORD, ctypes.c_size_t]
+    k.VirtualUnlock.argtypes = [ctypes.c_void_p, ctypes.c_size_t]
+    k.UnmapViewOfFile.argtypes = [ctypes.c_void_p]
+    size = model.stat().st_size
+    fh = k.CreateFileW(str(model), 0x80000000, 1, None, 3, 0x80, None)
+    mh = k.CreateFileMappingW(fh, None, 0x02, 0, 0, None)
+    addr = k.MapViewOfFile(mh, 0x0004, 0, 0, 0)
+    pid = os.getpid()
+    res = {"size_mib": size // MIB, "start": procmem(pid), "start_sys": sysmem()}
+    buf = (ctypes.c_char * size).from_address(addr)
+    t = time.time()
+    total = 0
+    for off in range(0, size, 4096):
+        total += buf[off][0]
+    res["touch_s"] = round(time.time() - t, 1)
+    res["touched"] = procmem(pid)
+    res["touched_sys"] = sysmem()
+    ok = k.VirtualUnlock(ctypes.c_void_p(addr), ctypes.c_size_t(size))
+    res["virtualunlock_ret"] = ok
+    res["virtualunlock_err"] = ctypes.get_last_error()
+    time.sleep(2)
+    res["unlocked"] = procmem(pid)
+    res["unlocked_sys"] = sysmem()
+    t = time.time()
+    for off in range(0, size, 4096):
+        total += buf[off][0]
+    res["retouch_s"] = round(time.time() - t, 1)
+    res["retouched"] = procmem(pid)
+    k.UnmapViewOfFile(ctypes.c_void_p(addr))
+    k.CloseHandle(mh)
+    k.CloseHandle(fh)
+    return res
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--state", required = True)
@@ -237,12 +278,10 @@ def main() -> int:
             kv = max(0, device_mib - weights - 1024) * MIB
             return max(8192, (kv // KV_BYTES_PER_TOKEN) // 1024 * 1024)
 
+        out["trim_test"] = trim_test(model)
         base = ["-c", "8192", "--parallel", "1", "-fa", "on", "--fit", "on"]
         configs = [
-            ("full_none", [*base, "--load-mode", "none"]),
             ("full_mmap", [*base, "--load-mode", "mmap"]),
-            ("full_mmap_lazy", [*base, "--load-mode", "mmap", "--lazy-mode", "on"]),
-            ("full_none_again", [*base, "--load-mode", "none"]),
         ]
         mid = 0
         out["sizing"] = {"avail_at_start_mib": avail, "weights_mib": weights, "mid_ctx": mid,
