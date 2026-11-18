@@ -17,21 +17,11 @@ OUT.mkdir(parents = True, exist_ok = True)
 MODEL = os.environ.get("MODEL", "qwen3.6-moe-35b-a3b-FLM")
 NEW_NAME = os.environ.get("NEW_NAME", "Qwen3.6-35B-A3B-NPU2")
 PROMPT = (
-    "Write one self-contained HTML file (no libraries) that draws a spinning 2D triangle lattice on a canvas. "
-    "Look: background #f2f0eb, dots and sticks #111, sticks 2.4px wide, dots radius 4.5px, and an SVG goo filter on "
-    "the canvas (feGaussianBlur stdDeviation 2, then feColorMatrix with alpha row 0 0 0 24 -7) so the joints look "
-    "soft and inky. Size the canvas from innerWidth/innerHeight times devicePixelRatio and handle resize. "
-    "Lattice: N = 7 rows, row r has r+1 dots, rest position (k - r/2, (r - 2(N-1)/3) * sqrt(3)/2) so it is centred "
-    "on the centroid, scaled by s = min(width, height) * 0.62 / (N-1). Edges join each dot to its right neighbour "
-    "and to the two dots below it; also add bending springs between dots two apart along each of the three lattice "
-    "directions, and keep the list of small triangles (both up and down ones). "
-    "Physics, fixed step 1/240 s with an accumulator (clamp frame time to 0.05 s): the target angle th grows by "
-    "(1.2 + 0.5*sin(0.5 t)) * dt. Each dot is pulled toward its rotated rest position with stiffness "
-    "5 + 180 * (1 - r/rMax)^2, where r is its rest distance from the centre and rMax = (N-1)/sqrt(3), so the centre "
-    "is driven hard and the tips lag behind like pinwheel arms. Edge springs k=300 rest length s, bending springs "
-    "k=150 rest 2s, and a signed-area spring per small triangle (k = 400/s^2 toward rest area -sqrt(3)/4 * s^2) so "
-    "a flipped triangle pushes itself back. Damping: v += (F - 9v) dt, then p += v dt. The mouse pushes dots away "
-    "within 1.6 s. Draw all edges in one path, then all dots in one path, every frame with requestAnimationFrame."
+    "Recreate this spinning 2D triangle lattice as one self-contained HTML file. Keep the same look (cream "
+    "background, black sticks and dots, the SVG goo filter) and the same physics and constants, and make sure it runs "
+    "without errors. Send the complete HTML file.\n\n```html\n"
+    + (Path(__file__).parent / "ref_lattice.html").read_text()
+    + "\n```"
 )
 W, H = 1440, 900
 FLAT2D = True  # 2D canvas: no orbit drags or zoom, looser coverage checks
@@ -518,7 +508,10 @@ def attempt(page, n):
     collapse_sidebar(page)
     box = page.get_by_placeholder("Ask anything")
     box.click()
-    page.keyboard.type(PROMPT, delay = 6)
+    if "\n" in PROMPT:
+        page.keyboard.insert_text(PROMPT)  # typing a newline would send early
+    else:
+        page.keyboard.type(PROMPT, delay = 6)
     page.wait_for_timeout(400)
     page.keyboard.press("Enter")
     log(tag, "sent")

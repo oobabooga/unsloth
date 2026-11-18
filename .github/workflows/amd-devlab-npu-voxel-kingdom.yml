@@ -31,6 +31,7 @@ jobs:
         run: |
           curl -fsSL "https://raw.githubusercontent.com/$GITHUB_REPOSITORY/$GITHUB_SHA/stack.bundle" -o "$RUNNER_TEMP/stack.bundle"
           curl -fsSL "https://raw.githubusercontent.com/$GITHUB_REPOSITORY/$GITHUB_SHA/shoot.py" -o "$RUNNER_TEMP/shoot.py"
+          curl -fsSL "https://raw.githubusercontent.com/$GITHUB_REPOSITORY/$GITHUB_SHA/ref_lattice.html" -o "$RUNNER_TEMP/ref_lattice.html"
 
       - name: Install Unsloth Studio from the stack
         run: |
