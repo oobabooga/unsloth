@@ -17,23 +17,24 @@ OUT.mkdir(parents = True, exist_ok = True)
 MODEL = os.environ.get("MODEL", "qwen3.6-moe-35b-a3b-FLM")
 NEW_NAME = os.environ.get("NEW_NAME", "Qwen3.6-35B-A3B-NPU2")
 PROMPT = (
-    "using html with embedded JavaScript with three.js make a beautiful, modern spinning triangle lattice: a big "
-    "equilateral triangle filled with a triangular lattice of dots (about 12 dots per side), every neighbouring pair "
-    "connected by a stick. The triangle faces the camera and spins smoothly in place around the axis pointing at the "
-    "camera, like a slowly turning wheel, so it always reads as a flat triangle. Make the sticks thick rounded tubes "
-    "(about half the dot radius) and the dots glossy spheres, so it looks chunky and clean, not wireframe. Add a "
-    "gentle ripple that looks like a soft cloth mesh: move each dot toward and away from the viewer with a smooth "
-    "sine wave travelling across the triangle (a closed-form formula of position and time, no physics simulation), "
-    "the three corners stay still, and update the sticks every frame so they follow the dots. "
-    "Colours: a nice pastel palette (mint, lavender, "
-    "peach, sky blue) blended smoothly across the triangle, on a deep slate-blue gradient background so the pastels "
-    "have strong contrast and pop; soft lighting with a subtle rim light. Antialiasing on, renderer pixel ratio from "
-    "window.devicePixelRatio, smooth 60 fps animation driven by requestAnimationFrame time. Frame the camera so the "
-    "triangle fills most of the view. Use one self-contained HTML file with three.js r128 and OrbitControls from a "
-    "CDN, size the renderer from window.innerWidth and window.innerHeight and update it on resize, and keep any "
-    "on-screen text small in a corner."
+    "Write one self-contained HTML file (no libraries) that draws a spinning 2D triangle lattice on a canvas. "
+    "Look: background #f2f0eb, dots and sticks #111, sticks 2.4px wide, dots radius 4.5px, and an SVG goo filter on "
+    "the canvas (feGaussianBlur stdDeviation 2, then feColorMatrix with alpha row 0 0 0 24 -7) so the joints look "
+    "soft and inky. Size the canvas from innerWidth/innerHeight times devicePixelRatio and handle resize. "
+    "Lattice: N = 7 rows, row r has r+1 dots, rest position (k - r/2, (r - 2(N-1)/3) * sqrt(3)/2) so it is centred "
+    "on the centroid, scaled by s = min(width, height) * 0.62 / (N-1). Edges join each dot to its right neighbour "
+    "and to the two dots below it; also add bending springs between dots two apart along each of the three lattice "
+    "directions, and keep the list of small triangles (both up and down ones). "
+    "Physics, fixed step 1/240 s with an accumulator (clamp frame time to 0.05 s): the target angle th grows by "
+    "(1.2 + 0.5*sin(0.5 t)) * dt. Each dot is pulled toward its rotated rest position with stiffness "
+    "5 + 180 * (1 - r/rMax)^2, where r is its rest distance from the centre and rMax = (N-1)/sqrt(3), so the centre "
+    "is driven hard and the tips lag behind like pinwheel arms. Edge springs k=300 rest length s, bending springs "
+    "k=150 rest 2s, and a signed-area spring per small triangle (k = 400/s^2 toward rest area -sqrt(3)/4 * s^2) so "
+    "a flipped triangle pushes itself back. Damping: v += (F - 9v) dt, then p += v dt. The mouse pushes dots away "
+    "within 1.6 s. Draw all edges in one path, then all dots in one path, every frame with requestAnimationFrame."
 )
 W, H = 1440, 900
+FLAT2D = True  # 2D canvas: no orbit drags or zoom, looser coverage checks
 ERRORS = []
 BENIGN = ("localStorage", "Failed to load resource")
 TRIES = int(os.environ.get("TRIES", "6"))
@@ -298,6 +299,8 @@ def drag_splitter(page, frac = 0.58):
 
 
 def drag(page, dx, dy, button = "left"):
+    if FLAT2D:
+        return
     f = page.locator("iframe").last.bounding_box()
     cx, cy = f["x"] + f["width"] / 2, f["y"] + f["height"] * 0.55
     page.mouse.move(cx, cy)
@@ -310,6 +313,8 @@ def drag(page, dx, dy, button = "left"):
 
 
 def wheel(page, dy):
+    if FLAT2D:
+        return
     f = page.locator("iframe").last.bounding_box()
     page.mouse.move(f["x"] + f["width"] / 2, f["y"] + f["height"] * 0.55)
     for _ in range(3):
@@ -376,6 +381,8 @@ def measure(page, path):
 
 def frame_scene(page, tag):
     """Zoom and pan until the kingdom fills most of the panel, centred."""
+    if FLAT2D:
+        return measure(page, OUT / f"{tag}-measure.png")
     m = {}
     zin = 0
     f = page.locator("iframe").last.bounding_box()
@@ -451,7 +458,7 @@ def present(page, tag):
         log(tag, f"t+{time.time() - t1:.0f}s canvas={has_canvas} flat={flat:.2f} buckets={spread}")
         texts = " ".join(x.get("text", "") for x in st.get("inner", [])).lower()
         loading = any(w in texts for w in ("loading", "building", "generating", "%"))
-        if has_canvas and spread > 50 and not loading and measure(page, OUT / f"{tag}-measure.png")["cov"] > 0.08:
+        if has_canvas and spread > (3 if FLAT2D else 50) and not loading and measure(page, OUT / f"{tag}-measure.png")["cov"] > (0.01 if FLAT2D else 0.08):
             ok = True
             break
     page.wait_for_timeout(5000)  # let title cards fade
@@ -483,7 +490,7 @@ def park_mouse(page):
     page.wait_for_timeout(1200)
 
 
-VIEWS = [0, 70, -70]  # orbit offsets (px of drag) tried per candidate
+VIEWS = [0] if FLAT2D else [0, 70, -70]  # orbit offsets (px of drag) tried per candidate
 
 
 def pick_view(page, tag):
@@ -536,8 +543,8 @@ def attempt(page, n):
         err = ("; ".join(e for e in errs if not e.startswith("banner:"))[:200] or errs[0][:200]) if errs else ""
         ask = (f"The page throws this error: {err}. Please fix it and send the complete corrected HTML file."
                if err else
-               "The preview shows almost nothing: the lattice is not visible, only a few stray dots. Fix it so the "
-               "whole triangle mesh is clearly visible and fills most of the view, and send the complete corrected HTML file.")
+               "The preview shows almost nothing: the triangle lattice is not visible. Fix it so the whole lattice is "
+               "drawn and spinning in the middle of the canvas, and send the complete corrected HTML file.")
         page.get_by_placeholder("Ask anything").click()
         page.keyboard.type(ask, delay = 6)
         page.wait_for_timeout(400)

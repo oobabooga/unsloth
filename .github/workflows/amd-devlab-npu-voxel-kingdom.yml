@@ -1,4 +1,4 @@
-name: AMD DevLab NPU blog stills, voxel kingdom spinning triangle lattice, auto-fix, 2x8 tries (main 4ef06c9 + #18107 + #18196)
+name: AMD DevLab NPU blog stills, voxel kingdom 2D triangle lattice (Leo spec), auto-fix, 2x8 tries (main 4ef06c9 + #18107 + #18196)
 
 on:
   push:
