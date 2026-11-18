@@ -16,7 +16,10 @@ import argparse
 import gc
 import json
 import os
-import resource
+try:
+    import resource
+except ImportError:  # Windows
+    resource = None
 import subprocess
 import sys
 import threading
@@ -545,7 +548,7 @@ def main():
         rec["error"] = repr(exc)[:2000]
         rec["traceback"] = traceback.format_exc()[-6000:]
         print(rec["traceback"], flush = True)
-    rec["ru_maxrss_gib"] = round(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 2**20, 3)
+    rec["ru_maxrss_gib"] = round(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 2**20, 3) if resource else None
     save()
     print("ARM_DONE", a.tag, rec["verdict"], flush = True)
     sampler.stop_ev.set()
