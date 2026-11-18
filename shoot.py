@@ -21,7 +21,7 @@ PROMPT = (
     "triangle filled with a triangular lattice of glowing dots (about 15 dots per side), every neighbouring pair "
     "connected by a thin stick, so it reads as a triangle mesh. Give it soft-body physics: treat the dots as masses "
     "and the sticks as springs, pin the three corners, and let a gentle wave or wind ripple through the mesh so it "
-    "flexes and settles while the whole thing slowly spins. Make it look polished: a soft light gradient background "
+    "flexes and settles while the whole thing slowly spins; keep the simulation stable (small fixed time step, damping, clamped forces) so it never collapses or explodes. Make it look polished: a soft light gradient background "
     "(not black), dots and sticks coloured with a smooth gradient across the triangle, good lighting with soft "
     "shadows, and frame the camera so the triangle fills most of the view. Use one self-contained HTML file with "
     "three.js r128 and OrbitControls from a CDN, size the renderer from window.innerWidth and window.innerHeight and "
@@ -515,7 +515,7 @@ def attempt(page, n):
     page.wait_for_timeout(800)
     r = present(page, tag)
     fixes = 0
-    while r and not r["clean"] and r.get("errs") and fixes < 2:
+    while r and not r["clean"] and fixes < 2:
         # most failures are one typo; ask the model to fix it in the same chat, like a user would
         fixes += 1
         shot(page, f"{tag}-fix{fixes}-before")
@@ -526,10 +526,15 @@ def attempt(page, n):
         page.wait_for_timeout(1500)
         cards = lambda: page.get_by_text("HTML preview", exact = True).count()
         ncards = cards()
-        err = "; ".join(e for e in r["errs"] if not e.startswith("banner:"))[:200] or r["errs"][0][:200]
+        errs = r.get("errs") or []
+        err = ("; ".join(e for e in errs if not e.startswith("banner:"))[:200] or errs[0][:200]) if errs else ""
+        ask = (f"The page throws this error: {err}. Please fix it and send the complete corrected HTML file."
+               if err else
+               "The preview shows almost nothing: the lattice is not visible, only a few stray dots. Fix it so the "
+               "whole triangle mesh is clearly visible, fills most of the view and the physics stays stable (small "
+               "time step, clamp the forces), and send the complete corrected HTML file.")
         page.get_by_placeholder("Ask anything").click()
-        page.keyboard.type(f"The page throws this error: {err}. Please fix it and send the complete corrected HTML file, "
-                           "keeping every voxel touching with no gaps.", delay = 6)
+        page.keyboard.type(ask, delay = 6)
         page.wait_for_timeout(400)
         page.keyboard.press("Enter")
         log(tag, f"fix{fixes} sent:", err)
