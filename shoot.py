@@ -35,7 +35,7 @@ PROMPT = (
 W, H = 1440, 900
 ERRORS = []
 BENIGN = ("localStorage", "Failed to load resource")
-TRIES = 6
+TRIES = int(os.environ.get("TRIES", "6"))
 
 
 def call(method, path, body = None, token = None, timeout = 60):
@@ -157,6 +157,13 @@ def find_row(page):
 
 
 def load_model(page):
+    st = call("GET", "/api/npu/status", token = TOKEN)
+    if st.get("loaded_model") == f"lemonade:{MODEL}" and not st.get("loading_model"):
+        log("model already loaded")
+        page.goto(f"{BASE}/chat")
+        page.wait_for_timeout(4000)
+        dismiss(page)
+        return
     page.goto(f"{BASE}/chat")
     page.wait_for_timeout(4000)
     dismiss(page)
@@ -670,5 +677,4 @@ def main():
     sys.exit(0 if good else 1)
 
 
-if __name__ == "__main__":
-    main()
+main()
