@@ -670,4 +670,5 @@ def main():
     sys.exit(0 if good else 1)
 
 
-main()
+if __name__ == "__main__":
+    main()

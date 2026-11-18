@@ -1,0 +1,526 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Medieval Voxel Kingdom</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{overflow:hidden;background:#1a1a2e}
+canvas{display:block}
+#info{position:fixed;top:10px;left:10px;color:#ffd699;font:11px/1.4 monospace;background:rgba(0,0,0,.55);padding:5px 8px;border-radius:4px;pointer-events:none;z-index:10}
+</style>
+</head>
+<body>
+<div id="info">Medieval Voxel Kingdom — drag to orbit · scroll to zoom</div>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/controls/OrbitControls.js"></script>
+<script>
+(function(){
+"use strict";
+
+/* ─── helpers ─── */
+const lerp=(a,b,t)=>a+(b-a)*t;
+const clamp=(v,lo,hi)=>Math.max(lo,Math.min(hi,v));
+
+/* ─── renderer / scene / camera ─── */
+const renderer=new THREE.WebGLRenderer({antialias:true,powerPreference:'high-performance'});
+renderer.setPixelRatio(Math.min(window.devicePixelRatio,2));
+renderer.setSize(window.innerWidth,window.innerHeight);
+renderer.shadowMap.enabled=true;
+renderer.shadowMap.type=THREE.PCFSoftShadowMap;
+renderer.toneMapping=THREE.ACESFilmicToneMapping;
+renderer.toneMappingExposure=1.1;
+document.body.appendChild(renderer.domElement);
+
+const scene=new THREE.Scene();
+scene.background=new THREE.Color(0x87CEEB);
+scene.fog=new THREE.FogExp2(0xc8dff5,0.004);
+
+const camera=new THREE.PerspectiveCamera(50,window.innerWidth/window.innerHeight,0.5,500);
+camera.position.set(60,45,60);
+
+const controls=new THREE.OrbitControls(camera,renderer.domElement);
+controls.target.set(0,8,0);
+controls.enableDamping=true;
+controls.dampingFactor=0.08;
+controls.minDistance=20;
+controls.maxDistance=180;
+controls.maxPolarAngle=Math.PI*0.48;
+controls.update();
+
+/* ─── lights ─── */
+const ambient=new THREE.AmbientLight(0x6688aa,0.5);
+scene.add(ambient);
+
+const hemi=new THREE.HemisphereLight(0x87ceeb,0x445522,0.6);
+scene.add(hemi);
+
+const sun=new THREE.DirectionalLight(0xfff4e0,1.3);
+sun.position.set(40,60,30);
+sun.castShadow=true;
+sun.shadow.mapSize.set(2048,2048);
+sun.shadow.camera.left=-70;sun.shadow.camera.right=70;
+sun.shadow.camera.top=70;sun.shadow.camera.bottom=-70;
+sun.shadow.camera.near=1;sun.shadow.camera.far=150;
+sun.shadow.bias=-0.001;
+scene.add(sun);
+
+const fill=new THREE.DirectionalLight(0x88aacc,0.3);
+fill.position.set(-30,20,-20);
+scene.add(fill);
+
+/* ─── instanced mesh factory ─── */
+function makeIM(color,size){
+  const geo=new THREE.BoxGeometry(size,size,size);
+  const mat=new THREE.MeshStandardMaterial({color,roughness:0.85,metalness:0.05});
+  const m=new THREE.InstancedMesh(geo,mat,60000);
+  m.castShadow=true;m.receiveShadow=true;
+  return{mesh:m,mat,count:0,max:60000,geo};
+}
+
+const palettes=[
+  {key:'grass',color:0x3a8c3f,size:0.45},
+  {key:'darkGrass',color:0x2d6b30,size:0.45},
+  {key:'stone',color:0x7a7a7a,size:0.45},
+  {key:'stoneDark',color:0x5a5a5a,size:0.45},
+  {key:'stoneLight',color:0x9a9a9a,size:0.45},
+  {key:'wood',color:0x8B6914,size:0.45},
+  {key:'roofRed',color:0xb33a2a,size:0.45},
+  {key:'roofBrown',color:0x6b4226,size:0.45},
+  {key:'roofDark',color:0x3d2b1f,size:0.45},
+  {key:'water',color:0x3388aa,size:0.45},
+  {key:'dirt',color:0x9e7e5a,size:0.45},
+  {key:'sand',color:0xc2b280,size:0.45},
+  {key:'door',color:0x4a3020,size:0.45},
+  {key:'window',color:0xaaddff,size:0.45},
+  {key:'treeDark',color:0x1e6b2e,size:0.45},
+  {key:'treeMed',color:0x2d8a3f,size:0.45},
+  {key:'treeLight',color:0x4aad55,size:0.45},
+  {key:'pineDark',color:0x1a5c28,size:0.45},
+  {key:'pineMed',color:0x257a35,size:0.45},
+  {key:'bush',color:0x3d9e45,size:0.35},
+  {key:'rock',color:0x6a6a6a,size:0.45},
+  {key:'rockLight',color:0x8a8a8a,size:0.45},
+  {key:'flowerRed',color:0xcc3333,size:0.2},
+  {key:'flowerYellow',color:0xddcc22,size:0.2},
+  {key:'flowerWhite',color:0xeeeeff,size:0.2},
+  {key:'flowerPurple',color:0x8844aa,size:0.2},
+];
+
+const maps={};
+for(const p of palettes){
+  const im=makeIM(p.color,p.size);
+  scene.add(im.mesh);
+  maps[p.key]=im;
+}
+
+function addInst(key,x,y,z,sx,sy,sz){
+  const m=maps[key];if(!m)return;
+  if(m.count>=m.max)return;
+  const i=m.count++;
+  const mat=new THREE.Matrix4();
+  mat.makeScale(sx||1,sy||1,sz||1);
+  mat.setPosition(x,y,z);
+  m.mesh.setMatrixAt(i,mat);
+}
+
+function flushAll(){
+  for(const k in maps){
+    const m=maps[k];m.mesh.count=m.count;m.mesh.instanceMatrix.needsUpdate=true;
+  }
+}
+
+/* ─── terrain generation ─── */
+const W=70,D=55,CX=0,CZ=-2; // island center
+function distFromCenter(x,z){return Math.sqrt((x-CX)**2+(z-CZ)**2);}
+function islandMask(x,z){
+  const dx=(x-CX)/38, dz=(z-CZ)/30;
+  return 1-(dx*dx+dz*dz);
+}
+
+// height map for the hill (castle sits on elevated part)
+function terrainH(x,z){
+  const base=2.5;
+  // gentle rolling hills
+  const h1=Math.sin(x*0.08)*Math.cos(z*0.1)*1.5;
+  const h2=Math.sin(x*0.15+z*0.12)*0.8;
+  // castle hill in upper-right quadrant
+  const hillDist=Math.sqrt((x-15)**2+(z+12)**2);
+  const hillH=clamp(12-hillDist*0.5,0,10);
+  return base+h1+h2+hillH;
+}
+
+// river path
+function riverZ(x){return -8+Math.sin(x*0.12)*6;}
+
+/* ─── build terrain ─── */
+function buildTerrain(){
+  const step=1;
+  for(let x=-35;x<=35;x+=step){
+    for(let z=-28;z<=28;z+=step){
+      if(islandMask(x,z)<0.05)continue;
+      const h=terrainH(x,z);
+      const onRiver=Math.abs(z-riverZ(x))<1.5;
+      
+      // water level at y≈1
+      for(let y=-2;y<=Math.floor(h);y++){
+        if(onRiver&&y>=0&&y<2){
+          addInst('water',x,y,riverZ(x),0.9,0.3,0.9);
+        }else{
+          const isSand=onRiver&&y===Math.floor(h)&&h-y<0.5;
+          if(isSand)addInst('sand',x,y,z,1,1,1);
+          else addInst('grass',x,y,z,1,1,1);
+        }
+      }
+      // dirt path: from gate to village
+      const onPath=Math.abs(x-0)<0.8&&z>-5&&z<20;
+      if(onPath){
+        for(let y=0;y<=Math.floor(h);y++){
+          addInst('dirt',x,y,z,1,1,1);
+        }
+      }
+    }
+  }
+}
+
+/* ─── castle ─── */
+function buildCastle(){
+  const baseX=15,baseZ=-12;
+  const hillH=terrainH(baseX,baseZ);
+  
+  // keep walls up to height ~14
+  const wallH=14;
+  
+  // corner towers (circular-ish)
+  const corners=[[-6,-6],[6,-6],[-6,6],[6,6]];
+  for(const[tx,tz]of corners){
+    const bx=baseX+tx,bz=baseZ+tz;
+    for(let y=0;y<=wallH;y++){
+      const r=y<4?3:2.5;
+      for(let dx=-Math.ceil(r);dx<=Math.ceil(r);dx++){
+        for(let dz=-Math.ceil(r);dz<=Math.ceil(r);dz++){
+          if(dx*dx+dz*dz>r*r)continue;
+          const isEdge=Math.abs(dx)===Math.ceil(r)||Math.abs(dz)===Math.ceil(r);
+          addInst(isEdge?'stoneDark':'stone',bx+dx,y,bz+dz,1,1,1);
+        }
+      }
+    }
+  }
+  
+  // curtain walls
+  const wallThick=2;
+  // north wall
+  for(let x=-6;x<=6;x+=1.5){
+    for(let y=0;y<=wallH;y++){
+      addInst('stone',baseX+x,y,baseZ-6,1,1,1);
+      if(y%4===3)addInst('stoneDark',baseX+x,y,baseZ-7,1,1,1); // crenellations
+    }
+  }
+  // south wall
+  for(let x=-6;x<=6;x+=1.5){
+    for(let y=0;y<=wallH;y++){
+      addInst('stone',baseX+x,y,baseZ+6,1,1,1);
+      if(y%4===3)addInst('stoneDark',baseX+x,y,baseZ+7,1,1,1);
+    }
+  }
+  // east wall
+  for(let z=-6;z<=6;z+=1.5){
+    for(let y=0;y<=wallH;y++){
+      addInst('stone',baseX+6,y,baseZ+z,1,1,1);
+      if(y%4===3)addInst('stoneDark',baseX+7,y,baseZ+z,1,1,1);
+    }
+  }
+  // west wall
+  for(let z=-6;z<=6;z+=1.5){
+    for(let y=0;y<=wallH;y++){
+      addInst('stone',baseX-6,y,baseZ+z,1,1,1);
+      if(y%4===3)addInst('stoneDark',baseX-7,y,baseZ+z,1,1,1);
+    }
+  }
+  
+  // gatehouse (south wall opening)
+  for(let y=0;y<=wallH;y++){
+    addInst('stone',baseX,y,baseZ+6,1,1,1);
+    addInst('stone',baseX,y,baseZ+7,1,1,1);
+    if(y>=2&&y<=5){
+      addInst('door',baseX,y,baseZ+6.5,1,1,1);
+    }
+  }
+  
+  // inner keep
+  const keepH=18;
+  for(let y=0;y<=keepH;y++){
+    for(let dx=-3;dx<=3;dx++){
+      for(let dz=-3;dz<=3;dz++){
+        const isWall=Math.abs(dx)===3||Math.abs(dz)===3;
+        addInst(isWall?'stone':'stoneLight',baseX+dx,y,baseZ+dz,1,1,1);
+        if(y===keepH){
+          addInst('stoneDark',baseX+dx,keepH+0.5,baseZ+dz,1,1,1);
+        }
+      }
+    }
+  }
+  
+  // keep roof
+  for(let dy=0;dy<4;dy++){
+    const s=3-dy*0.7;
+    for(let dx=-Math.ceil(s);dx<=Math.ceil(s);dx++){
+      for(let dz=-Math.ceil(s);dz<=Math.ceil(s);dz++){
+        if(Math.abs(dx)>s+0.1||Math.abs(dz)>s+0.1)continue;
+        addInst('roofRed',baseX+dx,keepH+dy,baseZ+dz,1,1,1);
+      }
+    }
+  }
+  
+  // flag on keep
+  for(let y=keepH+3;y<keepH+7;y++){
+    addInst('red',baseX,y,baseZ-3.5,0.3,1,0.3);
+  }
+}
+
+/* ─── village houses ─── */
+function buildVillage(){
+  const houseDefs=[
+    {x:-8,z:5,rot:0},
+    {x:-4,z:8,rot:0.3},
+    {x:3,z:6,rot:-0.2},
+    {x:7,z:9,rot:0.1},
+    {x:-6,z:12,rot:-0.4},
+    {x:5,z:13,rot:0.5},
+    {x:-10,z:10,rot:0.2},
+    {x:9,z:5,rot:-0.3},
+  ];
+  
+  for(const{ x,z }of houseDefs){
+    const w=4,d=3,h=4;
+    // walls
+    for(let wy=0;wy<h;wy++){
+      for(let wx=-w;wx<=w;wx+=1.5){
+        for(let dz=-d;dz<=d;dz+=1.5){
+          const isWall=Math.abs(wx)===w||Math.abs(dz)===d;
+          if(isWall){
+            addInst('stoneLight',x+wx,wy,z+dz,1,1,1);
+          }else{
+            addInst('wood',x+wx,wy,z+dz,1,1,1);
+          }
+        }
+      }
+    }
+    
+    // roof (pyramid)
+    const roofColors=['roofRed','roofBrown','roofDark'];
+    const rc=roofColors[Math.floor(Math.random()*3)];
+    for(let ry=0;ry<3;ry++){
+      const s=w-ry*0.8;
+      for(let dx=-Math.ceil(s);dx<=Math.ceil(s);dx+=1){
+        for(let dz=-Math.ceil(s);dz<=Math.ceil(s);dz+=1){
+          if(Math.abs(dx)>s+0.1||Math.abs(dz)>s+0.1)continue;
+          addInst(rc,x+dx,h+ry,z+dz,1,1,1);
+        }
+      }
+    }
+    
+    // door
+    addInst('door',x,-0.5,z+d+0.3,1,1,1);
+    // windows
+    addInst('window',x+w+0.3,2,z,1,1,1);
+  }
+}
+
+/* ─── bridge over river ─── */
+function buildBridge(){
+  const bx=0,bz=riverZ(0);
+  for(let x=-3;x<=3;x++){
+    for(let y=0;y<=2;y++){
+      addInst('wood',x,y,bz,1,1,1);
+      if(y===2)addInst('stoneDark',x,y+0.5,bz,1,1,1);
+    }
+  }
+  // railings
+  for(let x=-3;x<=3;x+=1){
+    addInst('wood',x,3,bz-1,1,1,1);
+    addInst('wood',x,3,bz+1,1,1,1);
+  }
+}
+
+/* ─── pond ─── */
+function buildPond(){
+  const px=-20,pz=5;
+  for(let x=-4;x<=4;x++){
+    for(let z=-4;z<=4;z++){
+      if(x*x+z*z>16)continue;
+      addInst('water',px+x,0.5,pz+z,1,0.3,1);
+      if(x*x+z*z>12){
+        addInst('sand',px+x,0.8,pz+z,1,0.4,1);
+      }
+    }
+  }
+}
+
+/* ─── trees ─── */
+function buildTrees(){
+  const treeTypes=[
+    {color:'treeDark',h:7,r:2,type:'pine'},
+    {color:'treeMed',h:5,r:3,type:'round'},
+    {color:'treeLight',h:6,r:2.5,type:'pine'},
+    {color:'pineDark',h:8,r:1.8,type:'pine'},
+    {color:'pineMed',h:6,r:2,type:'pine'},
+    {color:'treeDark',h:4,r:3,type:'round'},
+  ];
+  
+  let placed=0;
+  const tries=500;
+  for(let t=0;t<tries&&placed<120;t++){
+    const x=(Math.random()*70)-35;
+    const z=(Math.random()*56)-28;
+    if(islandMask(x,z)<0.05)continue;
+    
+    // avoid river
+    if(Math.abs(z-riverZ(x))<1.5)continue;
+    // avoid paths
+    if(Math.abs(x)<0.8&&z>-5&&z<20)continue;
+    // avoid castle area
+    if(Math.sqrt((x-15)**2+(z+12)**2)<8)continue;
+    
+    const h=terrainH(x,z);
+    if(h<1)continue;
+    
+    const type=treeTypes[Math.floor(Math.random()*treeTypes.length)];
+    const trunkH=Math.floor(type.h*0.4);
+    
+    // trunk
+    for(let ty=0;ty<trunkH;ty++){
+      addInst('wood',x,ty+1,z,0.5,1,0.5);
+    }
+    
+    // canopy
+    const topY=trunkH+1;
+    if(type.type==='pine'){
+      for(let cy=0;cy<type.h-trunkH;cy++){
+        const r=type.r*(1-cy/(type.h-trunkH));
+        for(let dx=-Math.ceil(r);dx<=Math.ceil(r);dx++){
+          for(let dz=-Math.ceil(r);dz<=Math.ceil(r);dz++){
+            if(dx*dx+dz*dz>r*r)continue;
+            addInst(type.color,x+dx,topY+cy,z+dz,1,1,1);
+          }
+        }
+      }
+    }else{
+      // round canopy
+      for(let dy=0;dy<type.h-trunkH;dy++){
+        const r=type.r*(1-Math.abs(dy-(type.h-trunkH)/2)/(type.h-trunkH));
+        for(let dx=-Math.ceil(r);dx<=Math.ceil(r);dx++){
+          for(let dz=-Math.ceil(r);dz<=Math.ceil(r);dz++){
+            if(dx*dx+dz*dz>r*r)continue;
+            addInst(type.color,x+dx,topY+dy,z+dz,1,1,1);
+          }
+        }
+      }
+    }
+    placed++;
+  }
+}
+
+/* ─── bushes ─── */
+function buildBushes(){
+  for(let i=0;i<40;i++){
+    const x=(Math.random()*60)-30;
+    const z=(Math.random()*50)-25;
+    if(islandMask(x,z)<0.1)continue;
+    if(Math.abs(z-riverZ(x))<1.5)continue;
+    const h=terrainH(x,z);
+    if(h<1)continue;
+    
+    const s=0.5+Math.random()*1.5;
+    for(let dx=-2;dx<=2;dx++){
+      for(let dz=-2;dz<=2;dz++){
+        if(dx*dx+dz*dz>4)continue;
+        addInst('bush',x+dx*0.5,h-0.3,z+dz*0.5,s*0.5,0.6*s,s*0.5);
+      }
+    }
+  }
+}
+
+/* ─── rocks ─── */
+function buildRocks(){
+  for(let i=0;i<30;i++){
+    const x=(Math.random()*64)-32;
+    const z=(Math.random()*52)-26;
+    if(islandMask(x,z)<0.08)continue;
+    const h=terrainH(x,z);
+    if(h<1)continue;
+    
+    const s=0.3+Math.random()*0.8;
+    const col=Math.random()>0.5?'rock':'rockLight';
+    addInst(col,x,h-0.2,z,s*0.6,s*0.4,s*0.6);
+  }
+}
+
+/* ─── flowers ─── */
+function buildFlowers(){
+  const fColors=['flowerRed','flowerYellow','flowerWhite','flowerPurple'];
+  for(let i=0;i<60;i++){
+    const x=(Math.random()*50)-25;
+    const z=(Math.random()*40)-20;
+    if(islandMask(x,z)<0.1)continue;
+    const h=terrainH(x,z);
+    if(h<1.5)continue;
+    
+    addInst(fColors[Math.floor(Math.random()*4)],x,h+0.3,z,0.6,0.6,0.6);
+  }
+}
+
+/* ─── well in village center ─── */
+function buildWell(){
+  const wx=0,wz=10;
+  for(let a=0;a<8;a++){
+    const angle=a*Math.PI/4;
+    addInst('stoneDark',wx+Math.cos(angle)*1.2,2,wz+Math.sin(angle)*1.2,1,1,1);
+  }
+  addInst('wood',wx,3,wz,0.5,1,0.5);
+  addInst('wood',wx-1,4,wz,1,0.3,0.3);
+  addInst('wood',wx+1,4,wz,1,0.3,0.3);
+  addInst('wood',wx,4.3,wz,2,0.3,0.5);
+}
+
+/* ─── main function ─── */
+function buildScene(){
+  buildTerrain();
+  buildCastle();
+  buildVillage();
+  buildBridge();
+  buildPond();
+  buildTrees();
+  buildBushes();
+  buildRocks();
+  buildFlowers();
+  buildWell();
+  
+  // count total instances
+  let total=0;
+  for(const k in maps){total+=maps[k].count;}
+  console.log('Total voxels:',total);
+}
+
+buildScene();
+flushAll();
+
+/* ─── animate ─── */
+function animate(){
+  requestAnimationFrame(animate);
+  controls.update();
+  renderer.render(scene,camera);
+}
+animate();
+
+/* ─── resize ─── */
+window.addEventListener('resize',()=>{
+  camera.aspect=window.innerWidth/window.innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(window.innerWidth,window.innerHeight);
+});
+
+})();
+</script>
+</body>
+</html>

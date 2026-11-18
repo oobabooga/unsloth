@@ -1,15 +1,16 @@
-name: AMD DevLab NPU blog stills, voxel kingdom (main 4ef06c9 + #18107 + #18196)
+name: AMD DevLab NPU blog stills, voxel kingdom, one long steered session (main 4ef06c9 + #18107 + #18196)
 
 on:
   push:
     branches: [amd-devlab-npu-voxel-kingdom-2-2026-11-17]
+    paths-ignore: [pick.txt]
 
 permissions: {}
 
 jobs:
   shoot:
     runs-on: [self-hosted, Linux, strix-halo, devlab-dispatch]
-    timeout-minutes: 240
+    timeout-minutes: 420
     env:
       BASE_SHA: 4ef06c9992eca6bc5d560bb8d1666e5995a04d44
       STACK_SHA: 7ca16ae8f610f838a6598c6624fbcaeda31f4e03
@@ -26,7 +27,9 @@ jobs:
       - name: Fetch the bundle and script
         run: |
           curl -fsSL "https://raw.githubusercontent.com/$GITHUB_REPOSITORY/$GITHUB_SHA/stack.bundle" -o "$RUNNER_TEMP/stack.bundle"
-          curl -fsSL "https://raw.githubusercontent.com/$GITHUB_REPOSITORY/$GITHUB_SHA/shoot.py" -o "$RUNNER_TEMP/shoot.py"
+          for f in shoot.py turns.py restored.html original_prompt.txt; do
+            curl -fsSL "https://raw.githubusercontent.com/$GITHUB_REPOSITORY/$GITHUB_SHA/$f" -o "$RUNNER_TEMP/$f"
+          done
 
       - name: Install Unsloth Studio from the stack
         run: |
@@ -74,12 +77,605 @@ jobs:
           "$W/pwvenv/bin/pip" -q install playwright pillow
           PLAYWRIGHT_BROWSERS_PATH="$W/pw-browsers" "$W/pwvenv/bin/python" -m playwright install chromium > "$W/pw-install.log" 2>&1; tail -2 "$W/pw-install.log"
 
-      - name: Shoot
+      - name: Turn 1
+        id: t01
+        if: always() && env.DONE != '1'
+        continue-on-error: true
+        timeout-minutes: 190
+        shell: bash {0}
+        env:
+          STATE: ${{ env.W }}/state.json
+          REPO: ${{ github.repository }}
+          BRANCH: amd-devlab-npu-voxel-kingdom-2-2026-11-17
+          ORIGINAL_PROMPT: ${{ runner.temp }}/original_prompt.txt
+          RESTORED_HTML: ${{ runner.temp }}/restored.html
         run: |
           PLAYWRIGHT_BROWSERS_PATH="$W/pw-browsers" BASE="http://127.0.0.1:$PORT" OUT="$W/out" \
-            "$W/pwvenv/bin/python" "$RUNNER_TEMP/shoot.py" 2>&1 | grep -vF "$PW"
-          exit "${PIPESTATUS[0]}"
+            "$W/pwvenv/bin/python" "$RUNNER_TEMP/turns.py" turn 1 2>&1 | grep --line-buffered -vF "$PW" | tee "$W/out/t01-log.txt"
+          python3 -c "import json,sys;sys.exit(0 if json.load(open('$STATE')).get('done') else 1)" 2>/dev/null && echo "DONE=1" >> "$GITHUB_ENV"
+          true
+
+      - uses: actions/upload-artifact@v4
+        if: always() && steps.t01.outcome != 'skipped'
+        with:
+          name: turn-01
+          path: ${{ env.W }}/out/t01*
+          if-no-files-found: ignore
+
+      - name: Turn 2
+        id: t02
+        if: always() && env.DONE != '1'
+        continue-on-error: true
+        timeout-minutes: 190
         shell: bash {0}
+        env:
+          STATE: ${{ env.W }}/state.json
+          REPO: ${{ github.repository }}
+          BRANCH: amd-devlab-npu-voxel-kingdom-2-2026-11-17
+          ORIGINAL_PROMPT: ${{ runner.temp }}/original_prompt.txt
+          RESTORED_HTML: ${{ runner.temp }}/restored.html
+        run: |
+          PLAYWRIGHT_BROWSERS_PATH="$W/pw-browsers" BASE="http://127.0.0.1:$PORT" OUT="$W/out" \
+            "$W/pwvenv/bin/python" "$RUNNER_TEMP/turns.py" turn 2 2>&1 | grep --line-buffered -vF "$PW" | tee "$W/out/t02-log.txt"
+          python3 -c "import json,sys;sys.exit(0 if json.load(open('$STATE')).get('done') else 1)" 2>/dev/null && echo "DONE=1" >> "$GITHUB_ENV"
+          true
+
+      - uses: actions/upload-artifact@v4
+        if: always() && steps.t02.outcome != 'skipped'
+        with:
+          name: turn-02
+          path: ${{ env.W }}/out/t02*
+          if-no-files-found: ignore
+
+      - name: Turn 3
+        id: t03
+        if: always() && env.DONE != '1'
+        continue-on-error: true
+        timeout-minutes: 190
+        shell: bash {0}
+        env:
+          STATE: ${{ env.W }}/state.json
+          REPO: ${{ github.repository }}
+          BRANCH: amd-devlab-npu-voxel-kingdom-2-2026-11-17
+          ORIGINAL_PROMPT: ${{ runner.temp }}/original_prompt.txt
+          RESTORED_HTML: ${{ runner.temp }}/restored.html
+        run: |
+          PLAYWRIGHT_BROWSERS_PATH="$W/pw-browsers" BASE="http://127.0.0.1:$PORT" OUT="$W/out" \
+            "$W/pwvenv/bin/python" "$RUNNER_TEMP/turns.py" turn 3 2>&1 | grep --line-buffered -vF "$PW" | tee "$W/out/t03-log.txt"
+          python3 -c "import json,sys;sys.exit(0 if json.load(open('$STATE')).get('done') else 1)" 2>/dev/null && echo "DONE=1" >> "$GITHUB_ENV"
+          true
+
+      - uses: actions/upload-artifact@v4
+        if: always() && steps.t03.outcome != 'skipped'
+        with:
+          name: turn-03
+          path: ${{ env.W }}/out/t03*
+          if-no-files-found: ignore
+
+      - name: Turn 4
+        id: t04
+        if: always() && env.DONE != '1'
+        continue-on-error: true
+        timeout-minutes: 190
+        shell: bash {0}
+        env:
+          STATE: ${{ env.W }}/state.json
+          REPO: ${{ github.repository }}
+          BRANCH: amd-devlab-npu-voxel-kingdom-2-2026-11-17
+          ORIGINAL_PROMPT: ${{ runner.temp }}/original_prompt.txt
+          RESTORED_HTML: ${{ runner.temp }}/restored.html
+        run: |
+          PLAYWRIGHT_BROWSERS_PATH="$W/pw-browsers" BASE="http://127.0.0.1:$PORT" OUT="$W/out" \
+            "$W/pwvenv/bin/python" "$RUNNER_TEMP/turns.py" turn 4 2>&1 | grep --line-buffered -vF "$PW" | tee "$W/out/t04-log.txt"
+          python3 -c "import json,sys;sys.exit(0 if json.load(open('$STATE')).get('done') else 1)" 2>/dev/null && echo "DONE=1" >> "$GITHUB_ENV"
+          true
+
+      - uses: actions/upload-artifact@v4
+        if: always() && steps.t04.outcome != 'skipped'
+        with:
+          name: turn-04
+          path: ${{ env.W }}/out/t04*
+          if-no-files-found: ignore
+
+      - name: Turn 5
+        id: t05
+        if: always() && env.DONE != '1'
+        continue-on-error: true
+        timeout-minutes: 190
+        shell: bash {0}
+        env:
+          STATE: ${{ env.W }}/state.json
+          REPO: ${{ github.repository }}
+          BRANCH: amd-devlab-npu-voxel-kingdom-2-2026-11-17
+          ORIGINAL_PROMPT: ${{ runner.temp }}/original_prompt.txt
+          RESTORED_HTML: ${{ runner.temp }}/restored.html
+        run: |
+          PLAYWRIGHT_BROWSERS_PATH="$W/pw-browsers" BASE="http://127.0.0.1:$PORT" OUT="$W/out" \
+            "$W/pwvenv/bin/python" "$RUNNER_TEMP/turns.py" turn 5 2>&1 | grep --line-buffered -vF "$PW" | tee "$W/out/t05-log.txt"
+          python3 -c "import json,sys;sys.exit(0 if json.load(open('$STATE')).get('done') else 1)" 2>/dev/null && echo "DONE=1" >> "$GITHUB_ENV"
+          true
+
+      - uses: actions/upload-artifact@v4
+        if: always() && steps.t05.outcome != 'skipped'
+        with:
+          name: turn-05
+          path: ${{ env.W }}/out/t05*
+          if-no-files-found: ignore
+
+      - name: Turn 6
+        id: t06
+        if: always() && env.DONE != '1'
+        continue-on-error: true
+        timeout-minutes: 190
+        shell: bash {0}
+        env:
+          STATE: ${{ env.W }}/state.json
+          REPO: ${{ github.repository }}
+          BRANCH: amd-devlab-npu-voxel-kingdom-2-2026-11-17
+          ORIGINAL_PROMPT: ${{ runner.temp }}/original_prompt.txt
+          RESTORED_HTML: ${{ runner.temp }}/restored.html
+        run: |
+          PLAYWRIGHT_BROWSERS_PATH="$W/pw-browsers" BASE="http://127.0.0.1:$PORT" OUT="$W/out" \
+            "$W/pwvenv/bin/python" "$RUNNER_TEMP/turns.py" turn 6 2>&1 | grep --line-buffered -vF "$PW" | tee "$W/out/t06-log.txt"
+          python3 -c "import json,sys;sys.exit(0 if json.load(open('$STATE')).get('done') else 1)" 2>/dev/null && echo "DONE=1" >> "$GITHUB_ENV"
+          true
+
+      - uses: actions/upload-artifact@v4
+        if: always() && steps.t06.outcome != 'skipped'
+        with:
+          name: turn-06
+          path: ${{ env.W }}/out/t06*
+          if-no-files-found: ignore
+
+      - name: Turn 7
+        id: t07
+        if: always() && env.DONE != '1'
+        continue-on-error: true
+        timeout-minutes: 190
+        shell: bash {0}
+        env:
+          STATE: ${{ env.W }}/state.json
+          REPO: ${{ github.repository }}
+          BRANCH: amd-devlab-npu-voxel-kingdom-2-2026-11-17
+          ORIGINAL_PROMPT: ${{ runner.temp }}/original_prompt.txt
+          RESTORED_HTML: ${{ runner.temp }}/restored.html
+        run: |
+          PLAYWRIGHT_BROWSERS_PATH="$W/pw-browsers" BASE="http://127.0.0.1:$PORT" OUT="$W/out" \
+            "$W/pwvenv/bin/python" "$RUNNER_TEMP/turns.py" turn 7 2>&1 | grep --line-buffered -vF "$PW" | tee "$W/out/t07-log.txt"
+          python3 -c "import json,sys;sys.exit(0 if json.load(open('$STATE')).get('done') else 1)" 2>/dev/null && echo "DONE=1" >> "$GITHUB_ENV"
+          true
+
+      - uses: actions/upload-artifact@v4
+        if: always() && steps.t07.outcome != 'skipped'
+        with:
+          name: turn-07
+          path: ${{ env.W }}/out/t07*
+          if-no-files-found: ignore
+
+      - name: Turn 8
+        id: t08
+        if: always() && env.DONE != '1'
+        continue-on-error: true
+        timeout-minutes: 190
+        shell: bash {0}
+        env:
+          STATE: ${{ env.W }}/state.json
+          REPO: ${{ github.repository }}
+          BRANCH: amd-devlab-npu-voxel-kingdom-2-2026-11-17
+          ORIGINAL_PROMPT: ${{ runner.temp }}/original_prompt.txt
+          RESTORED_HTML: ${{ runner.temp }}/restored.html
+        run: |
+          PLAYWRIGHT_BROWSERS_PATH="$W/pw-browsers" BASE="http://127.0.0.1:$PORT" OUT="$W/out" \
+            "$W/pwvenv/bin/python" "$RUNNER_TEMP/turns.py" turn 8 2>&1 | grep --line-buffered -vF "$PW" | tee "$W/out/t08-log.txt"
+          python3 -c "import json,sys;sys.exit(0 if json.load(open('$STATE')).get('done') else 1)" 2>/dev/null && echo "DONE=1" >> "$GITHUB_ENV"
+          true
+
+      - uses: actions/upload-artifact@v4
+        if: always() && steps.t08.outcome != 'skipped'
+        with:
+          name: turn-08
+          path: ${{ env.W }}/out/t08*
+          if-no-files-found: ignore
+
+      - name: Turn 9
+        id: t09
+        if: always() && env.DONE != '1'
+        continue-on-error: true
+        timeout-minutes: 190
+        shell: bash {0}
+        env:
+          STATE: ${{ env.W }}/state.json
+          REPO: ${{ github.repository }}
+          BRANCH: amd-devlab-npu-voxel-kingdom-2-2026-11-17
+          ORIGINAL_PROMPT: ${{ runner.temp }}/original_prompt.txt
+          RESTORED_HTML: ${{ runner.temp }}/restored.html
+        run: |
+          PLAYWRIGHT_BROWSERS_PATH="$W/pw-browsers" BASE="http://127.0.0.1:$PORT" OUT="$W/out" \
+            "$W/pwvenv/bin/python" "$RUNNER_TEMP/turns.py" turn 9 2>&1 | grep --line-buffered -vF "$PW" | tee "$W/out/t09-log.txt"
+          python3 -c "import json,sys;sys.exit(0 if json.load(open('$STATE')).get('done') else 1)" 2>/dev/null && echo "DONE=1" >> "$GITHUB_ENV"
+          true
+
+      - uses: actions/upload-artifact@v4
+        if: always() && steps.t09.outcome != 'skipped'
+        with:
+          name: turn-09
+          path: ${{ env.W }}/out/t09*
+          if-no-files-found: ignore
+
+      - name: Turn 10
+        id: t10
+        if: always() && env.DONE != '1'
+        continue-on-error: true
+        timeout-minutes: 190
+        shell: bash {0}
+        env:
+          STATE: ${{ env.W }}/state.json
+          REPO: ${{ github.repository }}
+          BRANCH: amd-devlab-npu-voxel-kingdom-2-2026-11-17
+          ORIGINAL_PROMPT: ${{ runner.temp }}/original_prompt.txt
+          RESTORED_HTML: ${{ runner.temp }}/restored.html
+        run: |
+          PLAYWRIGHT_BROWSERS_PATH="$W/pw-browsers" BASE="http://127.0.0.1:$PORT" OUT="$W/out" \
+            "$W/pwvenv/bin/python" "$RUNNER_TEMP/turns.py" turn 10 2>&1 | grep --line-buffered -vF "$PW" | tee "$W/out/t10-log.txt"
+          python3 -c "import json,sys;sys.exit(0 if json.load(open('$STATE')).get('done') else 1)" 2>/dev/null && echo "DONE=1" >> "$GITHUB_ENV"
+          true
+
+      - uses: actions/upload-artifact@v4
+        if: always() && steps.t10.outcome != 'skipped'
+        with:
+          name: turn-10
+          path: ${{ env.W }}/out/t10*
+          if-no-files-found: ignore
+
+      - name: Turn 11
+        id: t11
+        if: always() && env.DONE != '1'
+        continue-on-error: true
+        timeout-minutes: 190
+        shell: bash {0}
+        env:
+          STATE: ${{ env.W }}/state.json
+          REPO: ${{ github.repository }}
+          BRANCH: amd-devlab-npu-voxel-kingdom-2-2026-11-17
+          ORIGINAL_PROMPT: ${{ runner.temp }}/original_prompt.txt
+          RESTORED_HTML: ${{ runner.temp }}/restored.html
+        run: |
+          PLAYWRIGHT_BROWSERS_PATH="$W/pw-browsers" BASE="http://127.0.0.1:$PORT" OUT="$W/out" \
+            "$W/pwvenv/bin/python" "$RUNNER_TEMP/turns.py" turn 11 2>&1 | grep --line-buffered -vF "$PW" | tee "$W/out/t11-log.txt"
+          python3 -c "import json,sys;sys.exit(0 if json.load(open('$STATE')).get('done') else 1)" 2>/dev/null && echo "DONE=1" >> "$GITHUB_ENV"
+          true
+
+      - uses: actions/upload-artifact@v4
+        if: always() && steps.t11.outcome != 'skipped'
+        with:
+          name: turn-11
+          path: ${{ env.W }}/out/t11*
+          if-no-files-found: ignore
+
+      - name: Turn 12
+        id: t12
+        if: always() && env.DONE != '1'
+        continue-on-error: true
+        timeout-minutes: 190
+        shell: bash {0}
+        env:
+          STATE: ${{ env.W }}/state.json
+          REPO: ${{ github.repository }}
+          BRANCH: amd-devlab-npu-voxel-kingdom-2-2026-11-17
+          ORIGINAL_PROMPT: ${{ runner.temp }}/original_prompt.txt
+          RESTORED_HTML: ${{ runner.temp }}/restored.html
+        run: |
+          PLAYWRIGHT_BROWSERS_PATH="$W/pw-browsers" BASE="http://127.0.0.1:$PORT" OUT="$W/out" \
+            "$W/pwvenv/bin/python" "$RUNNER_TEMP/turns.py" turn 12 2>&1 | grep --line-buffered -vF "$PW" | tee "$W/out/t12-log.txt"
+          python3 -c "import json,sys;sys.exit(0 if json.load(open('$STATE')).get('done') else 1)" 2>/dev/null && echo "DONE=1" >> "$GITHUB_ENV"
+          true
+
+      - uses: actions/upload-artifact@v4
+        if: always() && steps.t12.outcome != 'skipped'
+        with:
+          name: turn-12
+          path: ${{ env.W }}/out/t12*
+          if-no-files-found: ignore
+
+      - name: Turn 13
+        id: t13
+        if: always() && env.DONE != '1'
+        continue-on-error: true
+        timeout-minutes: 190
+        shell: bash {0}
+        env:
+          STATE: ${{ env.W }}/state.json
+          REPO: ${{ github.repository }}
+          BRANCH: amd-devlab-npu-voxel-kingdom-2-2026-11-17
+          ORIGINAL_PROMPT: ${{ runner.temp }}/original_prompt.txt
+          RESTORED_HTML: ${{ runner.temp }}/restored.html
+        run: |
+          PLAYWRIGHT_BROWSERS_PATH="$W/pw-browsers" BASE="http://127.0.0.1:$PORT" OUT="$W/out" \
+            "$W/pwvenv/bin/python" "$RUNNER_TEMP/turns.py" turn 13 2>&1 | grep --line-buffered -vF "$PW" | tee "$W/out/t13-log.txt"
+          python3 -c "import json,sys;sys.exit(0 if json.load(open('$STATE')).get('done') else 1)" 2>/dev/null && echo "DONE=1" >> "$GITHUB_ENV"
+          true
+
+      - uses: actions/upload-artifact@v4
+        if: always() && steps.t13.outcome != 'skipped'
+        with:
+          name: turn-13
+          path: ${{ env.W }}/out/t13*
+          if-no-files-found: ignore
+
+      - name: Turn 14
+        id: t14
+        if: always() && env.DONE != '1'
+        continue-on-error: true
+        timeout-minutes: 190
+        shell: bash {0}
+        env:
+          STATE: ${{ env.W }}/state.json
+          REPO: ${{ github.repository }}
+          BRANCH: amd-devlab-npu-voxel-kingdom-2-2026-11-17
+          ORIGINAL_PROMPT: ${{ runner.temp }}/original_prompt.txt
+          RESTORED_HTML: ${{ runner.temp }}/restored.html
+        run: |
+          PLAYWRIGHT_BROWSERS_PATH="$W/pw-browsers" BASE="http://127.0.0.1:$PORT" OUT="$W/out" \
+            "$W/pwvenv/bin/python" "$RUNNER_TEMP/turns.py" turn 14 2>&1 | grep --line-buffered -vF "$PW" | tee "$W/out/t14-log.txt"
+          python3 -c "import json,sys;sys.exit(0 if json.load(open('$STATE')).get('done') else 1)" 2>/dev/null && echo "DONE=1" >> "$GITHUB_ENV"
+          true
+
+      - uses: actions/upload-artifact@v4
+        if: always() && steps.t14.outcome != 'skipped'
+        with:
+          name: turn-14
+          path: ${{ env.W }}/out/t14*
+          if-no-files-found: ignore
+
+      - name: Turn 15
+        id: t15
+        if: always() && env.DONE != '1'
+        continue-on-error: true
+        timeout-minutes: 190
+        shell: bash {0}
+        env:
+          STATE: ${{ env.W }}/state.json
+          REPO: ${{ github.repository }}
+          BRANCH: amd-devlab-npu-voxel-kingdom-2-2026-11-17
+          ORIGINAL_PROMPT: ${{ runner.temp }}/original_prompt.txt
+          RESTORED_HTML: ${{ runner.temp }}/restored.html
+        run: |
+          PLAYWRIGHT_BROWSERS_PATH="$W/pw-browsers" BASE="http://127.0.0.1:$PORT" OUT="$W/out" \
+            "$W/pwvenv/bin/python" "$RUNNER_TEMP/turns.py" turn 15 2>&1 | grep --line-buffered -vF "$PW" | tee "$W/out/t15-log.txt"
+          python3 -c "import json,sys;sys.exit(0 if json.load(open('$STATE')).get('done') else 1)" 2>/dev/null && echo "DONE=1" >> "$GITHUB_ENV"
+          true
+
+      - uses: actions/upload-artifact@v4
+        if: always() && steps.t15.outcome != 'skipped'
+        with:
+          name: turn-15
+          path: ${{ env.W }}/out/t15*
+          if-no-files-found: ignore
+
+      - name: Turn 16
+        id: t16
+        if: always() && env.DONE != '1'
+        continue-on-error: true
+        timeout-minutes: 190
+        shell: bash {0}
+        env:
+          STATE: ${{ env.W }}/state.json
+          REPO: ${{ github.repository }}
+          BRANCH: amd-devlab-npu-voxel-kingdom-2-2026-11-17
+          ORIGINAL_PROMPT: ${{ runner.temp }}/original_prompt.txt
+          RESTORED_HTML: ${{ runner.temp }}/restored.html
+        run: |
+          PLAYWRIGHT_BROWSERS_PATH="$W/pw-browsers" BASE="http://127.0.0.1:$PORT" OUT="$W/out" \
+            "$W/pwvenv/bin/python" "$RUNNER_TEMP/turns.py" turn 16 2>&1 | grep --line-buffered -vF "$PW" | tee "$W/out/t16-log.txt"
+          python3 -c "import json,sys;sys.exit(0 if json.load(open('$STATE')).get('done') else 1)" 2>/dev/null && echo "DONE=1" >> "$GITHUB_ENV"
+          true
+
+      - uses: actions/upload-artifact@v4
+        if: always() && steps.t16.outcome != 'skipped'
+        with:
+          name: turn-16
+          path: ${{ env.W }}/out/t16*
+          if-no-files-found: ignore
+
+      - name: Turn 17
+        id: t17
+        if: always() && env.DONE != '1'
+        continue-on-error: true
+        timeout-minutes: 190
+        shell: bash {0}
+        env:
+          STATE: ${{ env.W }}/state.json
+          REPO: ${{ github.repository }}
+          BRANCH: amd-devlab-npu-voxel-kingdom-2-2026-11-17
+          ORIGINAL_PROMPT: ${{ runner.temp }}/original_prompt.txt
+          RESTORED_HTML: ${{ runner.temp }}/restored.html
+        run: |
+          PLAYWRIGHT_BROWSERS_PATH="$W/pw-browsers" BASE="http://127.0.0.1:$PORT" OUT="$W/out" \
+            "$W/pwvenv/bin/python" "$RUNNER_TEMP/turns.py" turn 17 2>&1 | grep --line-buffered -vF "$PW" | tee "$W/out/t17-log.txt"
+          python3 -c "import json,sys;sys.exit(0 if json.load(open('$STATE')).get('done') else 1)" 2>/dev/null && echo "DONE=1" >> "$GITHUB_ENV"
+          true
+
+      - uses: actions/upload-artifact@v4
+        if: always() && steps.t17.outcome != 'skipped'
+        with:
+          name: turn-17
+          path: ${{ env.W }}/out/t17*
+          if-no-files-found: ignore
+
+      - name: Turn 18
+        id: t18
+        if: always() && env.DONE != '1'
+        continue-on-error: true
+        timeout-minutes: 190
+        shell: bash {0}
+        env:
+          STATE: ${{ env.W }}/state.json
+          REPO: ${{ github.repository }}
+          BRANCH: amd-devlab-npu-voxel-kingdom-2-2026-11-17
+          ORIGINAL_PROMPT: ${{ runner.temp }}/original_prompt.txt
+          RESTORED_HTML: ${{ runner.temp }}/restored.html
+        run: |
+          PLAYWRIGHT_BROWSERS_PATH="$W/pw-browsers" BASE="http://127.0.0.1:$PORT" OUT="$W/out" \
+            "$W/pwvenv/bin/python" "$RUNNER_TEMP/turns.py" turn 18 2>&1 | grep --line-buffered -vF "$PW" | tee "$W/out/t18-log.txt"
+          python3 -c "import json,sys;sys.exit(0 if json.load(open('$STATE')).get('done') else 1)" 2>/dev/null && echo "DONE=1" >> "$GITHUB_ENV"
+          true
+
+      - uses: actions/upload-artifact@v4
+        if: always() && steps.t18.outcome != 'skipped'
+        with:
+          name: turn-18
+          path: ${{ env.W }}/out/t18*
+          if-no-files-found: ignore
+
+      - name: Turn 19
+        id: t19
+        if: always() && env.DONE != '1'
+        continue-on-error: true
+        timeout-minutes: 190
+        shell: bash {0}
+        env:
+          STATE: ${{ env.W }}/state.json
+          REPO: ${{ github.repository }}
+          BRANCH: amd-devlab-npu-voxel-kingdom-2-2026-11-17
+          ORIGINAL_PROMPT: ${{ runner.temp }}/original_prompt.txt
+          RESTORED_HTML: ${{ runner.temp }}/restored.html
+        run: |
+          PLAYWRIGHT_BROWSERS_PATH="$W/pw-browsers" BASE="http://127.0.0.1:$PORT" OUT="$W/out" \
+            "$W/pwvenv/bin/python" "$RUNNER_TEMP/turns.py" turn 19 2>&1 | grep --line-buffered -vF "$PW" | tee "$W/out/t19-log.txt"
+          python3 -c "import json,sys;sys.exit(0 if json.load(open('$STATE')).get('done') else 1)" 2>/dev/null && echo "DONE=1" >> "$GITHUB_ENV"
+          true
+
+      - uses: actions/upload-artifact@v4
+        if: always() && steps.t19.outcome != 'skipped'
+        with:
+          name: turn-19
+          path: ${{ env.W }}/out/t19*
+          if-no-files-found: ignore
+
+      - name: Turn 20
+        id: t20
+        if: always() && env.DONE != '1'
+        continue-on-error: true
+        timeout-minutes: 190
+        shell: bash {0}
+        env:
+          STATE: ${{ env.W }}/state.json
+          REPO: ${{ github.repository }}
+          BRANCH: amd-devlab-npu-voxel-kingdom-2-2026-11-17
+          ORIGINAL_PROMPT: ${{ runner.temp }}/original_prompt.txt
+          RESTORED_HTML: ${{ runner.temp }}/restored.html
+        run: |
+          PLAYWRIGHT_BROWSERS_PATH="$W/pw-browsers" BASE="http://127.0.0.1:$PORT" OUT="$W/out" \
+            "$W/pwvenv/bin/python" "$RUNNER_TEMP/turns.py" turn 20 2>&1 | grep --line-buffered -vF "$PW" | tee "$W/out/t20-log.txt"
+          python3 -c "import json,sys;sys.exit(0 if json.load(open('$STATE')).get('done') else 1)" 2>/dev/null && echo "DONE=1" >> "$GITHUB_ENV"
+          true
+
+      - uses: actions/upload-artifact@v4
+        if: always() && steps.t20.outcome != 'skipped'
+        with:
+          name: turn-20
+          path: ${{ env.W }}/out/t20*
+          if-no-files-found: ignore
+
+      - name: Turn 21
+        id: t21
+        if: always() && env.DONE != '1'
+        continue-on-error: true
+        timeout-minutes: 190
+        shell: bash {0}
+        env:
+          STATE: ${{ env.W }}/state.json
+          REPO: ${{ github.repository }}
+          BRANCH: amd-devlab-npu-voxel-kingdom-2-2026-11-17
+          ORIGINAL_PROMPT: ${{ runner.temp }}/original_prompt.txt
+          RESTORED_HTML: ${{ runner.temp }}/restored.html
+        run: |
+          PLAYWRIGHT_BROWSERS_PATH="$W/pw-browsers" BASE="http://127.0.0.1:$PORT" OUT="$W/out" \
+            "$W/pwvenv/bin/python" "$RUNNER_TEMP/turns.py" turn 21 2>&1 | grep --line-buffered -vF "$PW" | tee "$W/out/t21-log.txt"
+          python3 -c "import json,sys;sys.exit(0 if json.load(open('$STATE')).get('done') else 1)" 2>/dev/null && echo "DONE=1" >> "$GITHUB_ENV"
+          true
+
+      - uses: actions/upload-artifact@v4
+        if: always() && steps.t21.outcome != 'skipped'
+        with:
+          name: turn-21
+          path: ${{ env.W }}/out/t21*
+          if-no-files-found: ignore
+
+      - name: Turn 22
+        id: t22
+        if: always() && env.DONE != '1'
+        continue-on-error: true
+        timeout-minutes: 190
+        shell: bash {0}
+        env:
+          STATE: ${{ env.W }}/state.json
+          REPO: ${{ github.repository }}
+          BRANCH: amd-devlab-npu-voxel-kingdom-2-2026-11-17
+          ORIGINAL_PROMPT: ${{ runner.temp }}/original_prompt.txt
+          RESTORED_HTML: ${{ runner.temp }}/restored.html
+        run: |
+          PLAYWRIGHT_BROWSERS_PATH="$W/pw-browsers" BASE="http://127.0.0.1:$PORT" OUT="$W/out" \
+            "$W/pwvenv/bin/python" "$RUNNER_TEMP/turns.py" turn 22 2>&1 | grep --line-buffered -vF "$PW" | tee "$W/out/t22-log.txt"
+          python3 -c "import json,sys;sys.exit(0 if json.load(open('$STATE')).get('done') else 1)" 2>/dev/null && echo "DONE=1" >> "$GITHUB_ENV"
+          true
+
+      - uses: actions/upload-artifact@v4
+        if: always() && steps.t22.outcome != 'skipped'
+        with:
+          name: turn-22
+          path: ${{ env.W }}/out/t22*
+          if-no-files-found: ignore
+
+      - name: Turn 23
+        id: t23
+        if: always() && env.DONE != '1'
+        continue-on-error: true
+        timeout-minutes: 190
+        shell: bash {0}
+        env:
+          STATE: ${{ env.W }}/state.json
+          REPO: ${{ github.repository }}
+          BRANCH: amd-devlab-npu-voxel-kingdom-2-2026-11-17
+          ORIGINAL_PROMPT: ${{ runner.temp }}/original_prompt.txt
+          RESTORED_HTML: ${{ runner.temp }}/restored.html
+        run: |
+          PLAYWRIGHT_BROWSERS_PATH="$W/pw-browsers" BASE="http://127.0.0.1:$PORT" OUT="$W/out" \
+            "$W/pwvenv/bin/python" "$RUNNER_TEMP/turns.py" turn 23 2>&1 | grep --line-buffered -vF "$PW" | tee "$W/out/t23-log.txt"
+          python3 -c "import json,sys;sys.exit(0 if json.load(open('$STATE')).get('done') else 1)" 2>/dev/null && echo "DONE=1" >> "$GITHUB_ENV"
+          true
+
+      - uses: actions/upload-artifact@v4
+        if: always() && steps.t23.outcome != 'skipped'
+        with:
+          name: turn-23
+          path: ${{ env.W }}/out/t23*
+          if-no-files-found: ignore
+
+      - name: Turn 24
+        id: t24
+        if: always() && env.DONE != '1'
+        continue-on-error: true
+        timeout-minutes: 190
+        shell: bash {0}
+        env:
+          STATE: ${{ env.W }}/state.json
+          REPO: ${{ github.repository }}
+          BRANCH: amd-devlab-npu-voxel-kingdom-2-2026-11-17
+          ORIGINAL_PROMPT: ${{ runner.temp }}/original_prompt.txt
+          RESTORED_HTML: ${{ runner.temp }}/restored.html
+        run: |
+          PLAYWRIGHT_BROWSERS_PATH="$W/pw-browsers" BASE="http://127.0.0.1:$PORT" OUT="$W/out" \
+            "$W/pwvenv/bin/python" "$RUNNER_TEMP/turns.py" turn 24 2>&1 | grep --line-buffered -vF "$PW" | tee "$W/out/t24-log.txt"
+          python3 -c "import json,sys;sys.exit(0 if json.load(open('$STATE')).get('done') else 1)" 2>/dev/null && echo "DONE=1" >> "$GITHUB_ENV"
+          true
+
+      - uses: actions/upload-artifact@v4
+        if: always() && steps.t24.outcome != 'skipped'
+        with:
+          name: turn-24
+          path: ${{ env.W }}/out/t24*
+          if-no-files-found: ignore
 
       - name: Collect
         if: always()
@@ -87,6 +683,7 @@ jobs:
         run: |
           mkdir -p "$GITHUB_WORKSPACE/stills"
           cp -r "$W/out/." "$GITHUB_WORKSPACE/stills/" 2>/dev/null
+          cp "$W/state.json" "$GITHUB_WORKSPACE/stills/" 2>/dev/null
           tail -300 "$W/studio.log" 2>/dev/null | grep -vF "$PW" > "$GITHUB_WORKSPACE/stills/studio-tail.log"
           ls -la "$GITHUB_WORKSPACE/stills"
 
