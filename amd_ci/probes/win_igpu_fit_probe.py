@@ -47,7 +47,8 @@ class PROCESS_MEMORY_COUNTERS_EX(ctypes.Structure):
         ("QuotaPeakPagedPoolUsage", ctypes.c_size_t), ("QuotaPagedPoolUsage", ctypes.c_size_t),
         ("QuotaPeakNonPagedPoolUsage", ctypes.c_size_t), ("QuotaNonPagedPoolUsage", ctypes.c_size_t),
         ("PagefileUsage", ctypes.c_size_t), ("PeakPagefileUsage", ctypes.c_size_t),
-        ("PrivateUsage", ctypes.c_size_t),
+        ("PrivateUsage", ctypes.c_size_t), ("PrivateWorkingSetSize", ctypes.c_size_t),
+        ("SharedCommitUsage", ctypes.c_ulonglong),
     ]
 
 
@@ -62,16 +63,17 @@ def sysmem() -> dict:
 
 
 def procmem(pid: int) -> dict:
-    h = ctypes.windll.kernel32.OpenProcess(0x0410, False, pid)
+    h = ctypes.windll.kernel32.OpenProcess(0x1000, False, pid)
     if not h:
         return {}
     try:
         c = PROCESS_MEMORY_COUNTERS_EX()
         c.cb = ctypes.sizeof(c)
-        if not ctypes.windll.psapi.GetProcessMemoryInfo(h, ctypes.byref(c), c.cb):
+        if not ctypes.windll.kernel32.K32GetProcessMemoryInfo(h, ctypes.byref(c), c.cb):
             return {}
         return {"private_mib": c.PrivateUsage // MIB, "ws_mib": c.WorkingSetSize // MIB,
-                "peak_ws_mib": c.PeakWorkingSetSize // MIB}
+                "peak_ws_mib": c.PeakWorkingSetSize // MIB,
+                "private_ws_mib": c.PrivateWorkingSetSize // MIB}
     finally:
         ctypes.windll.kernel32.CloseHandle(h)
 
@@ -185,6 +187,9 @@ def run_config(server: Path, model: Path, name: str, args: list[str], logdir: Pa
         res["loaded_proc"] = procmem(p.pid)
         res["loaded_sys"] = sysmem()
         res["loaded_gpu"] = gpu_counters(p.pid)
+        time.sleep(60)
+        res["idle60_proc"] = procmem(p.pid)
+        res["idle60_sys"] = sysmem()
     res["peak_private_mib"] = peak_private
     res["min_avail_phys_mib"] = min_avail
     res["min_commit_avail_mib"] = min_commit
@@ -232,15 +237,14 @@ def main() -> int:
             kv = max(0, device_mib - weights - 1024) * MIB
             return max(8192, (kv // KV_BYTES_PER_TOKEN) // 1024 * 1024)
 
-        # Between avail - 16 GiB and avail: a margin backed by RAM would shrink this plan.
-        mid = ctx_for(avail - 8 * 1024)
+        base = ["-c", "8192", "--parallel", "1", "-fa", "on", "--fit", "on"]
         configs = [
-            ("small_default", ["-c", "8192", "--parallel", "1", "-fa", "on", "--fit", "on"]),
-            ("mid_fit_target_16384", ["-c", str(mid), "--parallel", "1", "-fa", "on", "--fit", "on",
-                                      "--fit-target", "16384"]),
-            ("mid_fit_target_16384_nommap", ["-c", str(mid), "--parallel", "1", "-fa", "on", "--fit", "on",
-                                             "--fit-target", "16384", "--no-mmap"]),
+            ("full_none", [*base, "--load-mode", "none"]),
+            ("full_mmap", [*base, "--load-mode", "mmap"]),
+            ("full_mmap_lazy", [*base, "--load-mode", "mmap", "--lazy-mode", "on"]),
+            ("full_none_again", [*base, "--load-mode", "none"]),
         ]
+        mid = 0
         out["sizing"] = {"avail_at_start_mib": avail, "weights_mib": weights, "mid_ctx": mid,
                          "mid_kv_mib": mid * KV_BYTES_PER_TOKEN // MIB}
         logdir = Path(a.out).parent / f"llama_logs_{a.state}"
