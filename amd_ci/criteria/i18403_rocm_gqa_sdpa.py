@@ -213,12 +213,26 @@ def _losses(o, cell):
 
 
 def head_is_worse(base, head):
-    bad = list(_problems(head))
+    probs = list(_problems(head))
+    notes = []
+    # A training cell that fails the same way on both arms is pre-existing, not the head's doing.
+    def _err(o, cell):
+        c = ((o or {}).get("train") or {}).get(cell) or {}
+        return (c.get("stage"), str(c.get("error") or "")[:120]) if not _train_ok(c) else None
+    same = {cell for cell in ("serial", "plain") if _err(base, cell) and _err(base, cell) == _err(head, cell)}
+    bad = []
+    for pr in probs:
+        if any(pr.startswith(f"train {cell}:") for cell in same):
+            notes.append("pre-existing on both arms: " + pr)
+        else:
+            bad.append(pr)
     rb, rh = _route_backends(base), _route_backends(head)
     if rb != rh:
         bad.append(f"default route backends differ: base {rb} head {rh}")
     for cell in ("serial", "plain"):
         lb, lh = _losses(base, cell), _losses(head, cell)
+        if cell in same:
+            continue
         if not lb or lb.keys() != lh.keys():
             bad.append(f"train {cell}: steps differ base {sorted(lb)} head {sorted(lh)}")
             continue
@@ -235,6 +249,10 @@ def head_is_worse(base, head):
         rep = (cc.get(b) or {}).get("report") or {}
         if not rep.get("ok") or not rep.get("ran"):
             bad.append(f"self-check child {b}: {cc.get(b)}")
+    if notes and not bad:
+        return False, "no head-only difference; " + "; ".join(notes)
+    if notes:
+        bad += notes
     return (bool(bad), "; ".join(bad) or "head routes, trains and computes like base; self-check passes; forced "
                                       "refusal routes every call to MATH with matching logits; PR tests pass")
 
@@ -254,6 +272,12 @@ def _extra_table(obs):
     L.append(f"\nPR tests at head (tests/utils/test_rocm_sdpa_check.py): rc={t.get('rc')} {n}; "
              f"failed {[k for k, v in cases.items() if v == 'failed']}; "
              f"skipped {[k.split('::')[-1] for k, v in cases.items() if v == 'skipped']}")
+    t2 = h.get("pr_tests_winshim")
+    if t2:
+        c2 = t2.get("cases") or {}
+        n2 = {k: sum(1 for v in c2.values() if v == k) for k in ("passed", "failed", "skipped")}
+        L.append(f"Supplementary (NOT the PR file): same tests with signal.SIGKILL -> getattr(signal, 'SIGKILL', 9): "
+                 f"rc={t2.get('rc')} {n2}; failed {[k for k, v in c2.items() if v == 'failed']}")
     L.append(f"base has rocm_sdpa_check.py: {(b.get('check_child') or {}).get('present')}; head commit {h.get('commit')} "
              f"tree {h.get('tree')}; base commit {b.get('commit')}; platform {h.get('platform')}")
     if h.get("stack_install"):

@@ -54,12 +54,22 @@ def env_for(extra = None):
 
 
 def run(cmd, timeout, **kw):
+    # Popen + whole-tree kill: on Windows subprocess.run's timeout kills only the child, then blocks forever
+    # on pipes a grandchild still holds (a previous Windows run hung 2.7 h that way).
+    p = subprocess.Popen(cmd, stdout = subprocess.PIPE, stderr = subprocess.PIPE, stdin = subprocess.DEVNULL,
+                         text = True, encoding = "utf-8", errors = "replace", **kw)
     try:
-        p = subprocess.run(cmd, capture_output = True, text = True, encoding = "utf-8", errors = "replace",
-                           timeout = timeout, **kw)
-        return p.returncode, p.stdout or "", p.stderr or ""
-    except subprocess.TimeoutExpired as e:
-        return "timeout", str(e.stdout or "")[-2000:], str(e.stderr or "")[-2000:]
+        so, se = p.communicate(timeout = timeout)
+        return p.returncode, so or "", se or ""
+    except subprocess.TimeoutExpired:
+        if sys.platform == "win32":
+            subprocess.run(["taskkill", "/T", "/F", "/PID", str(p.pid)], capture_output = True)
+        p.kill()
+        try:
+            so, se = p.communicate(timeout = 60)
+        except subprocess.TimeoutExpired:
+            so, se = "", "pipes still held after tree kill"
+        return "timeout", str(so or "")[-2000:], str(se or "")[-2000:]
 
 
 def load(p: Path, rc, so, se):
@@ -87,8 +97,10 @@ obs["stack_preinstalled"] = rc == 0
 if rc != 0 and WIN:
     steps = []
     for cmd in (
-        [a.python, "-m", "pip", "install", "-q", "--disable-pip-version-check", "transformers==5.23.0", "trl==1.18.0",
-         "peft==0.21.3", "accelerate", "datasets>=3.4.1,!=4.0.*,!=4.1.0,!=4.4.*,!=4.5.0,<5.0.0", "sentencepiece>=0.2.0",
+        # Same training stack as the Linux Studio venv (transformers 5.23 / trl 1.18 / peft 0.21.3 failed both
+        # arms at step 0 on Windows: GradScaler unscale on bf16 grads).
+        [a.python, "-m", "pip", "install", "-q", "--disable-pip-version-check", "transformers==5.5.4", "trl==0.23.1",
+         "peft==0.18.1", "accelerate", "datasets>=3.4.1,!=4.0.*,!=4.1.0,!=4.4.*,!=4.5.0,<5.0.0", "sentencepiece>=0.2.0",
          "protobuf", "huggingface_hub>=0.34.0", "bitsandbytes", "einops", "msgspec", "psutil", "tqdm", "regex", "pillow",
          "packaging", "numpy", "wheel", "requests", "filelock", "typing_extensions", "typer>=0.19.0,<0.29", "rich",
          "pydantic", "pyyaml", "json5>=0.9.25", "nest-asyncio", "structlog>=24.1.0", "click>=8.0", "tyro", "diffusers",
@@ -223,6 +235,34 @@ if chk.exists():
         t["junit_error"] = repr(e)
     obs["pr_tests"] = t
     save()
+    if WIN and t.get("rc") not in (0,):
+        # Supplementary, NOT the PR's file: the same tests with signal.SIGKILL (absent on Windows) replaced by 9,
+        # to see whether anything besides the collection error fails here.
+        src = (ck / "tests" / "utils" / "test_rocm_sdpa_check.py").read_text(encoding = "utf-8")
+        alt = ck / "tests" / "utils" / "test_rocm_sdpa_check_winshim.py"
+        alt.write_text(src.replace("signal.SIGKILL", "getattr(signal, 'SIGKILL', 9)"), encoding = "utf-8")
+        junit2 = work / "pr_tests_winshim.junit.xml"
+        r, so, se = run([a.python, "-m", "pytest", "-q", "-rfEs", "--color=no", "-p", "no:cacheprovider", "-o",
+                         "addopts=", f"--junitxml={junit2}", str(alt.relative_to(ck)).replace("\\", "/")], 1800,
+                        cwd = str(ck), env = env_for())
+        t2 = {"rc": r, "tail": (so + se)[-3000:]}
+        try:
+            import xml.etree.ElementTree as ET
+            res2 = {}
+            for c in ET.parse(junit2).getroot().iter("testcase"):
+                kind = "passed"
+                for ch in c:
+                    if ch.tag in ("failure", "error"):
+                        kind = "failed"
+                    elif ch.tag == "skipped" and kind == "passed":
+                        kind = "skipped"
+                res2[f"{c.get('classname')}::{c.get('name')}"] = kind
+            t2["cases"] = res2
+        except Exception as e:  # noqa: BLE001
+            t2["junit_error"] = repr(e)
+        alt.unlink()
+        obs["pr_tests_winshim"] = t2
+        save()
 
 # B. route
 ro = work / "route.json"
@@ -255,7 +295,7 @@ for name, extra in cells:
     cw.mkdir(exist_ok = True)
     co = work / f"train_{name}.json"
     r, so, se = run([a.python, "-u", str(HERE / "i18403_train.py"), "--mode", "train", "--model-dir", str(model_dir),
-                     "--bnb", str(BNB), "--steps", str(a.steps), "--work", str(cw), "--out", str(co)], 1200,
+                     "--bnb", str(BNB), "--steps", str(a.steps), "--work", str(cw), "--out", str(co)], 900,
                     cwd = str(cw), env = env_for({"UNSLOTH_COMPILE_LOCATION": str(cw / "ucache"), **extra}))
     obs["train"][name] = load(co, r, so, se)
     save()
