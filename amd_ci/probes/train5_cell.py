@@ -36,6 +36,8 @@ import traceback
 # Llama 3.2 has head_dim 8 with hidden 8 / 4 heads, which FastLlama rebuilds as head_dim 2 (load MISMATCH).
 LLAMA_TOKENIZER = "trl-internal-testing/tiny-MistralForCausalLM-0.1"
 MODELS = {
+    "cg_forced8": "w20a 8-layer tiny Qwen3 (seed 0, B200 repro model; dpo_cg_repro.py 10 steps, UNSLOTH_BLOCK_CUDAGRAPHS=1)",
+    "cg_auto8": "w20a 8-layer tiny Qwen3 (dpo_cg_repro.py 10 steps, block CUDA graphs auto)",
     "cg_forced": "trl-internal-testing/tiny-Qwen3ForCausalLM (w20a dpo_cg_repro.py, DPO ref adapter, UNSLOTH_BLOCK_CUDAGRAPHS=1)",
     "cg_auto": "trl-internal-testing/tiny-Qwen3ForCausalLM (w20a dpo_cg_repro.py, DPO ref adapter, block CUDA graphs auto)",
     "ls_qwen3": "trl-internal-testing/tiny-Qwen3ForCausalLM (SFT label_smoothing_factor 0.1, GA 2)",
