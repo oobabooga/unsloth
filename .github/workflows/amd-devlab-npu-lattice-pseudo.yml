@@ -71,13 +71,37 @@ jobs:
       - name: Enable the NPU and download the model
         run: |
           curl -fsSL "https://raw.githubusercontent.com/oobabooga/unsloth/776c87ef15/rec.py" -o "$W/rec.py"
-          BASE="http://127.0.0.1:$PORT" OUT="$W/prep" python3 "$W/rec.py" prepare 2>&1 | grep -vF "$PW" | tail -20
+          BASE="http://127.0.0.1:$PORT" OUT="$W/prep" python3 "$W/rec.py" prepare 2>&1 | grep -vF "$PW" | tee "$W/prep/prepare-log.txt" | tail -20
 
       - name: Playwright
         run: |
           python3 -m venv "$W/pwvenv"
           "$W/pwvenv/bin/pip" -q install playwright pillow
           PLAYWRIGHT_BROWSERS_PATH="$W/pw-browsers" "$W/pwvenv/bin/python" -m playwright install chromium > "$W/pw-install.log" 2>&1; tail -2 "$W/pw-install.log"
+
+      - name: Record the setup
+        shell: bash {0}
+        run: |
+          mkdir -p "$W/out/env"; E="$W/out/env/setup.txt"
+          { echo "unsloth commit: $(git -C "$W/src" rev-parse HEAD) (main $BASE_SHA + PR heads below)"
+            git -C "$W/src" log --format='%P' --first-parent "$BASE_SHA..HEAD" | awk '{print "merged PR head " $2}'
+            echo "model: $MODEL (picker name $NEW_NAME)"
+            uname -r; lscpu | grep 'Model name'; free -h | head -2
+            cat /sys/module/amdxdna/version 2>/dev/null | sed 's/^/amdxdna /'
+            command -v flm >/dev/null && flm version 2>&1 | head -3
+            command -v lemonade-server >/dev/null && lemonade-server --version 2>&1 | head -2
+            command -v lemond >/dev/null && lemond --version 2>&1 | head -2
+            echo "playwright chromium: $("$W/pwvenv/bin/python" -c 'import playwright;print(playwright.__version__)')"
+          } > "$E" 2>&1
+          cp "$W/prep/"*.txt "$W/prep/"*.json "$W/out/env/" 2>/dev/null || true
+          cat "$E"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        continue-on-error: true
+        with:
+          name: pseudo-${{ matrix.shard }}-env
+          path: ${{ runner.temp }}/npu-voxel-${{ github.run_id }}-${{ matrix.shard }}/out/env/
 
       - name: Try 01
         continue-on-error: true

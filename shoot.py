@@ -166,6 +166,7 @@ def load_model(page):
         st = call("GET", "/api/npu/status", token = TOKEN)
         if st.get("loaded_model") == f"lemonade:{MODEL}" and not st.get("loading_model"):
             log("loaded", json.dumps({k: st.get(k) for k in ("loaded_model", "context_length")}))
+            (OUT / "settings-after-load.json").write_text(json.dumps({"npu_status": st, "inference_status": call("GET", "/api/inference/status", token = TOKEN)}, indent = 2))
             break
         page.wait_for_timeout(2000)
     else:
@@ -705,6 +706,19 @@ def main():
         ctx = browser.new_context(viewport = {"width": W, "height": H}, device_scale_factor = dsf, color_scheme = "light")
         ctx.add_init_script(seed())
         ctx.add_init_script(FRAME_CLOCK)
+        def keep_request(req):
+            # every setting the UI sends: model load body and the chat request (prompt text trimmed)
+            if req.method != "POST" or not any(k in req.url for k in ("/api/inference/", "/v1/", "/api/npu/")):
+                return
+            try:
+                body = json.loads(req.post_data or "null")
+            except ValueError:
+                body = (req.post_data or "")[:400]
+            if isinstance(body, dict) and isinstance(body.get("messages"), list):
+                body = {**body, "messages": [{**m, "content": str(m.get("content"))[:200] + " ...[trimmed]"} if isinstance(m, dict) else m for m in body["messages"]]}
+            with open(OUT / "settings-requests.jsonl", "a") as fh:
+                fh.write(json.dumps({"t": time.strftime("%H:%M:%S"), "url": req.url.replace(BASE, ""), "body": body}) + "\n")
+        ctx.on("request", keep_request)
         def fresh(old = None):
             # a generated page can exhaust the renderer; every try starts in a new tab
             if old is not None:
