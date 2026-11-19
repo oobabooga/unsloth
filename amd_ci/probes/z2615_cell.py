@@ -47,12 +47,15 @@ try:
                            "arch": str(getattr(torch.cuda.get_device_properties(0), "gcnArchName", ""))}
         res["has_stats"] = hasattr(gcm, "NO_GRAD_CHECKPOINT_STATS")
         dump()
-        model, tok = FastLanguageModel.from_pretrained(a.dir, max_seq_length = 128, dtype = torch.bfloat16,
+        model, tok = FastLanguageModel.from_pretrained(a.dir, max_seq_length = 1024, dtype = torch.bfloat16,
                                                        load_in_4bit = False)
+        # max_seq_length >= 512: below it Unsloth swaps "unsloth" GC for torch's (zoo's shims never installed).
         model = FastLanguageModel.get_peft_model(model, r = 8, lora_alpha = 16, lora_dropout = 0.0, bias = "none",
                                                  target_modules = ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj",
                                                                    "up_proj", "down_proj"],
                                                  use_gradient_checkpointing = "unsloth", random_state = 0)
+        import torch.utils.checkpoint as tuc
+        res["torch_checkpoint_fn"] = f"{getattr(tuc.checkpoint, '__module__', '?')}.{getattr(tuc.checkpoint, '__name__', '?')}"
         res["stage"] = "loaded"
         dump()
         g = torch.Generator().manual_seed(0)
