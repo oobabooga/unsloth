@@ -1,0 +1,160 @@
+name: "A/B: ROCm Triton pairing failure keeps the install manifest"
+
+on:
+  push:
+    branches: [rocm-triton-manifest-ab-ci]
+
+permissions:
+  contents: read
+
+env:
+  BASE_SHA: "91211c70110bd34bee120bb628e35398ad089c06"
+
+jobs:
+  ab:
+    strategy:
+      fail-fast: false
+      matrix:
+        leg: [main, fix]
+    name: "Windows AMD ${{ matrix.leg }}"
+    runs-on: [self-hosted, Windows, strix-halo, devlab-dispatch]
+    timeout-minutes: 200
+    defaults:
+      run:
+        shell: powershell
+    env:
+      LEG: ${{ matrix.leg }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          path: ci
+
+      - name: Host
+        run: |
+          $ErrorActionPreference = "Continue"
+          Write-Host "machine $env:COMPUTERNAME leg $env:LEG"
+          Get-CimInstance Win32_VideoController | ForEach-Object { Write-Host "GPU: $($_.Name) driver $($_.DriverVersion)" }
+          Get-CimInstance Win32_Processor | ForEach-Object { Write-Host "CPU: $($_.Name)" }
+          $work = Join-Path $env:RUNNER_TEMP "tritonab"
+          New-Item -ItemType Directory -Force -Path $work, "$work\out" | Out-Null
+          Add-Content -Path $env:GITHUB_ENV -Value "WORK=$work"
+          Add-Content -Path $env:GITHUB_ENV -Value "UNSLOTH_STUDIO_HOME=$work\studio"
+          Add-Content -Path $env:GITHUB_ENV -Value "SRC=$work\src"
+
+      - name: Source (main at BASE_SHA, fix = main + patch)
+        run: |
+          $ErrorActionPreference = "Continue"
+          git -c core.autocrlf=false clone --quiet --filter=blob:none https://github.com/unslothai/unsloth $env:SRC
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          Push-Location $env:SRC
+          git -c core.autocrlf=false checkout --quiet $env:BASE_SHA
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          if ($env:LEG -eq "fix") {
+            git -c core.autocrlf=false apply --whitespace=nowarn "$env:GITHUB_WORKSPACE\ci\fix.patch"
+            if ($LASTEXITCODE -ne 0) { Write-Host "FATAL: patch did not apply"; exit 1 }
+          }
+          git log -1 --oneline
+          git status --short
+          Pop-Location
+
+      - name: Pairing unit test on Windows PowerShell 5.1 (the branch's test against this leg's setup.ps1)
+        run: |
+          $ErrorActionPreference = "Continue"
+          # Both legs run the fixed test file, so the main leg shows which expectations its setup.ps1 breaks.
+          Push-Location $env:SRC
+          git -c core.autocrlf=false apply --whitespace=nowarn --include=tests/studio/test_rocm_triton_windows_pairing.ps1 "$env:GITHUB_WORKSPACE\ci\fix.patch" 2>$null
+          & powershell -NoProfile -ExecutionPolicy Bypass -File tests\studio\test_rocm_triton_windows_pairing.ps1 *>&1 | Tee-Object -FilePath "$env:WORK\out\unit.log" | Select-String -Pattern "FAIL|check\(s\) failed|All checks passed" | ForEach-Object { Write-Host $_.Line }
+          $rc = $LASTEXITCODE
+          git -c core.autocrlf=false checkout --quiet -- tests/studio/test_rocm_triton_windows_pairing.ps1
+          if ($env:LEG -eq "fix") {
+            git -c core.autocrlf=false apply --whitespace=nowarn --include=tests/studio/test_rocm_triton_windows_pairing.ps1 "$env:GITHUB_WORKSPACE\ci\fix.patch"
+          }
+          Pop-Location
+          Write-Host "unit test exit $rc"
+          Add-Content -Path $env:GITHUB_ENV -Value "UNIT_RC=$rc"
+
+      - name: Trigger - a uv config override keeps triton-windows 3.9 (the pairing install exits 0 but changes nothing)
+        run: |
+          $cfg = Join-Path $env:WORK "uv-override.toml"
+          [System.IO.File]::WriteAllText($cfg, "override-dependencies = [`"triton-windows==3.9.0.post30`"]`n")
+          Get-Content $cfg
+          Add-Content -Path $env:GITHUB_ENV -Value "OVERRIDE_CFG=$cfg"
+
+      - name: 1. install.ps1 --local --python 3.13 with the trigger in place
+        timeout-minutes: 120
+        run: |
+          $ErrorActionPreference = "Continue"
+          $env:UV_CONFIG_FILE = $env:OVERRIDE_CFG
+          $env:UNSLOTH_SKIP_AUTOSTART = "1"
+          Push-Location $env:SRC
+          & powershell -NoProfile -ExecutionPolicy Bypass -File ".\install.ps1" --local --python 3.13 *>&1 |
+            Tee-Object -FilePath "$env:WORK\out\1-install.log" | Select-Object -Last 25 | Out-String | Write-Host
+          $rc = $LASTEXITCODE
+          Pop-Location
+          Write-Host "install.ps1 exit $rc"
+          Add-Content -Path $env:GITHUB_ENV -Value "RC1=$rc"
+
+      - name: Evidence after install
+        run: |
+          $ErrorActionPreference = "Continue"
+          & "$env:GITHUB_WORKSPACE\ci\evidence.ps1" -Phase "1-install" -ExitCode $env:RC1
+
+      - name: 2. Desktop-equivalent repair - `unsloth studio update` (PyPI fast path) with the trigger still in place
+        timeout-minutes: 90
+        run: |
+          $ErrorActionPreference = "Continue"
+          $env:UV_CONFIG_FILE = $env:OVERRIDE_CFG
+          $cli = "$env:UNSLOTH_STUDIO_HOME\unsloth_studio\Scripts\unsloth.exe"
+          $sp = "$env:UNSLOTH_STUDIO_HOME\unsloth_studio\Lib\site-packages\studio\setup.ps1"
+          if (Test-Path -LiteralPath $sp) {
+            $hasFix = [bool](Select-String -LiteralPath $sp -SimpleMatch -Quiet -Pattern "Dropping the manifest here instead")
+            Write-Host "installed setup.ps1 carries the fix: $hasFix"
+          } else { Write-Host "installed setup.ps1 not found at $sp" }
+          & $cli studio update *>&1 | Tee-Object -FilePath "$env:WORK\out\2-update.log" | Select-Object -Last 25 | Out-String | Write-Host
+          $rc = $LASTEXITCODE
+          Write-Host "studio update exit $rc"
+          Add-Content -Path $env:GITHUB_ENV -Value "RC2=$rc"
+
+      - name: Evidence after repair
+        run: |
+          $ErrorActionPreference = "Continue"
+          & "$env:GITHUB_WORKSPACE\ci\evidence.ps1" -Phase "2-update" -ExitCode $env:RC2
+
+      - name: 3. Trigger removed - `unsloth studio update --local` retries the pairing
+        timeout-minutes: 90
+        run: |
+          $ErrorActionPreference = "Continue"
+          Remove-Item Env:UV_CONFIG_FILE -ErrorAction SilentlyContinue
+          $env:STUDIO_LOCAL_REPO = $env:SRC
+          $cli = "$env:UNSLOTH_STUDIO_HOME\unsloth_studio\Scripts\unsloth.exe"
+          Push-Location $env:SRC
+          & $cli studio update --local *>&1 | Tee-Object -FilePath "$env:WORK\out\3-update-local.log" | Select-Object -Last 25 | Out-String | Write-Host
+          $rc = $LASTEXITCODE
+          Pop-Location
+          Write-Host "studio update --local exit $rc"
+          Add-Content -Path $env:GITHUB_ENV -Value "RC3=$rc"
+
+      - name: Evidence after the trigger is removed
+        run: |
+          $ErrorActionPreference = "Continue"
+          & "$env:GITHUB_WORKSPACE\ci\evidence.ps1" -Phase "3-update-local" -ExitCode $env:RC3
+
+      - name: Verdict
+        run: |
+          $ErrorActionPreference = "Continue"
+          $unitExpected = if ($env:LEG -eq "fix") { "0" } else { "nonzero" }
+          $unitMatch = if ($env:LEG -eq "fix") { $env:UNIT_RC -eq "0" } else { $env:UNIT_RC -ne "0" }
+          Add-Content -Path "$env:WORK\out\verdict.txt" -Value "| $env:LEG | unit test (PS 5.1) | exit $env:UNIT_RC | | | | expected $unitExpected | $(if ($unitMatch) { 'MATCH' } else { 'MISMATCH' }) |"
+          Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value "| leg | phase | exit | triton | manifest | capability | expected | result |"
+          Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value "|---|---|---|---|---|---|---|---|"
+          Get-Content "$env:WORK\out\verdict.txt" | ForEach-Object { Write-Host $_ }
+          Get-Content "$env:WORK\out\verdict.txt" | Add-Content -Path $env:GITHUB_STEP_SUMMARY
+          if (Select-String -LiteralPath "$env:WORK\out\verdict.txt" -SimpleMatch -Quiet -Pattern "MISMATCH") { exit 1 }
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tritonab-${{ matrix.leg }}
+          path: ${{ runner.temp }}\tritonab\out
