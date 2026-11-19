@@ -11,16 +11,16 @@ jobs:
   source:
     runs-on: ubuntu-24.04
     steps:
-      - run: curl -fsSL --retry 5 -o "$RUNNER_TEMP/llama.cpp-source-b12233-mix-7c77012.tar.gz" https://github.com/unslothai/llama.cpp/releases/download/b12233-mix-7c77012/llama.cpp-source-b12233-mix-7c77012.tar.gz
+      - run: curl -fsSL --retry 5 -o "$RUNNER_TEMP/llama.cpp-source-b12347-mix-241a0f3.tar.gz" https://github.com/unslothai/llama.cpp/releases/download/b12347-mix-241a0f3/llama.cpp-source-b12347-mix-241a0f3.tar.gz
       - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f  # v6.0.0
         with:
-          name: app-source-b12233-mix-7c77012
-          path: ${{ runner.temp }}/llama.cpp-source-b12233-mix-7c77012.tar.gz
+          name: app-source-b12347-mix-241a0f3
+          path: ${{ runner.temp }}/llama.cpp-source-b12347-mix-241a0f3.tar.gz
           if-no-files-found: error
           retention-days: 1
 
   linux-base:
-    name: linux / fork master actions
+    name: linux / fork master actions (CCCL 3.4.3)
     needs: source
     runs-on: ubuntu-22.04
     timeout-minutes: 90
@@ -28,11 +28,11 @@ jobs:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803  # v6.1.0
         with: { path: tooling, persist-credentials: false }
       - uses: ./tooling/.github/actions/base-linux
-        with: { tag: b12233-mix-7c77012, source_artifact: app-source-b12233-mix-7c77012, cuda: '12.8.0', arch: x64, archs: '70 75 80 86 89', profile: "e9-base-${{ github.run_id }}" }
+        with: { tag: b12347-mix-241a0f3, source_artifact: app-source-b12347-mix-241a0f3, cuda: '12.8.0', arch: x64, archs: '70 75 80 86 89', profile: "e9-base-${{ github.run_id }}" }
       - run: bash tooling/e9/experiment.sh
 
   linux-fixed:
-    name: linux / this branch's actions
+    name: linux / merged #363 actions
     needs: source
     runs-on: ubuntu-22.04
     timeout-minutes: 90
@@ -40,11 +40,11 @@ jobs:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803  # v6.1.0
         with: { path: tooling, persist-credentials: false }
       - uses: ./tooling/.github/actions/fixed-linux
-        with: { tag: b12233-mix-7c77012, source_artifact: app-source-b12233-mix-7c77012, cuda: '12.8.0', arch: x64, archs: '70 75 80 86 89', profile: "e9-fixed-${{ github.run_id }}" }
+        with: { tag: b12347-mix-241a0f3, source_artifact: app-source-b12347-mix-241a0f3, cuda: '12.8.0', arch: x64, archs: '70 75 80 86 89', profile: "e9-fixed-${{ github.run_id }}" }
       - run: bash tooling/e9/experiment.sh
 
   windows-base:
-    name: windows / fork master actions
+    name: windows / fork master actions (CCCL 3.4.3)
     needs: source
     runs-on: windows-2022
     timeout-minutes: 120
@@ -52,12 +52,12 @@ jobs:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803  # v6.1.0
         with: { path: tooling, persist-credentials: false }
       - uses: ./tooling/.github/actions/base-windows
-        with: { tag: b12233-mix-7c77012, source_artifact: app-source-b12233-mix-7c77012, cuda: '12.8.0', archs: '70 75 80 86 89', profile: "e9-base-${{ github.run_id }}" }
+        with: { tag: b12347-mix-241a0f3, source_artifact: app-source-b12347-mix-241a0f3, cuda: '12.8.0', archs: '70 75 80 86 89', profile: "e9-base-${{ github.run_id }}" }
       - shell: bash
         run: bash tooling/e9/experiment.sh
 
   windows-fixed:
-    name: windows / this branch's actions
+    name: windows / merged #363 actions
     needs: source
     runs-on: windows-2022
     timeout-minutes: 120
@@ -65,6 +65,6 @@ jobs:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803  # v6.1.0
         with: { path: tooling, persist-credentials: false }
       - uses: ./tooling/.github/actions/fixed-windows
-        with: { tag: b12233-mix-7c77012, source_artifact: app-source-b12233-mix-7c77012, cuda: '12.8.0', archs: '70 75 80 86 89', profile: "e9-fixed-${{ github.run_id }}" }
+        with: { tag: b12347-mix-241a0f3, source_artifact: app-source-b12347-mix-241a0f3, cuda: '12.8.0', archs: '70 75 80 86 89', profile: "e9-fixed-${{ github.run_id }}" }
       - shell: bash
         run: bash tooling/e9/experiment.sh
