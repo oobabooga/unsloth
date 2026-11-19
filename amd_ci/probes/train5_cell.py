@@ -45,6 +45,8 @@ MODELS = {
     "dora16": "built:llama (DoRA r16 all 7 projections, bf16, GA 2)",
     "dora16_off": "built:llama (as dora16, UNSLOTH_DORA_FACTORED_NORM=0)",
     "dora4": "built:llama (DoRA r16 all 7 projections, bitsandbytes NF4, GA 2)",
+    "dora16_g64": "built:llama (as dora16, kill switch on, row norm in fp64 from the factors: gold trajectory)",
+    "dora4_g64": "built:llama (as dora4, kill switch on, row norm in fp64 from the factors: gold trajectory)",
     "ls_qwen3": "trl-internal-testing/tiny-Qwen3ForCausalLM (SFT label_smoothing_factor 0.1, GA 2)",
     "ls_qwen3_off": "trl-internal-testing/tiny-Qwen3ForCausalLM (as ls_qwen3, UNSLOTH_FUSED_LABEL_SMOOTHING=0)",
     "pk_qwen3": "trl-internal-testing/tiny-Qwen3ForCausalLM (SFT packing=True, GA 4, loss-only eval steps)",
@@ -4690,6 +4692,29 @@ def cell_dora(four_bit):
         res["dora_kernel_file"] = f"absent ({type(e).__name__})"
     calls = [0]
     inner = cls.forward
+    if args.cell.endswith("_g64"):
+        # Gold arm (identical code at both states): PEFT's forward with the row norm of W + s * B @ A computed in fp64
+        # from the factors, then cast to the activation dtype. The best any bf16 path can do; base and head trajectories
+        # are both judged by their distance to it.
+        import torch.nn.functional as F
+
+        def gold(self, x, *, lora_A, lora_B, scaling, base_layer, base_result = None, **kw):
+            weight = peft_dora.dequantize_module_weight(base_layer).to(x.dtype)
+            W = peft_dora.transpose(weight, self.fan_in_fan_out)
+            with torch.no_grad():
+                wn = torch.linalg.vector_norm(W.double() + scaling * (lora_B.weight.double() @ lora_A.weight.double()),
+                                              dim = 1).to(x.dtype)
+            mag = (self.weight / wn).view(1, -1)
+            lora_result = lora_B(lora_A(x))
+            if base_result is not None:
+                bias = base_layer.bias
+                if bias is not None:
+                    base_result = base_result - bias
+            else:
+                base_result = F.linear(x, W)
+            return (mag - 1) * base_result + mag * lora_result * scaling
+        inner = gold
+        res["dora_gold_fp64"] = True
 
     def counted(self, *a, **k):
         calls[0] += 1
@@ -4867,7 +4892,7 @@ def cell_fx(dtype):
     res["decreasing"] = None
 
 
-CELLS = {"dora16": lambda: cell_dora(False), "dora16_off": lambda: cell_dora(False), "dora4": lambda: cell_dora(True), "fx32": lambda: cell_fx("float32"), "fx16": lambda: cell_fx("bfloat16"), "cg_forced8": lambda: cell_cg(True, True), "cg_auto8": lambda: cell_cg(False, True), "cg_forced": lambda: cell_cg(True), "cg_auto": lambda: cell_cg(False), "ls_qwen3": cell_ls, "ls_qwen3_off": cell_ls, "pk_qwen3": lambda: cell_pk("pack"), "pk_qwen3_ef1": lambda: cell_pk("pack"), "pf_qwen3": lambda: cell_pk("pfree"), "mgsa_llama": lambda: cell_mg("mgsa_llama"), "mgsa_qwen3": lambda: cell_mg("mgsa_qwen3"), "mgsa_llama_sa0": lambda: cell_mg("mgsa_llama"), "mgpin_llama": lambda: cell_mg("mgpin_llama"), "mgpin_llama_px0": lambda: cell_mg("mgpin_llama"),
+CELLS = {"dora16": lambda: cell_dora(False), "dora16_off": lambda: cell_dora(False), "dora4": lambda: cell_dora(True), "dora16_g64": lambda: cell_dora(False), "dora4_g64": lambda: cell_dora(True), "fx32": lambda: cell_fx("float32"), "fx16": lambda: cell_fx("bfloat16"), "cg_forced8": lambda: cell_cg(True, True), "cg_auto8": lambda: cell_cg(False, True), "cg_forced": lambda: cell_cg(True), "cg_auto": lambda: cell_cg(False), "ls_qwen3": cell_ls, "ls_qwen3_off": cell_ls, "pk_qwen3": lambda: cell_pk("pack"), "pk_qwen3_ef1": lambda: cell_pk("pack"), "pf_qwen3": lambda: cell_pk("pfree"), "mgsa_llama": lambda: cell_mg("mgsa_llama"), "mgsa_qwen3": lambda: cell_mg("mgsa_qwen3"), "mgsa_llama_sa0": lambda: cell_mg("mgsa_llama"), "mgpin_llama": lambda: cell_mg("mgpin_llama"), "mgpin_llama_px0": lambda: cell_mg("mgpin_llama"),
          "hd512_llama": lambda: cell_hd512("llama"), "hd512_gemma4": lambda: cell_hd512("gemma4"),
          "hd512_gemma4_nc": lambda: cell_hd512("gemma4"),
          "bclens": cell_bclens, "bswap": cell_bswap,
@@ -4905,7 +4930,7 @@ CELLS = {"dora16": lambda: cell_dora(False), "dora16_off": lambda: cell_dora(Fal
 def main():
     if args.cell == "moe":
         os.environ["UNSLOTH_MOE_BACKEND"] = "grouped_mm"
-    if args.cell == "dora16_off":
+    if args.cell == "dora16_off" or args.cell.endswith("_g64"):
         os.environ["UNSLOTH_DORA_FACTORED_NORM"] = "0"  # unsloth #18515 kill switch (read at import)
     if args.cell == "ls_qwen3_off":
         os.environ["UNSLOTH_FUSED_LABEL_SMOOTHING"] = "0"  # unsloth #18495 kill switch
