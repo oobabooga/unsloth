@@ -122,15 +122,15 @@ for mid in MODELS:
             pull(mid)
             rec["download_s"] = round(time.time() - t)
         t = time.time()
-        code, resp = raw("POST", "/api/inference/load", {"model_path": mid, "max_seq_length": 8192}, TOKEN, timeout = 1500)
+        code, resp = raw("POST", "/api/inference/load", {"model_path": "lemonade:" + mid, "max_seq_length": 8192}, TOKEN, timeout = 1500)
         rec["load_s"], rec["load_http"] = round(time.time() - t, 1), code
         if code != 200:
             rec["error"] = json.dumps(resp)[:300]
             log(mid, "load failed", rec["error"])
             continue
-        rec["warmup"] = chat(mid, "Say hi in five words.", 32)
-        rec["short"] = [chat(mid, SHORT, 400) for _ in range(RUNS)]
-        rec["long"] = [chat(mid, LONG, 64) for _ in range(2)]
+        rec["warmup"] = chat("lemonade:" + mid, "Say hi in five words.", 32)
+        rec["short"] = [chat("lemonade:" + mid, SHORT, 400) for _ in range(RUNS)]
+        rec["long"] = [chat("lemonade:" + mid, LONG, 64) for _ in range(2)]
         ok = [x["decode_tok_s"] for x in rec["short"] if x.get("decode_tok_s")]
         rec["decode_tok_s_median"] = sorted(ok)[len(ok) // 2] if ok else None
         rec["ttft_short_s"] = sorted(x["ttft_s"] for x in rec["short"] if x.get("ttft_s"))[len(rec["short"]) // 2] if ok else None
@@ -143,7 +143,7 @@ for mid in MODELS:
         rec["error"] = repr(exc)[:300]
         log(mid, "failed", rec["error"])
     finally:
-        raw("POST", "/api/inference/unload", {"model_path": mid}, TOKEN, timeout = 300)
+        raw("POST", "/api/inference/unload", {"model_path": "lemonade:" + mid}, TOKEN, timeout = 300)
         (OUT / "bench.json").write_text(json.dumps(results, indent = 2))
 
 log("done")
