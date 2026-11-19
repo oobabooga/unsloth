@@ -1,0 +1,548 @@
+diff --git a/tests/utils/test_rocm_sdpa_check.py b/tests/utils/test_rocm_sdpa_check.py
+new file mode 100644
+index 0000000000..31adc99565
+--- /dev/null
++++ b/tests/utils/test_rocm_sdpa_check.py
+@@ -0,0 +1,233 @@
++# SPDX-License-Identifier: AGPL-3.0-only
++# Copyright 2026-present the Unsloth AI Inc. team. All rights reserved.
++"""ROCm: AOTriton SDPA kernels that fail Unsloth's self-check on a GPU stay out of its attention (#18403)."""
++
++import importlib
++import sys
++import types
++
++import pytest
++import torch
++import torch.nn.functional as F
++
++ad = pytest.importorskip("unsloth.utils.attention_dispatch")
++_CHECK = "unsloth.utils.rocm_sdpa_check"
++try:
++    check = importlib.import_module(_CHECK)
++except ImportError:  # a tree without the check: the routing tests must fail there, not skip
++    check = None
++needs_check = pytest.mark.skipif(check is None, reason = "tree has no rocm_sdpa_check")
++
++
++class _CudaLooking(torch.Tensor):
++    @property
++    def is_cuda(self):
++        return True
++
++
++def _flags():
++    cuda = torch.backends.cuda
++    return (cuda.flash_sdp_enabled(), cuda.mem_efficient_sdp_enabled(), cuda.math_sdp_enabled())
++
++
++@pytest.fixture
++def rocm(monkeypatch):
++    """A ROCm build whose device 0 verdict the test sets; every SDPA call records the enabled kernels."""
++    monkeypatch.setattr(torch.version, "hip", "7.0.0")
++    monkeypatch.setattr(ad, "_ROCM_SDPA_GUARD", True, raising = False)
++    verdict = {"flash": True, "efficient": True, "arch": "gfx1200", "source": "check", "detail": ""}
++    module = check if check is not None else types.ModuleType(_CHECK)
++    monkeypatch.setitem(sys.modules, _CHECK, module)
++    monkeypatch.setattr(module, "rocm_sdpa_verdict", lambda index = 0: verdict, raising = False)
++    seen = []
++
++    def fake_sdpa(q, k, v, *args, **kwargs):
++        seen.append(_flags())
++        return torch.zeros_like(q)
++
++    monkeypatch.setattr(F, "scaled_dot_product_attention", fake_sdpa)
++    ad._sdpa_gqa_choices.cache_clear()
++    yield verdict, seen
++    ad._sdpa_gqa_choices.cache_clear()
++
++
++def _context(
++    seq_info = None,
++    attention_mask = None,
++    q_len = 12,
++):
++    return ad.AttentionContext(
++        bsz = 1,
++        q_len = q_len,
++        kv_seq_len = q_len,
++        n_heads = 4,
++        head_dim = 8,
++        requires_grad = True,
++        seq_info = seq_info,
++        attention_mask = attention_mask,
++        causal_mask = None,
++        training = True,
++    )
++
++
++def _qkv(q_len = 12):
++    Q = torch.randn(1, 4, q_len, 8).as_subclass(_CudaLooking)
++    K = torch.randn(1, 2, q_len, 8).as_subclass(_CudaLooking)
++    return Q, K, K.clone()
++
++
++def _packed(seen):
++    Q, K, V = _qkv()
++    config = ad.AttentionConfig(backend = ad.SDPA, n_kv_heads = 2, n_groups = 2)
++    seq_info = (
++        torch.tensor([7, 5], dtype = torch.int32),
++        torch.tensor([0, 7, 12], dtype = torch.int32),
++        7,
++    )
++    ad.run_attention(config = config, context = _context(seq_info = seq_info), Q = Q, K = K, V = V)
++    return seen
++
++
++@pytest.mark.parametrize(
++    "flash, efficient, expect",
++    [
++        (False, False, (False, False, True)),
++        (False, True, (False, True, True)),
++        (True, False, (True, False, True)),
++    ],
++)
++def test_packed_segments_skip_refused_kernels(rocm, monkeypatch, flash, efficient, expect):
++    monkeypatch.setattr(ad, "_SDPA_PACKED_SEGMENTS", True)
++    verdict, seen = rocm
++    verdict.update(flash = flash, efficient = efficient)
++    before = _flags()
++    _packed(seen)
++    assert seen and all(flags == expect for flags in seen), seen
++    assert _flags() == before
++
++
++def test_dense_masked_call_skips_refused_kernels(rocm):
++    verdict, seen = rocm
++    verdict.update(flash = False, efficient = False)
++    Q, K, V = _qkv()
++    mask = torch.ones(1, 12, dtype = torch.bool)
++    config = ad.AttentionConfig(backend = ad.SDPA, n_kv_heads = 2, n_groups = 2)
++    ad.run_attention(config = config, context = _context(attention_mask = mask), Q = Q, K = K, V = V)
++    assert seen == [(False, False, True)]
++
++
++def test_decode_call_skips_refused_kernels(rocm):
++    verdict, seen = rocm
++    verdict.update(efficient = False)
++    Q, K, V = _qkv(1)
++    ad.decode_scaled_dot_product_attention(Q, K, V, enable_gqa = True)
++    assert seen == [(True, False, True)]
++
++
++def test_gqa_probe_sees_the_narrowed_kernels(rocm, monkeypatch):
++    """enable_gqa vs expanded K/V is decided under the kernels the call will run with."""
++    verdict, _ = rocm
++    verdict.update(flash = False, efficient = False)
++    probed = []
++
++    def choice(*args, **kwargs):
++        probed.append(_flags())
++        return 0  # MATH
++
++    monkeypatch.setattr(torch, "_fused_sdp_choice", choice)
++    Q, K, V = _qkv()
++    assert ad._sdpa_takes_gqa(Q, K, True, False, V)
++    assert probed and all(flags == (False, False, True) for flags in probed)
++
++
++def test_passing_device_and_cuda_builds_are_untouched(rocm, monkeypatch):
++    verdict, seen = rocm
++    before = _flags()
++    Q, K, V = _qkv()
++    ad.scaled_dot_product_attention(Q, K, V, is_causal = True)
++    assert seen == [before]
++    # CUDA build: the verdict is never asked.
++    monkeypatch.setattr(ad, "_ROCM_SDPA_GUARD", False)
++    monkeypatch.setattr(
++        sys.modules[_CHECK], "rocm_sdpa_verdict", lambda index = 0: pytest.fail("asked on CUDA")
++    )
++    ad.scaled_dot_product_attention(Q, K, V, is_causal = True)
++    assert seen[-1] == before
++
++
++def test_caller_policy_of_only_refused_kernels_is_kept(rocm):
++    from torch.nn.attention import SDPBackend, sdpa_kernel
++
++    verdict, seen = rocm
++    verdict.update(flash = False)
++    Q, K, V = _qkv()
++    with sdpa_kernel([SDPBackend.FLASH_ATTENTION]):
++        ad.scaled_dot_product_attention(Q, K, V, is_causal = True)
++    assert seen == [(True, False, False)]
++
++
++@pytest.fixture
++def fresh_verdicts(monkeypatch):
++    if check is None:
++        pytest.skip("tree has no rocm_sdpa_check")
++    monkeypatch.setattr(check, "_VERDICTS", {})
++    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
++    monkeypatch.delenv(check.ROCM_SDPA_CHECK_ENV, raising = False)
++
++
++def _no_children(index):
++    pytest.fail("the check ran")
++
++
++@needs_check
++def test_verdict_cuda_build(fresh_verdicts, monkeypatch):
++    monkeypatch.setattr(torch.version, "hip", None)
++    monkeypatch.setattr(check, "_run_children", _no_children)
++    v = check.rocm_sdpa_verdict(0)
++    assert (v["flash"], v["efficient"], v["source"]) == (True, True, "not_rocm")
++
++
++@needs_check
++@pytest.mark.parametrize("arch, env, source", [("gfx942", None, "cdna"), ("gfx1200", "0", "env")])
++def test_verdict_trusted_without_a_check(fresh_verdicts, monkeypatch, arch, env, source):
++    monkeypatch.setattr(torch.version, "hip", "7.0.0")
++    monkeypatch.setattr(check, "_arch", lambda index: arch)
++    monkeypatch.setattr(check, "_run_children", _no_children)
++    if env is not None:
++        monkeypatch.setenv(check.ROCM_SDPA_CHECK_ENV, env)
++    v = check.rocm_sdpa_verdict(0)
++    assert (v["flash"], v["efficient"], v["source"]) == (True, True, source)
++
++
++@needs_check
++def test_verdict_refuses_failed_backends_once(fresh_verdicts, monkeypatch, capsys):
++    monkeypatch.setattr(torch.version, "hip", "7.0.0")
++    monkeypatch.setattr(check, "_arch", lambda index: "gfx1200")
++    calls = []
++
++    def children(index):
++        calls.append(index)
++        return {
++            "flash": (False, "segments float16 hd128: hipErrorInvalidValue"),
++            "efficient": (None, "no start"),
++        }
++
++    monkeypatch.setattr(check, "_run_children", children)
++    v = check.rocm_sdpa_verdict(0)
++    # A check that could not start says nothing about the kernel.
++    assert (v["flash"], v["efficient"], v["source"]) == (False, True, "check")
++    assert "flash attention failed a self-check" in capsys.readouterr().out
++    assert check.rocm_sdpa_verdict(0) is v and calls == [0]
++
++
++@needs_check
++def test_child_script_compiles():
++    compile(check._CHILD, "rocm_sdpa_check_child", "exec")
++
++
++@needs_check
++@pytest.mark.skipif(not torch.cuda.is_available(), reason = "needs a GPU")
++def test_child_passes_on_a_working_gpu():
++    """The child's shapes, reference and tolerance accept kernels that are correct."""
++    results = check._run_children(0)
++    assert all(ok for ok, _ in results.values()), results
+diff --git a/unsloth/utils/attention_dispatch.py b/unsloth/utils/attention_dispatch.py
+index bcf69b0ab5..16a2e40893 100644
+--- a/unsloth/utils/attention_dispatch.py
++++ b/unsloth/utils/attention_dispatch.py
+@@ -30,6 +30,7 @@ from ..device_type import DEVICE_TYPE
+ from ..models._utils import *
+ from ..context_parallel import get_cp_manager
+ from .ulysses import ulysses_attention
++from .rocm_sdpa_check import rocm_sdpa_verdict  # noqa: F401  (re-exported)
+ from ..utils.packing import (
+     PACKED_BLOCK_KWARG,
+     PackedVarlen,
+@@ -109,9 +110,18 @@ _XFORMERS_FP32_UNSUPPORTED = (
+ 
+ def scaled_dot_product_attention(*args, **kwargs):
+     # Resolved per call: context_parallel monkey patches torch.nn.functional.
++    if _ROCM_SDPA_GUARD and args and isinstance(args[0], Tensor) and args[0].is_cuda:
++        backends = _CUDNN_FREE_BACKENDS[_rocm_sdpa_index(args[0].device.index)]
++        if backends is not None:
++            with _sdpa_kernel(backends):
++                return F.scaled_dot_product_attention(*args, **kwargs)
+     return F.scaled_dot_product_attention(*args, **kwargs)
+ 
+ 
++# ROCm: AOTriton kernels that failed rocm_sdpa_check on a device are kept out of every SDPA call here.
++_ROCM_SDPA_GUARD = torch.version.hip is not None
++
++
+ def _avoids_cudnn(Q, training):
+     """Training calls on SM100 run without cuDNN attention (_training_sdpa); probes must match."""
+     return bool(training) and Q.is_cuda and Q.device.index in _NO_CUDNN_TRAINING
+@@ -413,6 +423,8 @@ def _decode_picks_cudnn(query, key, attn_mask, enable_gqa):
+ 
+ def decode_scaled_dot_product_attention(query, key, value, *args, **kwargs):
+     """Decode SDPA, kept off cuDNN where torch would pick it on _NO_CUDNN_DECODE devices."""
++    if _ROCM_SDPA_GUARD and query.is_cuda:
++        return scaled_dot_product_attention(query, key, value, *args, **kwargs)
+     if (
+         _CUDNN_CHOICE is not None
+         and query.is_cuda
+@@ -798,6 +810,30 @@ _sdpa_masked_choice = _constant_probe(_sdpa_masked_choice)
+ _cudnn_free_index = _constant_probe(_cudnn_free_index)
+ 
+ 
++def _rocm_sdpa_index_now(device_index) -> int:
++    """_CUDNN_FREE_BACKENDS index of the enabled SDPA backends minus AOTriton kernels that failed
++    rocm_sdpa_check on this device; 0 when nothing is refused or only refused ones are enabled."""
++    if not _ROCM_SDPA_GUARD:
++        return 0
++    from .rocm_sdpa_check import rocm_sdpa_verdict
++
++    verdict = rocm_sdpa_verdict(device_index)
++    if verdict["flash"] and verdict["efficient"]:
++        return 0
++    cuda = torch.backends.cuda
++    enabled = (
++        (1 if cuda.flash_sdp_enabled() else 0)
++        | (2 if cuda.mem_efficient_sdp_enabled() else 0)
++        | (4 if cuda.math_sdp_enabled() else 0)
++    )
++    allowed = enabled & ~((0 if verdict["flash"] else 1) | (0 if verdict["efficient"] else 2))
++    # A caller that enabled only refused kernels (sdpa_kernel([FLASH])) keeps its own policy.
++    return 0 if allowed in (0, enabled) else allowed
++
++
++_rocm_sdpa_index = _constant_probe(_rocm_sdpa_index_now)
++
++
+ @functools.lru_cache(maxsize = 128)
+ def _sdpa_gqa_choices(
+     device,
+@@ -911,6 +947,11 @@ def _sdpa_gqa_state(*args, no_cudnn = False):
+     """_sdpa_gqa_state_now; no_cudnn probes under the kernels the call runs with (_training_sdpa,
+     _rerouted_sdpa), whose enabled flags are part of the probe's cache key."""
+     backends = _CUDNN_FREE_BACKENDS[_cudnn_free_index()] if no_cudnn else None
++    if _ROCM_SDPA_GUARD:
++        # The call runs under the same narrowed backends (scaled_dot_product_attention).
++        rocm = _rocm_sdpa_index_now(torch.device(args[0]).index)
++        if rocm:
++            backends = _CUDNN_FREE_BACKENDS[rocm]
+     if backends is not None:
+         with _sdpa_kernel(backends):
+             return _sdpa_gqa_state_now(*args)
+diff --git a/unsloth/utils/rocm_sdpa_check.py b/unsloth/utils/rocm_sdpa_check.py
+new file mode 100644
+index 0000000000..6624aaebe5
+--- /dev/null
++++ b/unsloth/utils/rocm_sdpa_check.py
+@@ -0,0 +1,220 @@
++# SPDX-License-Identifier: AGPL-3.0-only
++# Copyright 2026-present the Unsloth AI Inc. team. All rights reserved.
++
++"""ROCm: whether AOTriton's flash / memory-efficient SDPA kernels compute the right answer on this GPU.
++
++Unsloth sets TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL=1 on import, so on archs AOTriton only lists as
++experimental (RDNA: gfx11xx, gfx12xx) torch offers those kernels to every SDPA call. On some of them
++(gfx1200 RX 9060 XT, #18403) they fail with hipErrorInvalidValue or corrupt memory, and the fault
++then surfaces in an unrelated kernel as an illegal memory access. A fault poisons the HIP context,
++so the check runs in a child process: the GQA shapes Unsloth's attention sends (per-segment strided
++views, expanded K/V, a boolean block mask), forward and backward, against an fp32 reference.
++A backend that errors, faults, hangs or disagrees is not used by Unsloth's attention on that GPU.
++CDNA (gfx9xx) is AOTriton's release target and is trusted. UNSLOTH_ROCM_SDPA_CHECK=0 skips the check.
++"""
++
++from __future__ import annotations
++
++import json
++import os
++import subprocess
++import sys
++import tempfile
++
++import torch
++
++__all__ = ["rocm_sdpa_verdict", "ROCM_SDPA_CHECK_ENV"]
++
++ROCM_SDPA_CHECK_ENV = "UNSLOTH_ROCM_SDPA_CHECK"
++_CHECK_TIMEOUT_S = 240
++_VERDICTS = {}
++
++# Runs in a fresh interpreter: argv = device index, backend ("flash" | "efficient").
++_CHILD = r"""
++import json, sys
++import torch
++import torch.nn.functional as F
++from torch.nn.attention import SDPBackend, sdpa_kernel
++
++index, name = int(sys.argv[1]), sys.argv[2]
++backend = {"flash": SDPBackend.FLASH_ATTENTION, "efficient": SDPBackend.EFFICIENT_ATTENTION}[name]
++torch.cuda.set_device(index)
++device = torch.device("cuda", index)
++lengths = (517, 203, 37)
++total = sum(lengths)
++heads, kv_heads = 8, 2
++groups = heads // kv_heads
++dtypes = [torch.float16] + ([torch.bfloat16] if torch.cuda.is_bf16_supported() else [])
++gen = torch.Generator().manual_seed(0)
++
++
++def reference(q, k, v, keep):
++    scores = (q @ k.transpose(-1, -2)) * q.shape[-1] ** -0.5
++    return scores.masked_fill(~keep, float("-inf")).softmax(-1) @ v
++
++
++def block_mask():
++    seg = torch.cat([torch.full((n,), i) for i, n in enumerate(lengths)]).to(device)
++    pos = torch.arange(total, device = device)
++    return (seg[:, None] == seg[None, :]) & (pos[None, :] <= pos[:, None])
++
++
++def segments(x):
++    out, start = [], 0
++    for n in lengths:
++        out.append(x[0, :, start:start + n].unflatten(1, (1, n)).transpose(0, 1))
++        start += n
++    return out
++
++
++def run(case, dtype, head_dim):
++    # (1, T, H, D) transposed, as the attention layers hand Q / K / V over.
++    q, k, v = (
++        torch.randn(1, total, h, head_dim, generator = gen).to(device, dtype).transpose(1, 2).requires_grad_()
++        for h in (heads, kv_heads, kv_heads)
++    )
++    grad = torch.randn(1, heads, total, head_dim, generator = gen).to(device, dtype)
++    keep = block_mask()
++    ref_in = [x.detach().float().requires_grad_() for x in (q, k, v)]
++    rq, rk, rv = ref_in[0], ref_in[1].repeat_interleave(groups, 1), ref_in[2].repeat_interleave(groups, 1)
++    ref = reference(rq, rk, rv, keep)
++    wants = (ref, *torch.autograd.grad(ref, ref_in, grad.float()))
++    with sdpa_kernel([backend]):
++        if case == "masked":
++            ke, ve = (x.repeat_interleave(groups, 1).contiguous() for x in (k, v))
++            out = F.scaled_dot_product_attention(q.contiguous(), ke, ve, attn_mask = keep[None, None])
++        else:
++            gqa = case == "segments_gqa"
++            ke, ve = (k, v) if gqa else (x.repeat_interleave(groups, 1) for x in (k, v))
++            kw = {"enable_gqa": True} if gqa else {}
++            outs = [
++                F.scaled_dot_product_attention(qs, ks, vs, is_causal = True, **kw)
++                for qs, ks, vs in zip(segments(q), segments(ke), segments(ve))
++            ]
++            out = torch.cat([o.transpose(0, 1).flatten(1, 2) for o in outs], dim = 1).unsqueeze(0)
++        gots = (out, *torch.autograd.grad(out, (q, k, v), grad))
++    torch.cuda.synchronize(device)
++    worst = 0.0
++    for got, want in zip(gots, wants):
++        if not torch.isfinite(got).all():
++            return False, "non-finite"
++        error = (got.float() - want).abs().max().item()
++        bound = 0.02 * want.abs().max().item() + 1e-3
++        worst = max(worst, error / bound)
++    return worst <= 1.0, "worst error / bound %.3g" % worst
++
++
++ok, details, ran = True, [], 0
++cases = ("segments", "segments_gqa") if name == "flash" else ("segments", "masked")
++for dtype in dtypes:
++    for head_dim in (64, 128):
++        for case in cases:
++            label = "%s %s hd%d" % (case, str(dtype).replace("torch.", ""), head_dim)
++            try:
++                passed, why = run(case, dtype, head_dim)
++            except RuntimeError as error:
++                if "No available kernel" in str(error):
++                    continue  # torch does not offer this backend here, so no call can reach it
++                passed, why = False, str(error).strip().splitlines()[0][:200]
++            ran += 1
++            if not passed:
++                ok = False
++                details.append("%s: %s" % (label, why))
++print("UNSLOTH_ROCM_SDPA_CHECK " + json.dumps({"backend": name, "ok": ok, "ran": ran, "detail": details[:4]}), flush = True)
++"""
++
++
++def _arch(index):
++    try:
++        name = str(getattr(torch.cuda.get_device_properties(index), "gcnArchName", ""))
++    except Exception:
++        return ""
++    return name.split(":", 1)[0].strip().lower()
++
++
++def _env_skips_check():
++    return os.environ.get(ROCM_SDPA_CHECK_ENV, "1").strip().lower() in ("0", "false", "no", "off")
++
++
++def _run_children(index):
++    """{backend: (ok, detail)} from one child per backend, run side by side."""
++    env = dict(os.environ)
++    # Launch failures raise at the failing kernel instead of surfacing later as an illegal access.
++    env["AMD_SERIALIZE_KERNEL"] = "3"
++    env.setdefault("TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL", "1")
++    flags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if sys.platform == "win32" else 0
++    children = {}
++    for backend in ("flash", "efficient"):
++        try:
++            children[backend] = subprocess.Popen(
++                [sys.executable, "-c", _CHILD, str(index), backend],
++                stdout = subprocess.PIPE,
++                stderr = subprocess.PIPE,
++                stdin = subprocess.DEVNULL,
++                cwd = tempfile.gettempdir(),
++                env = env,
++                text = True,
++                encoding = "utf-8",
++                errors = "replace",
++                creationflags = flags,
++            )
++        except Exception as error:
++            children[backend] = error
++    results = {}
++    for backend, child in children.items():
++        if isinstance(child, Exception):
++            results[backend] = (None, f"could not start the check: {child!r}")
++            continue
++        try:
++            stdout, stderr = child.communicate(timeout = _CHECK_TIMEOUT_S)
++        except subprocess.TimeoutExpired:
++            child.kill()
++            child.communicate()
++            results[backend] = (False, f"timed out after {_CHECK_TIMEOUT_S}s")
++            continue
++        line = next(
++            (l for l in stdout.splitlines() if l.startswith("UNSLOTH_ROCM_SDPA_CHECK ")),
++            None,
++        )
++        if line is None:
++            tail = (stderr or stdout).strip().splitlines()[-1:] or [""]
++            results[backend] = (False, f"exit code {child.returncode}: {tail[0][:200]}")
++            continue
++        report = json.loads(line.split(" ", 1)[1])
++        detail = "; ".join(report.get("detail") or []) or f"{report.get('ran', 0)} cases passed"
++        results[backend] = (bool(report.get("ok")), detail)
++    return results
++
++
++def rocm_sdpa_verdict(device_index = 0) -> dict:
++    """{"flash", "efficient": usable, "arch", "source", "detail"} for this device, computed once.
++    source: "not_rocm" (both usable), "env" (check skipped), "cdna" (trusted), "check" (child result)."""
++    index = 0 if device_index is None else int(device_index)
++    verdict = _VERDICTS.get(index)
++    if verdict is not None:
++        return verdict
++    verdict = {"flash": True, "efficient": True, "arch": "", "source": "not_rocm", "detail": ""}
++    if torch.version.hip is not None and torch.cuda.is_available():
++        verdict["arch"] = arch = _arch(index)
++        if _env_skips_check():
++            verdict["source"] = "env"
++        elif arch.startswith("gfx9"):
++            verdict["source"] = "cdna"
++        else:
++            verdict["source"] = "check"
++            results = _run_children(index)
++            details = []
++            for backend, (ok, detail) in results.items():
++                # A check that could not start says nothing about the kernel: keep torch's choice.
++                verdict[backend] = ok is not False
++                details.append(f"{backend}: {detail}")
++            verdict["detail"] = " | ".join(details)
++            refused = [b for b in ("flash", "efficient") if not verdict[b]]
++            if refused:
++                print(
++                    f"Unsloth: ROCm {arch or 'GPU'} {index}: AOTriton "
++                    f"{' and '.join(refused)} attention failed a self-check, so Unsloth's attention "
++                    f"will not use it ({verdict['detail']}). {ROCM_SDPA_CHECK_ENV}=0 skips the check."
++                )
++    _VERDICTS[index] = verdict
++    return verdict
