@@ -59,14 +59,37 @@ try:
         ids = torch.randint(10, len(tok) - 1, (2, 48), generator = g).cuda()
         model.train()
         before = dict(getattr(gcm, "NO_GRAD_CHECKPOINT_STATS", {}) or {})
-        with torch.no_grad():
-            out = model(input_ids = ids, attention_mask = torch.ones_like(ids))
+        # Count the checkpoint autograd Functions' forwards during the no-grad pass: base routes there, head must not.
+        fn_calls = {}
+        originals = []
+        for cname in ("UnslothCheckpointFunction", "Unsloth_Gradient_Checkpointer", "Unsloth_Offloaded_Gradient_Checkpointer"):
+            cls = getattr(gcm, cname, None)
+            if cls is None or "forward" not in cls.__dict__:
+                continue
+            orig = cls.__dict__["forward"]
+            fwd = orig.__func__ if isinstance(orig, staticmethod) else orig
+
+            def make(f, n):
+                def counted(*args, **kw):
+                    fn_calls[n] = fn_calls.get(n, 0) + 1
+                    return f(*args, **kw)
+                return staticmethod(counted)
+            setattr(cls, "forward", make(fwd, cname))
+            originals.append((cls, orig))
+        try:
+            with torch.no_grad():
+                # use_cache=False: Unsloth's fast forward only checkpoints layers when the cache is off (as in
+                # GRPO / DPO reference log-prob passes).
+                out = model(input_ids = ids, attention_mask = torch.ones_like(ids), use_cache = False)
+        finally:
+            for cls, orig in originals:
+                setattr(cls, "forward", orig)
         torch.cuda.synchronize()
         lg = out.logits.float()
         res["nograd"] = {"finite": bool(torch.isfinite(lg).all()), "sum": float(lg.sum()), "abs_sum": float(lg.abs().sum()),
                          "first": [float(x) for x in lg[0, 0, :4]],
                          "stats_before": before, "stats_after": dict(getattr(gcm, "NO_GRAD_CHECKPOINT_STATS", {}) or {}),
-                         "training_flag": bool(model.training)}
+                         "training_flag": bool(model.training), "checkpoint_function_forwards": fn_calls}
         res["stage"] = "nograd_done"
         dump()
         from datasets import Dataset

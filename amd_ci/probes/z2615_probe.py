@@ -71,6 +71,16 @@ else:
         save()
         sys.exit(0)
     python = obs["venv"]["python"]
+    # unsloth (installed --no-deps) imports bitsandbytes and friends that unsloth-zoo does not declare.
+    mark = shared / "extra.json"
+    if not mark.exists():
+        import shutil as _sh
+        uv = _sh.which("uv")
+        base_cmd = [uv, "pip", "install", "--python", python] if uv else [python, "-m", "pip", "install", "-q"]
+        rc = sh(base_cmd + ["--extra-index-url", "https://pypi.org/simple", "bitsandbytes", "datasets", "sentencepiece",
+                            "protobuf", "hf_transfer", "tyro", "psutil", "wheel", "msgspec", "diffusers"], "extra", 1800)
+        mark.write_text(json.dumps({"rc": rc}), encoding = "utf-8")
+    obs["venv"]["extra"] = json.loads(mark.read_text(encoding = "utf-8"))
 obs["python"] = python
 obs["zoo_import"] = zoo_venv.zoo_import(python, ck)
 save()
