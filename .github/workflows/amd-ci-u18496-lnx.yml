@@ -91,7 +91,7 @@ jobs:
             --probe amd_ci/probes/train5_probe.py \
             --criteria amd_ci/criteria/train5_rocm.py \
             --out-dir "$AMD_CI_WORK/out/gpu" \
-            --python "$AMD_CI_PY" -- --unit u18496 --state-repo unsloth --transformers 5.23.0 --trl 1.18.0 --cells env,cg_auto,cg_forced --companion-repo https://github.com/unslothai/unsloth-zoo --companion-base 2ad4a204e478b4e7d56b6e58dc1c988d11260ecf --companion-head 2ad4a204e478b4e7d56b6e58dc1c988d11260ecf --venv "$AMD_CI_WORK/tvenv" --tests tests/test_block_cudagraphs_adapter_switch.py tests/test_block_cudagraphs_clone.py --repeat cg_auto --tests-from-head tests/test_block_cudagraphs_adapter_switch.py
+            --python "$AMD_CI_PY" -- --unit u18496 --state-repo unsloth --transformers 5.23.0 --trl 1.18.0 --cells env,cg_auto8,cg_forced8,cg_auto,cg_forced --companion-repo https://github.com/unslothai/unsloth-zoo --companion-base 2ad4a204e478b4e7d56b6e58dc1c988d11260ecf --companion-head 2ad4a204e478b4e7d56b6e58dc1c988d11260ecf --venv "$AMD_CI_WORK/tvenv" --tests tests/test_block_cudagraphs_adapter_switch.py tests/test_block_cudagraphs_clone.py --repeat cg_auto8 --tests-from-head tests/test_block_cudagraphs_adapter_switch.py
           cat "$AMD_CI_WORK/out/gpu/VERDICT.md" >> "$GITHUB_STEP_SUMMARY"
           # A finding keeps the job green; a NON-result (VOID / INCONCLUSIVE) does not.
           python3 "$GITHUB_WORKSPACE/amd_ci/lib/announce.py" "$AMD_CI_WORK/out/gpu"

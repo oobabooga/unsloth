@@ -4661,7 +4661,29 @@ def cell_ls():
     res["decreasing"] = None
 
 
-def cell_cg(forced):
+W20A_8L_CONFIG = {"architectures": ["Qwen3ForCausalLM"], "attention_bias": False, "attention_dropout": 0.0, "bos_token_id": 151643,
+                  "eos_token_id": 151645, "head_dim": 64, "hidden_act": "silu", "hidden_size": 256, "initializer_range": 0.02,
+                  "intermediate_size": 512, "max_position_embeddings": 40960, "max_window_layers": 8, "num_attention_heads": 4,
+                  "num_hidden_layers": 8, "num_key_value_heads": 2, "rms_norm_eps": 1e-06, "rope_theta": 1000000,
+                  "tie_word_embeddings": True, "use_cache": True, "use_sliding_window": False, "vocab_size": 151936}
+
+
+def build_w20a_8l(d):
+    """The W20A 8-layer tiny Qwen3 (B200 repro model): same config, seed-0 random bf16 weights, Qwen3-0.6B tokenizer."""
+    import hashlib
+    import torch
+    from transformers import AutoTokenizer, Qwen3Config, Qwen3ForCausalLM
+    if not os.path.exists(os.path.join(d, "model.safetensors")):
+        torch.manual_seed(0)
+        m = Qwen3ForCausalLM(Qwen3Config(**W20A_8L_CONFIG)).to(torch.bfloat16)
+        m.save_pretrained(d)
+        AutoTokenizer.from_pretrained("Qwen/Qwen3-0.6B").save_pretrained(d)
+    with open(os.path.join(d, "model.safetensors"), "rb") as fh:
+        res["w20a_8l_sha256"] = hashlib.sha256(fh.read()).hexdigest()
+    return d
+
+
+def cell_cg(forced, eight = False):
     """unsloth #18496: scripts/w20a/dpo_cg_repro.py (tiny Qwen3 DPO, PEFT ref adapter, 8 steps) in a child process with
     this state's unsloth / zoo checkouts; UNSLOTH_BLOCK_CUDAGRAPHS=1 (forced) or unset (auto)."""
     import subprocess
@@ -4676,10 +4698,15 @@ def cell_cg(forced):
     env.pop("UNSLOTH_BLOCK_CUDAGRAPHS", None)
     if forced:
         env["UNSLOTH_BLOCK_CUDAGRAPHS"] = "1"
+    steps = "8"
+    if eight:
+        env["REPO"] = build_w20a_8l(os.path.join(here, "w20a_tiny_qwen3_8l"))
+        steps = "10"
+    res["cg_repo"], res["cg_steps"] = env.get("REPO", "default tiny-Qwen3"), steps
     res["cg_env"] = env.get("UNSLOTH_BLOCK_CUDAGRAPHS")
     script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "dpo_cg_repro.py")
     stage("child")
-    p = subprocess.run([sys.executable, script, src_u, src_z, "dpo", "8"], env = env, capture_output = True, text = True,
+    p = subprocess.run([sys.executable, script, src_u, src_z, "dpo", steps], env = env, capture_output = True, text = True,
                        encoding = "utf-8", errors = "replace", timeout = 1200)
     res["cg_rc"] = p.returncode
     res["cg_stderr_tail"] = (p.stderr or "")[-2500:]
@@ -4699,7 +4726,7 @@ def cell_cg(forced):
     res["decreasing"] = None
 
 
-CELLS = {"cg_forced": lambda: cell_cg(True), "cg_auto": lambda: cell_cg(False), "ls_qwen3": cell_ls, "ls_qwen3_off": cell_ls, "pk_qwen3": lambda: cell_pk("pack"), "pk_qwen3_ef1": lambda: cell_pk("pack"), "pf_qwen3": lambda: cell_pk("pfree"), "mgsa_llama": lambda: cell_mg("mgsa_llama"), "mgsa_qwen3": lambda: cell_mg("mgsa_qwen3"), "mgsa_llama_sa0": lambda: cell_mg("mgsa_llama"), "mgpin_llama": lambda: cell_mg("mgpin_llama"), "mgpin_llama_px0": lambda: cell_mg("mgpin_llama"),
+CELLS = {"cg_forced8": lambda: cell_cg(True, True), "cg_auto8": lambda: cell_cg(False, True), "cg_forced": lambda: cell_cg(True), "cg_auto": lambda: cell_cg(False), "ls_qwen3": cell_ls, "ls_qwen3_off": cell_ls, "pk_qwen3": lambda: cell_pk("pack"), "pk_qwen3_ef1": lambda: cell_pk("pack"), "pf_qwen3": lambda: cell_pk("pfree"), "mgsa_llama": lambda: cell_mg("mgsa_llama"), "mgsa_qwen3": lambda: cell_mg("mgsa_qwen3"), "mgsa_llama_sa0": lambda: cell_mg("mgsa_llama"), "mgpin_llama": lambda: cell_mg("mgpin_llama"), "mgpin_llama_px0": lambda: cell_mg("mgpin_llama"),
          "hd512_llama": lambda: cell_hd512("llama"), "hd512_gemma4": lambda: cell_hd512("gemma4"),
          "hd512_gemma4_nc": lambda: cell_hd512("gemma4"),
          "bclens": cell_bclens, "bswap": cell_bswap,
