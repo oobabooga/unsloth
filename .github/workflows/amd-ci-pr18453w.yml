@@ -138,9 +138,16 @@ jobs:
           $orphans | Stop-Process -Force -ErrorAction SilentlyContinue
           Write-Host "orphans stopped: $($orphans.Count)"
           if ($orphans.Count -gt 0) { Start-Sleep -Seconds 3 }
-          & $env:AMD_CI_PY -m venv "$env:AMD_CI_WORK\venv"
+          # A venv's python.exe re-launches the base interpreter, so orphans of a cancelled run show the SYSTEM
+          # python path: match them by command line instead and stop them (they hold venv DLLs open).
+          $stale = @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Where-Object {
+            $_.ProcessId -ne $PID -and $_.CommandLine -and $_.CommandLine -like "*$env:AMD_CI_WORK*" })
+          $stale | ForEach-Object { Write-Host "stopping stale $($_.ProcessId) $($_.CommandLine)"; Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+          Write-Host "stale stopped: $($stale.Count)"
+          Start-Sleep -Seconds 3
+          & $env:AMD_CI_PY -m venv "$env:AMD_CI_WORK\venv2"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          $py = "$env:AMD_CI_WORK\venv\Scripts\python.exe"
+          $py = "$env:AMD_CI_WORK\venv2\Scripts\python.exe"
           & $py -m pip install -q --upgrade pip
           & $py -m pip install -q pytest pytest-asyncio pytest-timeout
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
