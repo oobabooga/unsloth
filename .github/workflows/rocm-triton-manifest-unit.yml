@@ -1,0 +1,51 @@
+name: "A/B unit: ROCm Triton pairing test on Windows PowerShell 5.1"
+
+on:
+  push:
+    branches: [rocm-triton-manifest-unit-ci]
+
+permissions:
+  contents: read
+
+env:
+  BASE_SHA: "91211c70110bd34bee120bb628e35398ad089c06"
+
+jobs:
+  unit:
+    strategy:
+      fail-fast: false
+      matrix:
+        leg: [main, fix]
+    name: "Windows AMD unit ${{ matrix.leg }}"
+    runs-on: [self-hosted, Windows, strix-halo, devlab-dispatch]
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: powershell
+    env:
+      LEG: ${{ matrix.leg }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          path: ci
+
+      - name: Fixed test file against this leg's setup.ps1
+        run: |
+          $ErrorActionPreference = "Continue"
+          $src = Join-Path $env:RUNNER_TEMP "src"
+          git -c core.autocrlf=false clone --quiet --filter=blob:none https://github.com/unslothai/unsloth $src
+          Push-Location $src
+          git -c core.autocrlf=false checkout --quiet $env:BASE_SHA
+          git -c core.autocrlf=false apply --whitespace=nowarn "$env:GITHUB_WORKSPACE\ci\fix.patch"
+          if ($LASTEXITCODE -ne 0) { Write-Host "FATAL: patch did not apply"; exit 1 }
+          # main: the fixed test file over main's setup.ps1.
+          if ($env:LEG -eq "main") { git -c core.autocrlf=false checkout --quiet -- studio/setup.ps1 }
+          git status --short
+          & powershell -NoProfile -ExecutionPolicy Bypass -File tests\studio\test_rocm_triton_windows_pairing.ps1 *>&1 | Select-String -Pattern "FAIL|check\(s\) failed|All checks passed" | ForEach-Object { Write-Host $_.Line }
+          $rc = $LASTEXITCODE
+          Pop-Location
+          Write-Host "unit test exit $rc (leg $env:LEG)"
+          $want = if ($env:LEG -eq "fix") { $rc -eq 0 } else { $rc -ne 0 }
+          if (-not $want) { Write-Host "MISMATCH"; exit 1 }
+          Write-Host "MATCH"
