@@ -37,6 +37,9 @@ def gates(obs):
     bc = b.get("cell") or {}
     out.append(("base cell finished (no-grad forward + 2 SFT steps)", bc.get("stage") == "done",
                 f"stage={bc.get('stage')} err={str(bc.get('error') or '')[:300]}"))
+    fb = sum(((bc.get("nograd") or {}).get("checkpoint_function_forwards") or {}).values())
+    out.append(("base no-grad forward went through a checkpoint autograd Function (path engaged)", fb > 0,
+                f"{(bc.get('nograd') or {}).get('checkpoint_function_forwards')}"))
     return out
 
 
@@ -57,6 +60,9 @@ def head_is_worse(base, head):
     calls = int((nh.get("stats_after") or {}).get("calls", 0)) - int((nh.get("stats_before") or {}).get("calls", 0))
     if calls <= 0:
         bad.append(f"head no-grad forward did not run checkpointed blocks directly (calls delta {calls})")
+    fh = sum((nh.get("checkpoint_function_forwards") or {}).values())
+    if fh:
+        bad.append(f"head no-grad forward still ran checkpoint Functions: {nh.get('checkpoint_function_forwards')}")
     if not nh.get("finite"):
         bad.append("head no-grad logits not finite")
     for k in ("sum", "abs_sum"):
@@ -79,15 +85,15 @@ def head_is_worse(base, head):
 
 def table(obs):
     b, h = obs.get("base") or {}, obs.get("head") or {}
-    L = ["| state | PR tests (passed / failed / skipped) | no-grad calls delta | no-grad logits sum / abs sum | "
-         "SFT losses | grad norms | peak GB |", "|---|---|---|---|---|---|---|"]
+    L = ["| state | PR tests (passed / failed / skipped) | no-grad calls delta | checkpoint Function forwards (no-grad) | no-grad logits sum / abs sum | "
+         "SFT losses | grad norms | peak GB |", "|---|---|---|---|---|---|---|---|"]
     for name, o in (("base", b), ("head", h)):
         t, c = o.get("pytest") or {}, o.get("cell") or {}
         n = c.get("nograd") or {}
         d = int((n.get("stats_after") or {}).get("calls", 0)) - int((n.get("stats_before") or {}).get("calls", 0)) \
             if c.get("has_stats") else "n/a"
         tests = "absent" if t.get("note") else f"{t.get('n_passed')} / {t.get('n_failed')} / {t.get('n_skipped')}"
-        L.append(f"| {name} | {tests} | {d} | {n.get('sum')} / {n.get('abs_sum')} | {c.get('losses')} | "
+        L.append(f"| {name} | {tests} | {d} | {n.get('checkpoint_function_forwards')} | {n.get('sum')} / {n.get('abs_sum')} | {c.get('losses')} | "
                  f"{c.get('grad_norms')} | {c.get('peak_gb')} |")
     for name, o in (("base", b), ("head", h)):
         c = o.get("cell") or {}
