@@ -4747,6 +4747,28 @@ def cell_dora(four_bit):
     res["dora_lr"], res["dora_steps"] = cfg.learning_rate, cfg.max_steps
     trainer = SFTTrainer(model = model, train_dataset = ds, processing_class = tt, args = cfg)
     res["trainer_class"] = type(trainer).__name__
+    # #18515 c2eb72b: cross term path. ROCm has no aten::mm.dtype route (_MM_OUT_DTYPE False) -> chunked fp32 upcast.
+    xt = {"cross_calls": 0, "norm_calls": 0, "nonfinite_norms": 0, "norm_dtypes": []}
+    if kd is not None:
+        res["dora_mm_out_dtype"] = getattr(kd, "_MM_OUT_DTYPE", "absent")
+        if hasattr(kd, "_cross_term_fp32"):
+            _ct = kd._cross_term_fp32
+
+            def _ct_counted(*a, **k):
+                xt["cross_calls"] += 1
+                return _ct(*a, **k)
+            kd._cross_term_fp32 = _ct_counted
+        _fn = kd.factored_dora_weight_norm
+
+        def _fn_counted(*a, **k):
+            out = _fn(*a, **k)
+            xt["norm_calls"] += 1
+            if not bool(torch.isfinite(out).all()):
+                xt["nonfinite_norms"] += 1
+            if len(xt["norm_dtypes"]) < 1:
+                xt["norm_dtypes"].append(str(out.dtype))
+            return out
+        kd.factored_dora_weight_norm = _fn_counted
     s0 = dict(kd.STATS) if kd is not None else None
     c0 = calls[0]
     stage("train")
@@ -4754,6 +4776,7 @@ def cell_dora(four_bit):
     trainer.train()
     peak()
     res["dora_forward_calls"] = calls[0] - c0
+    res["dora_cross_term"] = dict(xt)
     if kd is not None:
         res["dora_stats_train"] = {k: v - (s0 or {}).get(k, 0) for k, v in kd.STATS.items()}
     else:
