@@ -82,6 +82,20 @@ else:
         mark.write_text(json.dumps({"rc": rc}), encoding = "utf-8")
     obs["venv"]["extra"] = json.loads(mark.read_text(encoding = "utf-8"))
 obs["python"] = python
+# unsloth main, pinned to one commit, identical for both arms (installed once, --no-deps over the release).
+UNSLOTH_SHA = "98f23d884cf9699e87706acfa750a2f37d7420a3"
+umark = shared / "unsloth_main.json"
+if not umark.exists():
+    rc = sh([python, "-m", "pip", "install", "-q", "--disable-pip-version-check", "--no-deps", "--force-reinstall",
+             f"unsloth @ git+https://github.com/unslothai/unsloth@{UNSLOTH_SHA}"], "unsloth_main", 1800)
+    umark.write_text(json.dumps({"rc": rc, "sha": UNSLOTH_SHA}), encoding = "utf-8")
+obs["unsloth_main"] = json.loads(umark.read_text(encoding = "utf-8"))
+try:
+    du = subprocess.run([python, "-c", "import importlib.metadata as m; print(m.distribution('unsloth').read_text('direct_url.json'))"],
+                        capture_output = True, text = True, timeout = 300).stdout.strip()
+    obs["unsloth_main"]["direct_url"] = du
+except Exception as e:  # noqa: BLE001
+    obs["unsloth_main"]["direct_url"] = repr(e)
 obs["zoo_import"] = zoo_venv.zoo_import(python, ck)
 save()
 

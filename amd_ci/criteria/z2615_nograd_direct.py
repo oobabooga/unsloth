@@ -37,6 +37,11 @@ def gates(obs):
     bc = b.get("cell") or {}
     out.append(("base cell finished (no-grad forward + 2 SFT steps)", bc.get("stage") == "done",
                 f"stage={bc.get('stage')} err={str(bc.get('error') or '')[:300]}"))
+    ub, uh = (b.get("unsloth_main") or {}), (h.get("unsloth_main") or {})
+    sha = "98f23d884cf9699e87706acfa750a2f37d7420a3"
+    out.append(("both arms run unsloth main at the same pinned commit",
+                ub.get("rc") == 0 and sha in str(ub.get("direct_url")) and sha in str(uh.get("direct_url")),
+                f"base {ub} head {uh}"[:400]))
     fb = sum(((bc.get("nograd") or {}).get("checkpoint_function_forwards") or {}).values())
     out.append(("base no-grad forward went through a checkpoint autograd Function (path engaged)", fb > 0,
                 f"{(bc.get('nograd') or {}).get('checkpoint_function_forwards')}"))
