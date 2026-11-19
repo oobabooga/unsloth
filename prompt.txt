@@ -1,0 +1,22 @@
+Write one self-contained HTML file (no libraries) with a full-window 2D canvas showing a soft triangle lattice of dots joined by sticks that spins in place, facing the camera. Send the complete file.
+
+Look
+- Cream background #f2f0eb. Black (#111) sticks 2.4 px wide and solid dots of radius 4.5 px.
+- Put an SVG "goo" filter on the canvas (Gaussian blur of 2, then a color matrix that sharpens alpha with 24 and -7), so the joints look slightly melted together.
+- Handle devicePixelRatio and window resize.
+
+Lattice
+- A big triangle made of 7 rows of dots: row r has r+1 dots, spaced 1 unit apart on a triangular grid (row height sqrt(3)/2), centred on the triangle's centroid.
+- Sticks join each dot to its neighbour on the right and its two neighbours in the row below.
+- Also keep "bending" links between dots two apart along each of those three directions, and the list of small triangles the sticks form.
+- Scale so the triangle spans about 62% of the shorter window side.
+
+Physics (fixed time step of 1/240 s, at most 0.05 s of catch-up per frame)
+- The whole shape has a target rotation angle that grows at (1.2 + 0.5 * sin(0.5 * time)) radians per second.
+- Every dot is pulled by a spring toward where its rest position would be after that rotation. The pull is strongest at the centre and weak at the tips: stiffness = 5 + 180 * (1 - distance_from_centre / max_distance)^2. That makes the tips lag behind like pinwheel arms.
+- Sticks are springs with stiffness 300 and rest length 1 unit; bending links have stiffness 150 and rest length 2 units.
+- Each small triangle also has an area spring (stiffness 400 / scale^2) that pushes its signed area back to its rest value, so a triangle that flips over pushes itself back.
+- The mouse pushes nearby dots away within 1.6 units.
+- Integrate with damping 9: velocity += (force - 9 * velocity) * dt, then position += velocity * dt.
+
+Draw all the sticks, then all the dots, every frame with requestAnimationFrame.
