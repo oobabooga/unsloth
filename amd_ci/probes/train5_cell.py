@@ -45,6 +45,10 @@ MODELS = {
     "dora16": "built:llama (DoRA r16 all 7 projections, bf16, GA 2)",
     "dora16_off": "built:llama (as dora16, UNSLOTH_DORA_FACTORED_NORM=0)",
     "dora4": "built:llama (DoRA r16 all 7 projections, bitsandbytes NF4, GA 2)",
+    "dora16_lr1": "built:llama (as dora16, lr 1e-3, 8 steps)",
+    "dora4_lr1": "built:llama (as dora4, lr 1e-3, 8 steps)",
+    "dora16_lr1_g64": "built:llama (gold of dora16_lr1)",
+    "dora4_lr1_g64": "built:llama (gold of dora4_lr1)",
     "dora16_g64": "built:llama (as dora16, kill switch on, row norm in fp64 from the factors: gold trajectory)",
     "dora4_g64": "built:llama (as dora4, kill switch on, row norm in fp64 from the factors: gold trajectory)",
     "ls_qwen3": "trl-internal-testing/tiny-Qwen3ForCausalLM (SFT label_smoothing_factor 0.1, GA 2)",
@@ -4734,10 +4738,13 @@ def cell_dora(four_bit):
         tt.pad_token = tt.eos_token
     ds = Dataset.from_dict({"text": [d + (tt.eos_token or "") for d in DOCS] * 8})
     cfg = SFTConfig(output_dir = os.path.join(os.path.dirname(os.path.abspath(args.out)), f"trainer_{args.cell}"),
-                    per_device_train_batch_size = 2, gradient_accumulation_steps = 2, max_steps = args.steps,
-                    learning_rate = args.lr, logging_steps = 1, bf16 = True, report_to = "none", seed = 0,
+                    per_device_train_batch_size = 2, gradient_accumulation_steps = 2,
+                    max_steps = 8 if "_lr1" in args.cell else args.steps,
+                    learning_rate = 1e-3 if "_lr1" in args.cell else args.lr, logging_steps = 1, bf16 = True,
+                    report_to = "none", seed = 0,
                     dataset_text_field = "text", max_length = 64, save_strategy = "no", dataset_num_proc = 1,
                     warmup_steps = 0, lr_scheduler_type = "constant", packing = False)
+    res["dora_lr"], res["dora_steps"] = cfg.learning_rate, cfg.max_steps
     trainer = SFTTrainer(model = model, train_dataset = ds, processing_class = tt, args = cfg)
     res["trainer_class"] = type(trainer).__name__
     s0 = dict(kd.STATS) if kd is not None else None
@@ -4892,7 +4899,7 @@ def cell_fx(dtype):
     res["decreasing"] = None
 
 
-CELLS = {"dora16": lambda: cell_dora(False), "dora16_off": lambda: cell_dora(False), "dora4": lambda: cell_dora(True), "dora16_g64": lambda: cell_dora(False), "dora4_g64": lambda: cell_dora(True), "fx32": lambda: cell_fx("float32"), "fx16": lambda: cell_fx("bfloat16"), "cg_forced8": lambda: cell_cg(True, True), "cg_auto8": lambda: cell_cg(False, True), "cg_forced": lambda: cell_cg(True), "cg_auto": lambda: cell_cg(False), "ls_qwen3": cell_ls, "ls_qwen3_off": cell_ls, "pk_qwen3": lambda: cell_pk("pack"), "pk_qwen3_ef1": lambda: cell_pk("pack"), "pf_qwen3": lambda: cell_pk("pfree"), "mgsa_llama": lambda: cell_mg("mgsa_llama"), "mgsa_qwen3": lambda: cell_mg("mgsa_qwen3"), "mgsa_llama_sa0": lambda: cell_mg("mgsa_llama"), "mgpin_llama": lambda: cell_mg("mgpin_llama"), "mgpin_llama_px0": lambda: cell_mg("mgpin_llama"),
+CELLS = {"dora16": lambda: cell_dora(False), "dora16_off": lambda: cell_dora(False), "dora4": lambda: cell_dora(True), "dora16_g64": lambda: cell_dora(False), "dora16_lr1": lambda: cell_dora(False), "dora4_lr1": lambda: cell_dora(True), "dora16_lr1_g64": lambda: cell_dora(False), "dora4_lr1_g64": lambda: cell_dora(True), "dora4_g64": lambda: cell_dora(True), "fx32": lambda: cell_fx("float32"), "fx16": lambda: cell_fx("bfloat16"), "cg_forced8": lambda: cell_cg(True, True), "cg_auto8": lambda: cell_cg(False, True), "cg_forced": lambda: cell_cg(True), "cg_auto": lambda: cell_cg(False), "ls_qwen3": cell_ls, "ls_qwen3_off": cell_ls, "pk_qwen3": lambda: cell_pk("pack"), "pk_qwen3_ef1": lambda: cell_pk("pack"), "pf_qwen3": lambda: cell_pk("pfree"), "mgsa_llama": lambda: cell_mg("mgsa_llama"), "mgsa_qwen3": lambda: cell_mg("mgsa_qwen3"), "mgsa_llama_sa0": lambda: cell_mg("mgsa_llama"), "mgpin_llama": lambda: cell_mg("mgpin_llama"), "mgpin_llama_px0": lambda: cell_mg("mgpin_llama"),
          "hd512_llama": lambda: cell_hd512("llama"), "hd512_gemma4": lambda: cell_hd512("gemma4"),
          "hd512_gemma4_nc": lambda: cell_hd512("gemma4"),
          "bclens": cell_bclens, "bswap": cell_bswap,

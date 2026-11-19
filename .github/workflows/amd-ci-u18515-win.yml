@@ -167,7 +167,7 @@ jobs:
             --probe "$env:GITHUB_WORKSPACE/amd_ci/probes/train5_probe.py" `
             --criteria "$env:GITHUB_WORKSPACE/amd_ci/criteria/train5_rocm.py" `
             --out-dir "$env:AMD_CI_WORK\out\windows" `
-            --python "$env:AMD_CI_PY" -- --unit u18515 --state-repo unsloth --transformers 5.23.0 --trl 1.18.0 --cells env,dora16,dora4,dora16_off,dora16_g64,dora4_g64 --companion-repo https://github.com/unslothai/unsloth-zoo --companion-base a779571bfe683cb4a31c6f0a3b1f48d0e4292968 --companion-head a779571bfe683cb4a31c6f0a3b1f48d0e4292968 --use-current --tests tests/test_dora_factored_norm.py --repeat dora16,dora4 --test-timeout 900 --no-rerun-timed-out --tests-from-head tests/test_dora_factored_norm.py
+            --python "$env:AMD_CI_PY" -- --unit u18515 --state-repo unsloth --transformers 5.23.0 --trl 1.18.0 --cells env,dora16,dora4,dora16_off,dora16_g64,dora4_g64,dora16_lr1,dora16_lr1_g64,dora4_lr1,dora4_lr1_g64 --companion-repo https://github.com/unslothai/unsloth-zoo --companion-base a779571bfe683cb4a31c6f0a3b1f48d0e4292968 --companion-head a779571bfe683cb4a31c6f0a3b1f48d0e4292968 --use-current --tests tests/test_dora_factored_norm.py --repeat dora16,dora4,dora16_lr1 --test-timeout 900 --no-rerun-timed-out --tests-from-head tests/test_dora_factored_norm.py
           Get-Content "$env:AMD_CI_WORK\out\windows\VERDICT.md" |
             Add-Content -Path $env:GITHUB_STEP_SUMMARY
           # A finding keeps the job green; a NON-result (VOID / INCONCLUSIVE) does not.
