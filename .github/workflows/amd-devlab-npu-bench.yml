@@ -1,0 +1,70 @@
+name: AMD DevLab NPU blog benchmark, decode tok/s and TTFT per FastFlowLM model (unsloth main beec0a3)
+
+on:
+  push:
+    branches: [amd-devlab-npu-bench-2026-11-18]
+
+permissions: {}
+
+jobs:
+  bench:
+    runs-on: [self-hosted, Linux, strix-halo, devlab-dispatch]
+    timeout-minutes: 240
+    env:
+      BASE_SHA: beec0a3800a3576e84d20efd759d404ee80a9ffc
+      MODELS: >-
+        lfm3-1.7b-FLM llama3.2-3b-FLM qwen3.5-4b-FLM gemma4-it-e4b-FLM qwen3-8b-FLM
+        gpt-oss-20b-FLM qwen3.8-mtp-27b-FLM qwen3.6-moe-35b-a3b-FLM
+    steps:
+      - name: Hardware
+        run: |
+          uname -a; lscpu | grep -E 'Model name|^CPU\(s\)'; free -h; df -h "$RUNNER_TEMP" | tail -1
+          ls -l /dev/accel* 2>/dev/null || true
+          cat /sys/module/amdxdna/version 2>/dev/null || true
+
+      - name: Install Unsloth Studio from main
+        run: |
+          set -euo pipefail
+          W="$RUNNER_TEMP/npu-bench-$GITHUB_RUN_ID"
+          mkdir -p "$W/tmp" "$W/hf" "$W/uv" "$W/out"
+          { echo "W=$W"; echo "TMPDIR=$W/tmp"; echo "HF_HOME=$W/hf"; echo "UV_CACHE_DIR=$W/uv"; echo "UNSLOTH_STUDIO_HOME=$W/studio"; } >> "$GITHUB_ENV"
+          export TMPDIR="$W/tmp" HF_HOME="$W/hf" UV_CACHE_DIR="$W/uv" UNSLOTH_STUDIO_HOME="$W/studio"
+          git clone -q https://github.com/unslothai/unsloth.git "$W/src"
+          cd "$W/src" && git checkout -q "$BASE_SHA" && git log -1 --format='installing %H %s'
+          curl -fsSL "https://raw.githubusercontent.com/$GITHUB_REPOSITORY/$GITHUB_SHA/bench.py" -o "$W/bench.py"
+          UNSLOTH_SKIP_AUTOSTART=1 bash install.sh --local --no-rollback > "$W/install.log" 2>&1 || { tail -150 "$W/install.log"; exit 1; }
+          tail -5 "$W/install.log"
+
+      - name: Start Unsloth Studio on localhost
+        shell: bash {0}
+        run: |
+          set -uo pipefail
+          PY="$UNSLOTH_STUDIO_HOME/unsloth_studio/bin/python"
+          PORT=$(shuf -i 18700-18799 -n 1)
+          PW="$(python3 -c 'import secrets; print(secrets.token_urlsafe(18))')"
+          echo "::add-mask::$PW"
+          cd "$W/src/studio/backend"
+          UNSLOTH_STUDIO_PASSWORD="$PW" nohup "$PY" run.py --port "$PORT" > "$W/studio.log" 2>&1 &
+          for i in $(seq 1 300); do curl -sf "http://127.0.0.1:$PORT/api/health" >/dev/null && break; sleep 1; done
+          curl -sf "http://127.0.0.1:$PORT/api/health" >/dev/null || { echo "Unsloth Studio did not start"; tail -80 "$W/studio.log" | grep -vF "$PW"; exit 1; }
+          { echo "PORT=$PORT"; echo "PW=$PW"; } >> "$GITHUB_ENV"
+
+      - name: Benchmark
+        timeout-minutes: 200
+        shell: bash {0}
+        run: |
+          BASE="http://127.0.0.1:$PORT" OUT="$W/out" python3 "$W/bench.py" 2>&1 | grep -vF "$PW" | tee "$W/out/log.txt"
+          exit "${PIPESTATUS[0]}"
+
+      - name: Keep the server log
+        if: always()
+        run: |
+          grep -vF "$PW" "$W/studio.log" > "$W/out/studio.log" 2>/dev/null || true
+          grep -hiE "fastflowlm|lemonade" "$W/out/studio.log" | tail -20 || true
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: npu-bench
+          path: ${{ runner.temp }}/npu-bench-${{ github.run_id }}/out/
+          if-no-files-found: ignore
