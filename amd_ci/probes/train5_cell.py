@@ -4756,16 +4756,25 @@ def cell_lsh():
     res["trainer_class"] = type(trainer).__name__
     res["label_smoother"] = type(getattr(trainer, "label_smoother", None)).__name__
     stats0 = dict(fls.STATS) if fls is not None else None
+    pq = [p for n, p in model.named_parameters() if "q_proj" in n and "lora_B" in n]
+    gq = []
+    if pq:
+        pq[0].register_post_accumulate_grad_hook(lambda p: gq.append(float(p.grad.float().norm()) if p.grad is not None else None))
     stage("train")
     torch.cuda.reset_peak_memory_stats()
-    trainer.train()
+    try:
+        trainer.train()
+    finally:  # record the route even when the step crashes (base)
+        if fls is not None:
+            res["fls_stats_train"] = {k: v - (stats0 or {}).get(k, 0) for k, v in fls.STATS.items()}
+        else:
+            res["fls_stats_train"] = "absent"
+        st = res["fls_stats_train"] if isinstance(res["fls_stats_train"], dict) else {}
+        res["ls_engaged_unsloth"] = st.get("fused", 0)
+        res["q_proj0_lora_B_grad_norms"] = gq
+        res["lm_head_lora_B_grad_norms"] = gB
+        dump()
     peak()
-    if fls is not None:
-        res["fls_stats_train"] = {k: v - (stats0 or {}).get(k, 0) for k, v in fls.STATS.items()}
-    else:
-        res["fls_stats_train"] = "absent"
-    st = res["fls_stats_train"] if isinstance(res["fls_stats_train"], dict) else {}
-    res["ls_engaged_unsloth"] = st.get("fused", 0)
     res["lm_head_lora_A_grad_norms"] = gA
     res["lm_head_lora_B_grad_norms"] = gB
     res["lm_head_lora_B_norm_after"] = float(hB.detach().float().norm()) if hB is not None else None
