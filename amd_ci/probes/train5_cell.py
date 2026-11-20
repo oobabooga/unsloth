@@ -4991,6 +4991,11 @@ def cell_cg2(kind):
                 except Exception as e:  # noqa: BLE001
                     key = f"diag ERR {type(e).__name__}: {e}"[:200]
                 diag["reasons"][key] = diag["reasons"].get(key, 0) + 1
+                sk = f"stack_grad{int(torch.is_grad_enabled())}"
+                if sk not in diag:
+                    import threading
+                    diag[sk] = [threading.current_thread().name] + [
+                        f"{os.path.basename(fr.filename)}:{fr.lineno}:{fr.name}" for fr in traceback.extract_stack()[-28:-1]]
             return r
         lm.arm_mlp_output_unread = _arm_diag
     res["cg2_diag"] = diag
