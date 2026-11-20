@@ -2693,19 +2693,25 @@ def _mlx_device_info(mx: Any) -> Dict[str, Any]:
     return {}
 
 
-def _metal_recommended_working_set_bytes() -> int:
-    """Metal's recommendedMaxWorkingSetSize, or 0. MLX first; torch.mps (2.5+) covers macOS 13, which has no MLX wheel."""
+def _metal_recommended_working_set_bytes(*, allow_import: bool = True) -> int:
+    """Metal's recommendedMaxWorkingSetSize, or 0. MLX first; torch.mps (2.5+) covers macOS 13, which has no MLX wheel. ``allow_import=False`` (polled paths) reads only imported modules: a broken MLX import can park."""
     try:
-        import mlx.core as mx
-        if mx.metal.is_available():
+        if allow_import:
+            import mlx.core as mx
+        else:
+            mx = sys.modules.get("mlx.core")
+        if mx is not None and mx.metal.is_available():
             rec = int(_mlx_device_info(mx).get("max_recommended_working_set_size") or 0)
             if rec > 0:
                 return rec
     except Exception:
         pass
     try:
-        import torch
-        if torch.backends.mps.is_available():
+        if allow_import:
+            import torch
+        else:
+            torch = sys.modules.get("torch")
+        if torch is not None and torch.backends.mps.is_available():
             return max(0, int(torch.mps.recommended_max_memory()))
     except Exception:
         pass
@@ -7739,6 +7745,78 @@ def get_cross_vendor_inference_gpu_info() -> Optional[Dict[str, Any]]:
         "parent_visible_gpu_ids": [],
         "devices": devices,
         "index_kind": "physical",
+    }
+
+
+# Kept once read; 0 retries on later polls, after the warm thread imports MLX or torch.
+_apple_metal_working_set_bytes: int = 0
+
+
+def _llama_cpp_offloads_to_metal() -> bool:
+    """Whether llama-server would place GGUF layers on Metal; cheap enough for the polled /api/system."""
+    try:
+        from core.inference.llama_cpp import (
+            LlamaCppBackend,
+            _metal_devices_env_hides_all,
+            _metal_offload_forced_off_for_polling,
+        )
+        return (
+            not _metal_devices_env_hides_all()
+            and LlamaCppBackend._build_has_metal()
+            and not _metal_offload_forced_off_for_polling()
+        )
+    except Exception as e:
+        logger.debug("Could not tell whether llama.cpp offloads to Metal: %s", e)
+        return False
+
+
+def get_apple_metal_inference_gpu_info() -> Optional[Dict[str, Any]]:
+    """llama.cpp's Metal device on Apple Silicon detected as CPU (GGUF-only install, MLX missing), else None.
+    The loader offloads to Metal there regardless, so the GGUF fit must see the unified pool."""
+    global _apple_metal_working_set_bytes
+    if not is_apple_silicon() or get_device() == DeviceType.MLX:
+        return None
+    if not _llama_cpp_offloads_to_metal():
+        return None
+    try:
+        import psutil
+        total_bytes = int(psutil.virtual_memory().total)
+    except Exception as e:
+        logger.debug("Apple Metal inventory could not read total memory: %s", e)
+        return None
+    if total_bytes <= 0:
+        return None
+    if not _apple_metal_working_set_bytes:
+        try:
+            _apple_metal_working_set_bytes = int(
+                _metal_recommended_working_set_bytes(allow_import = False) or 0
+            )
+        except Exception as e:
+            logger.debug("Metal working set probe failed: %s", e)
+            _apple_metal_working_set_bytes = 0
+    # Same fallback as the loader.
+    working_set_bytes = _apple_metal_working_set_bytes or total_bytes
+    total_gb = round(total_bytes / (1024**3), 2)
+    device: Dict[str, Any] = {
+        "index": 0,
+        "index_kind": "relative",
+        "visible_ordinal": 0,
+        "name": "Apple Silicon (Metal)",
+        "memory_total_gb": total_gb,
+        "shared_memory": True,
+        "shared_memory_host_backed_gb": total_gb,
+        "metal_working_set_gb": round(working_set_bytes / (1024**3), 2),
+        # No vram_used_gb: AGX in-use is system-wide; the switch budget would credit it all as freed.
+    }
+    return {
+        "available": True,
+        "backend": "metal",
+        "backend_cuda_visible_devices": None,
+        "parent_visible_gpu_ids": [],
+        "devices": [device],
+        "index_kind": "relative",
+        # llama-server takes no device ids on Metal.
+        "gguf_gpu_ids_supported": False,
     }
 
 
