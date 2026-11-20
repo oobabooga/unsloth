@@ -36,6 +36,10 @@ import traceback
 # Llama 3.2 has head_dim 8 with hidden 8 / 4 heads, which FastLlama rebuilds as head_dim 2 (load MISMATCH).
 LLAMA_TOKENIZER = "trl-internal-testing/tiny-MistralForCausalLM-0.1"
 MODELS = {
+    "nwh_moe": "trl-internal-testing/tiny-Qwen3MoeForCausalLM GRPO packing 6 steps (unsloth #18685)",
+    "nwh_moe_r2": "same as nwh_moe, second run",
+    "nwh_q06": "unsloth/Qwen3-0.6B GRPO packing 6 steps (unsloth #18685)",
+    "nwh_q06_r2": "same as nwh_q06, second run",
     "z12_whisper": "unsloth/whisper-large-v3-turbo (mem_ab worker, bf16 autocast LoRA, 10 steps)",
     "z12_w2v": "facebook/wav2vec2-base-960h (mem_ab worker, bf16 autocast LoRA, 10 steps)",
     "cg5_on": "tiny random Qwen3-MoE (cg5_parity.py, UNSLOTH_GRPO_PREFIX_GROUPER_MOE=1)",
