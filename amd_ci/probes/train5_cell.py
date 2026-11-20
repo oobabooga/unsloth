@@ -4962,6 +4962,38 @@ def cell_cg2(kind):
         res["zoo_has_replay_module"] = hasattr(zgc, "gradient_checkpoint_replay_module")
     except Exception as e:  # noqa: BLE001
         res["zoo_has_replay_module"] = f"ERR {type(e).__name__}"
+    # Diagnostics (observe only): why the head does or does not arm the skip on each decoder-layer call.
+    diag = {"arm_calls": 0, "arm_true": 0, "reasons": {}, "layer_forward": None, "gc_func": None}
+    lm = sys.modules.get("unsloth.models.llama")
+    try:
+        lay = next(m for m in model.modules() if type(m).__name__.endswith("DecoderLayer"))
+        diag["layer_forward"] = f"{type(lay).__name__}.forward={getattr(type(lay).forward, '__qualname__', '?')}"
+        diag["gc_func"] = repr(lay.__dict__.get("_gradient_checkpointing_func"))[:200]
+    except StopIteration:
+        pass
+    if lm is not None and hasattr(lm, "arm_mlp_output_unread"):
+        _arm = lm.arm_mlp_output_unread
+
+        def _arm_diag(layer, mlp, _arm = _arm):
+            r = _arm(layer, mlp)
+            diag["arm_calls"] += 1
+            diag["arm_true"] += int(bool(r))
+            if not r:
+                try:
+                    import unsloth_zoo.gradient_checkpointing as _z
+                    tls = _z._GC_RECOMPUTE_TLS
+                    fn = getattr(tls, "function", None)
+                    rm = _z._replayed_module(fn) if fn is not None else None
+                    key = (f"compiling={fl._is_compiling()} enabled={fl._SKIP_DOWN_ENABLED} "
+                           f"active={getattr(tls, 'active', False)} fn={type(fn).__name__}:{str(getattr(fn, 'func', fn))[:70]} "
+                           f"replayed={type(rm).__name__} is_layer={rm is layer} ghooks={len(torch.nn.modules.module._global_forward_hooks)} "
+                           f"lhooks={len(layer._forward_hooks)} mhooks={len(mlp._forward_hooks)} grad={torch.is_grad_enabled()}")
+                except Exception as e:  # noqa: BLE001
+                    key = f"diag ERR {type(e).__name__}: {e}"[:200]
+                diag["reasons"][key] = diag["reasons"].get(key, 0) + 1
+            return r
+        lm.arm_mlp_output_unread = _arm_diag
+    res["cg2_diag"] = diag
     g1 = {}
     hooks = []
     for n, p in model.named_parameters():
