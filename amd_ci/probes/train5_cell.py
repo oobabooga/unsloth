@@ -36,6 +36,10 @@ import traceback
 # Llama 3.2 has head_dim 8 with hidden 8 / 4 heads, which FastLlama rebuilds as head_dim 2 (load MISMATCH).
 LLAMA_TOKENIZER = "trl-internal-testing/tiny-MistralForCausalLM-0.1"
 MODELS = {
+    "cg2_qwen3_nbc_ml": "tiny-Qwen3 (as cg2_qwen3_nbc, manual AdamW loop on one batch, no Trainer)",
+    "cg2_qwen3_nbc_ml_off": "tiny-Qwen3 (as cg2_qwen3_nbc_ml, UNSLOTH_GC_SKIP_MLP_DOWN=0)",
+    "cg2_llama_nbc_ml": "built:llama (bf16, block compile off, manual loop, no Trainer)",
+    "cg2_llama4_nbc_ml": "built:llama (NF4, block compile off, manual loop, no Trainer)",
     "cg2_qwen3": "trl-internal-testing/tiny-Qwen3ForCausalLM (LoRA r16 all 7, GC unsloth, block compile default)",
     "cg2_qwen3_nbc": "trl-internal-testing/tiny-Qwen3ForCausalLM (as cg2_qwen3, UNSLOTH_BLOCK_COMPILE=0)",
     "cg2_qwen3_nbc_off": "tiny-Qwen3 (as cg2_qwen3_nbc, UNSLOTH_GC_SKIP_MLP_DOWN=0)",
@@ -4946,13 +4950,17 @@ def cell_cg2(kind):
     res["skip_env"] = os.environ.get("UNSLOTH_GC_SKIP_MLP_DOWN")
     res["block_compile_env"] = os.environ.get("UNSLOTH_BLOCK_COMPILE")
     stage("load")
-    model, tok = FastLanguageModel.from_pretrained(path, max_seq_length = 256, dtype = torch.bfloat16,
+    # max_seq_length >= 512: below it apply_unsloth_gradient_checkpointing swaps "unsloth" for torch's own checkpoint
+    # (round 1 used 256 and so never reached an Unsloth checkpointer). Batches stay 64 tokens.
+    model, tok = FastLanguageModel.from_pretrained(path, max_seq_length = 1024, dtype = torch.bfloat16,
                                                    load_in_4bit = four)
+    res["max_seq_length"] = 1024
     res["n_linear4bit"] = sum(1 for m in model.modules() if type(m).__name__ == "Linear4bit")
     model = FastLanguageModel.get_peft_model(model, r = 16, lora_alpha = 32, lora_dropout = 0.0, bias = "none",
                                              target_modules = TARGETS, use_gradient_checkpointing = "unsloth",
                                              random_state = 0)
     lora_stats(model)
+    res["smart_gc_patched"] = getattr(torch.utils.checkpoint.CheckpointFunction, "__name__", "")
     gc = GCCounter(model)
     fl = sys.modules.get("unsloth.kernels.fast_lora")
     st = getattr(fl, "MLP_DOWN_SKIP_STATS", None)
@@ -4962,6 +4970,43 @@ def cell_cg2(kind):
         res["zoo_has_replay_module"] = hasattr(zgc, "gradient_checkpoint_replay_module")
     except Exception as e:  # noqa: BLE001
         res["zoo_has_replay_module"] = f"ERR {type(e).__name__}"
+    # Diagnostics (observe only): why the head does or does not arm the skip on each decoder-layer call.
+    diag = {"arm_calls": 0, "arm_true": 0, "reasons": {}, "layer_forward": None, "gc_func": None}
+    lm = sys.modules.get("unsloth.models.llama")
+    try:
+        lay = next(m for m in model.modules() if type(m).__name__.endswith("DecoderLayer"))
+        diag["layer_forward"] = f"{type(lay).__name__}.forward={getattr(type(lay).forward, '__qualname__', '?')}"
+        diag["gc_func"] = repr(lay.__dict__.get("_gradient_checkpointing_func"))[:200]
+    except StopIteration:
+        pass
+    if lm is not None and hasattr(lm, "arm_mlp_output_unread"):
+        _arm = lm.arm_mlp_output_unread
+
+        def _arm_diag(layer, mlp, _arm = _arm):
+            r = _arm(layer, mlp)
+            diag["arm_calls"] += 1
+            diag["arm_true"] += int(bool(r))
+            if not r:
+                try:
+                    import unsloth_zoo.gradient_checkpointing as _z
+                    tls = _z._GC_RECOMPUTE_TLS
+                    fn = getattr(tls, "function", None)
+                    rm = _z._replayed_module(fn) if fn is not None else None
+                    key = (f"compiling={fl._is_compiling()} enabled={fl._SKIP_DOWN_ENABLED} "
+                           f"active={getattr(tls, 'active', False)} fn={type(fn).__name__}:{str(getattr(fn, 'func', fn))[:70]} "
+                           f"replayed={type(rm).__name__} is_layer={rm is layer} ghooks={len(torch.nn.modules.module._global_forward_hooks)} "
+                           f"lhooks={len(layer._forward_hooks)} mhooks={len(mlp._forward_hooks)} grad={torch.is_grad_enabled()}")
+                except Exception as e:  # noqa: BLE001
+                    key = f"diag ERR {type(e).__name__}: {e}"[:200]
+                diag["reasons"][key] = diag["reasons"].get(key, 0) + 1
+                sk = f"stack_grad{int(torch.is_grad_enabled())}"
+                if sk not in diag:
+                    import threading
+                    diag[sk] = [threading.current_thread().name] + [
+                        f"{os.path.basename(fr.filename)}:{fr.lineno}:{fr.name}" for fr in traceback.extract_stack()[-28:-1]]
+            return r
+        lm.arm_mlp_output_unread = _arm_diag
+    res["cg2_diag"] = diag
     g1 = {}
     hooks = []
     for n, p in model.named_parameters():
@@ -4981,10 +5026,29 @@ def cell_cg2(kind):
                     warmup_steps = 0, lr_scheduler_type = "constant", packing = False)
     stage("train")
     torch.cuda.reset_peak_memory_stats()
-    trainer = SFTTrainer(model = model, train_dataset = ds, processing_class = tt, args = cfg)
-    trainer.add_callback(gc_callback(gc, model))
-    res["trainer_class"] = type(trainer).__name__
-    trainer.train()
+    ml = "_ml" in args.cell
+    if ml:  # manual AdamW loop on one fixed batch: no Trainer (no gradient_checkpointing_enable re-bind)
+        try:
+            lay0 = next(m for m in model.modules() if type(m).__name__.endswith("DecoderLayer"))
+            f0 = lay0.__dict__.get("_gradient_checkpointing_func")
+            inner_f = (getattr(f0, "__kwdefaults__", None) or {}).get("_f", f0)
+            res["gc_func_inner"] = repr(inner_f)[:300]
+        except Exception as e:  # noqa: BLE001
+            res["gc_func_inner"] = repr(e)[:200]
+        manual_loop(model, text_batch(tok, model.get_input_embeddings().weight.device), args.steps, gc)
+        trainer = None
+    else:
+        trainer = SFTTrainer(model = model, train_dataset = ds, processing_class = tt, args = cfg)
+        trainer.add_callback(gc_callback(gc, model))
+        res["trainer_class"] = type(trainer).__name__
+        trainer.train()
+        try:
+            lay0 = next(m for m in model.modules() if type(m).__name__.endswith("DecoderLayer"))
+            f0 = lay0.__dict__.get("_gradient_checkpointing_func")
+            inner_f = (getattr(f0, "__kwdefaults__", None) or {}).get("_f", f0)
+            res["gc_func_inner"] = repr(inner_f)[:300]
+        except Exception as e:  # noqa: BLE001
+            res["gc_func_inner"] = repr(e)[:200]
     peak()
     for h in hooks:
         h.remove()
@@ -4998,6 +5062,9 @@ def cell_cg2(kind):
     res["mlp_down_skip_stats"] = ({k: v - (s0 or {}).get(k, 0) for k, v in st.items()} if st is not None else "absent")
     res["mlp_down_skipped"] = (res["mlp_down_skip_stats"].get("skipped", 0)
                                if isinstance(res["mlp_down_skip_stats"], dict) else 0)
+    if ml:
+        res["grad_norms"] = [math.sqrt(sum(v * v for v in res["step1_grad_norms"]))] if names else []
+        return
     logs = [h for h in trainer.state.log_history if "loss" in h]
     res["grad_norms"] = [h.get("grad_norm") for h in logs]
     finish_losses([float(h["loss"]) for h in logs])
@@ -5091,7 +5158,7 @@ def cell_z28(kind):
     finish_losses(losses)
 
 
-CELLS = {"cg2_qwen3": lambda: cell_cg2("qwen3"), "cg2_qwen3_nbc": lambda: cell_cg2("qwen3"), "cg2_qwen3_nbc_off": lambda: cell_cg2("qwen3"), "cg2_llama": lambda: cell_cg2("llama"), "cg2_llama_nbc": lambda: cell_cg2("llama"), "cg2_llama4_nbc": lambda: cell_cg2("llama4"), "z28_ernie": lambda: cell_z28("ernie"), "z28_ernie_nl": lambda: cell_z28("ernie_nl"), "z28_llama": lambda: cell_z28("llama"), "dora16": lambda: cell_dora(False), "dora16_off": lambda: cell_dora(False), "dora4": lambda: cell_dora(True), "dora16_g64": lambda: cell_dora(False), "dora16_lr1": lambda: cell_dora(False), "dora4_lr1": lambda: cell_dora(True), "dora16_lr1_g64": lambda: cell_dora(False), "dora4_lr1_g64": lambda: cell_dora(True), "dora4_g64": lambda: cell_dora(True), "fx32": lambda: cell_fx("float32"), "fx16": lambda: cell_fx("bfloat16"), "cg_forced8": lambda: cell_cg(True, True), "cg_auto8": lambda: cell_cg(False, True), "cg_forced": lambda: cell_cg(True), "cg_auto": lambda: cell_cg(False), "ls_qwen3": cell_ls, "ls_qwen3_off": cell_ls, "pk_qwen3": lambda: cell_pk("pack"), "pk_qwen3_ef1": lambda: cell_pk("pack"), "pf_qwen3": lambda: cell_pk("pfree"), "mgsa_llama": lambda: cell_mg("mgsa_llama"), "mgsa_qwen3": lambda: cell_mg("mgsa_qwen3"), "mgsa_llama_sa0": lambda: cell_mg("mgsa_llama"), "mgpin_llama": lambda: cell_mg("mgpin_llama"), "mgpin_llama_px0": lambda: cell_mg("mgpin_llama"),
+CELLS = {"cg2_qwen3_nbc_ml": lambda: cell_cg2("qwen3"), "cg2_qwen3_nbc_ml_off": lambda: cell_cg2("qwen3"), "cg2_llama_nbc_ml": lambda: cell_cg2("llama"), "cg2_llama4_nbc_ml": lambda: cell_cg2("llama4"), "cg2_qwen3": lambda: cell_cg2("qwen3"), "cg2_qwen3_nbc": lambda: cell_cg2("qwen3"), "cg2_qwen3_nbc_off": lambda: cell_cg2("qwen3"), "cg2_llama": lambda: cell_cg2("llama"), "cg2_llama_nbc": lambda: cell_cg2("llama"), "cg2_llama4_nbc": lambda: cell_cg2("llama4"), "z28_ernie": lambda: cell_z28("ernie"), "z28_ernie_nl": lambda: cell_z28("ernie_nl"), "z28_llama": lambda: cell_z28("llama"), "dora16": lambda: cell_dora(False), "dora16_off": lambda: cell_dora(False), "dora4": lambda: cell_dora(True), "dora16_g64": lambda: cell_dora(False), "dora16_lr1": lambda: cell_dora(False), "dora4_lr1": lambda: cell_dora(True), "dora16_lr1_g64": lambda: cell_dora(False), "dora4_lr1_g64": lambda: cell_dora(True), "dora4_g64": lambda: cell_dora(True), "fx32": lambda: cell_fx("float32"), "fx16": lambda: cell_fx("bfloat16"), "cg_forced8": lambda: cell_cg(True, True), "cg_auto8": lambda: cell_cg(False, True), "cg_forced": lambda: cell_cg(True), "cg_auto": lambda: cell_cg(False), "ls_qwen3": cell_ls, "ls_qwen3_off": cell_ls, "pk_qwen3": lambda: cell_pk("pack"), "pk_qwen3_ef1": lambda: cell_pk("pack"), "pf_qwen3": lambda: cell_pk("pfree"), "mgsa_llama": lambda: cell_mg("mgsa_llama"), "mgsa_qwen3": lambda: cell_mg("mgsa_qwen3"), "mgsa_llama_sa0": lambda: cell_mg("mgsa_llama"), "mgpin_llama": lambda: cell_mg("mgpin_llama"), "mgpin_llama_px0": lambda: cell_mg("mgpin_llama"),
          "hd512_llama": lambda: cell_hd512("llama"), "hd512_gemma4": lambda: cell_hd512("gemma4"),
          "hd512_gemma4_nc": lambda: cell_hd512("gemma4"),
          "bclens": cell_bclens, "bswap": cell_bswap,
@@ -5131,7 +5198,7 @@ def main():
         os.environ["UNSLOTH_MOE_BACKEND"] = "grouped_mm"
     if args.cell.startswith("cg2_") and "_nbc" in args.cell:
         os.environ["UNSLOTH_BLOCK_COMPILE"] = "0"  # torch >= 2.11 compiles the block: the eager replay skip path needs it off
-    if args.cell == "cg2_qwen3_nbc_off":
+    if args.cell in ("cg2_qwen3_nbc_off", "cg2_qwen3_nbc_ml_off"):
         os.environ["UNSLOTH_GC_SKIP_MLP_DOWN"] = "0"  # unsloth #18607 kill switch (read at import)
     if args.cell == "dora16_off" or args.cell.endswith("_g64"):
         os.environ["UNSLOTH_DORA_FACTORED_NORM"] = "0"  # unsloth #18515 kill switch (read at import)
