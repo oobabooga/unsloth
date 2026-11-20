@@ -1,0 +1,87 @@
+diff --git a/tests/utils/test_hybrid_packing_default.py b/tests/utils/test_hybrid_packing_default.py
+index cd8498832..e32daa3db 100644
+--- a/tests/utils/test_hybrid_packing_default.py
++++ b/tests/utils/test_hybrid_packing_default.py
+@@ -551,7 +551,7 @@ def test_default_on_is_cuda_only(monkeypatch, caplog):
+     model = FakeHybrid(mixer)
+     with caplog.at_level(logging.WARNING, logger = "unsloth.hybrid_packing"):
+         assert patch_hybrid_linear_attention_varlen(model) is False
+-    assert "only on CUDA" in caplog.text
++    assert "default-on only on CUDA" in caplog.text
+     assert _untouched(model, conv_exact, scan_exact)
+     monkeypatch.setenv(ENV, "1")
+     assert patch_hybrid_linear_attention_varlen(FakeHybrid(FakeGatedDeltaNet())) is True
+@@ -794,3 +794,21 @@ def test_a_failed_probe_restores_the_mirrored_alias_namespace(monkeypatch):
+     for n, m in zip(names, (modeling, other, stale)):
+         for k, fn in before[n].items():
+             assert vars(m)[k] is fn, (n, k)
++
++
++@pytest.mark.parametrize("varlen", [True, False])
++def test_rocm_default_on_follows_the_varlen_self_check(monkeypatch, varlen):
++    """ROCm GPUs pack hybrids by default exactly when hf_packed_attention's flash varlen self-check passes."""
++    from unsloth.utils import hf_packed_attention as hpa
++
++    monkeypatch.undo()
++    mixer = FakeGatedDeltaNet()
++    monkeypatch.setattr(
++        mixer, "parameters", lambda: iter([types.SimpleNamespace(device = torch.device("cuda", 0))])
++    )
++    monkeypatch.setattr(torch.version, "hip", "7.1")
++    monkeypatch.setattr(hpa, "_torch_varlen", lambda device: (lambda *a: None) if varlen else None)
++    assert packing_module._auto_hybrid_device_ok(mixer) is varlen
++    assert packing_module._hybrid_opt_in_device([mixer]) == (None if varlen else "ROCm")
++    monkeypatch.setattr(torch.version, "hip", None)
++    assert packing_module._auto_hybrid_device_ok(mixer)
+diff --git a/unsloth/trainer.py b/unsloth/trainer.py
+index 1a9029fbb..0116de7b7 100644
+--- a/unsloth/trainer.py
++++ b/unsloth/trainer.py
+@@ -2454,7 +2454,7 @@ def _patch_sft_trainer_auto_packing(trl_module):
+             if is_hybrid and hybrid_opt_in_device is not None:
+                 print(
+                     f"🦥 Unsloth: Packing enabled on {hybrid_opt_in_device} through "
+-                    f"{_HYBRID_PACKING_ENV_VAR}=1 (on by default only on CUDA). The speedup "
++                    f"{_HYBRID_PACKING_ENV_VAR}=1 (not on by default on this device). The speedup "
+                     "depends on this device's attention kernels, so compare seconds per step "
+                     "against packing = False."
+                 )
+diff --git a/unsloth/utils/packing.py b/unsloth/utils/packing.py
+index 8b3b181a9..92addde83 100644
+--- a/unsloth/utils/packing.py
++++ b/unsloth/utils/packing.py
+@@ -454,7 +454,7 @@ def _hybrid_packing_enabled() -> bool:
+     return _hybrid_packing_mode() == "on"
+ 
+ 
+-# Auto-packed mixers (CUDA only). MoE router aux loss is computed over the whole packed row, not per document.
++# Auto-packed mixers (CUDA, and ROCm with a working flash varlen). MoE router aux loss is computed over the whole packed row, not per document.
+ _HYBRID_AUTO_KINDS = ("gated_delta", "ple")
+ 
+ HYBRID_PACKING_STATS = {
+@@ -1443,7 +1443,14 @@ def _auto_hybrid_device_ok(module) -> bool:
+     if _stateful_mixer_kind(module) == "ple":
+         return True
+     weight = next(module.parameters(), None)
+-    return torch.version.hip is None and weight is not None and weight.device.type == "cuda"
++    if weight is None or weight.device.type != "cuda":
++        return False
++    if torch.version.hip is None:
++        return True
++    # ROCm: without flash varlen the full-attention layers run a dense T x T mask and packing is a wash (#17738).
++    from .hf_packed_attention import _torch_varlen
++
++    return _torch_varlen(weight.device) is not None
+ 
+ 
+ def _hybrid_opt_in_device(modules) -> Optional[str]:
+@@ -1578,7 +1585,8 @@ def patch_hybrid_linear_attention_varlen(model) -> bool:
+         # Every stateful mixer, kwargs-mode ones included (transformers 5.16+ Qwen mixers move there).
+         if not all(_auto_hybrid_device_ok(m) for m in hybrid_modules):
+             return _hybrid_reject(
+-                f"default-on only on CUDA (set {_HYBRID_PACKING_ENV_VAR}=1 to opt in on this device)"
++                f"default-on only on CUDA, or ROCm whose flash varlen passes its self-check "
++                f"(set {_HYBRID_PACKING_ENV_VAR}=1 to opt in on this device)"
+             )
+     rollback = _snapshot_mixers(hybrid_modules)
+     if kwargs_modules or hub_short_convs:
