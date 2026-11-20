@@ -1,0 +1,105 @@
+name: "AMD CI: validate PR 18633"
+
+# Generated from amd_ci/templates/workflow.yml. Edit the PROBE and CRITERIA env
+# values, and the tests/args, rather than the plumbing.
+#
+# Two jobs, because two jobs of this workflow may land on the SAME machine and
+# then share its one GPU:
+#   suites  masks the GPU, so it cannot perturb a measurement running beside it
+#   gpu     is the only job allowed to allocate, and is serialised against every
+#           other run of the same concurrency group
+#
+# They may equally land on different machines: the Linux pool is at least seven
+# (a 24-way matrix ran essentially concurrently across seven distinct hosts).
+# Nothing is shared between them, including the Docker image cache, so a job that
+# pulls an image does not make it available to the next one.
+#
+# This is the LINUX template. For the Windows boxes use
+# `scaffold.py --windows`, which emits templates/workflow_windows.yml.
+#
+# If your change needs no GPU measurement, delete the gpu job. If it needs no
+# test suites, delete suites. Do not delete the gate: it fails rather than
+# skipping, because a skip misreports missing hardware as nothing to see.
+
+on:
+  push:
+    branches: [amd-ci-kr4u5b-lnx]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  PR: "18633"
+  UPSTREAM: "https://github.com/unslothai/unsloth"
+  # Set to "1" for a PR already merged: compares the merge commit to its parent.
+  AMD1_BASE_OVERRIDE: "ab2736d7de41160336e1cb20aea6ba61c34dd863"
+  AMD1_HEAD_OVERRIDE: "0867e72092028d3862c7e586c50df0624c9d58d1"
+  MERGED: "0"
+  # Set by scaffold.py --patch: base = PATCH_BASE, head = PATCH_BASE plus this diff (relative to the checkout).
+  PATCH_BASE: ""
+  PATCH_FILE: ""
+  PATCH_SHA256: "__PATCH_SHA256__"
+
+jobs:
+
+  gpu:
+    name: "PR 18633 GPU check (shared GPU)"
+    runs-on: [self-hosted, Linux, strix-halo, devlab-dispatch]
+    timeout-minutes: 180
+    # --shared-gpu: no concurrency group, so a co-tenant may share the card.
+    # Correctness only; capability.py reports `exclusive_gpu` as a gap.
+    env:
+      AMD_CI_SHARED_GPU: "1"
+    steps:
+      - uses: actions/checkout@v4
+        with: { persist-credentials: false }
+
+      - name: Preamble
+        run: |
+          source amd_ci/lib/preamble.sh "pr18633-gpu"
+
+      - name: Hardware gate
+        run: |
+          set -euo pipefail
+          python3 amd_ci/lib/gate.py --no-torch --require rocm gpu \
+            --expect-arch gfx1151 --min-gpus 1 \
+            --out "$AMD_CI_WORK/out/host.json" || \
+          echo "note: gate ran before the venv exists; re-gated after install below"
+
+      - name: Resolve states
+        run: |
+          set -euo pipefail
+          ARGS=""
+          [ "$MERGED" = "1" ] && ARGS="--merged"
+          if [ -n "$PATCH_FILE" ]; then ARGS="--patch-base $PATCH_BASE --patch $GITHUB_WORKSPACE/$PATCH_FILE --patch-sha256 $PATCH_SHA256"; fi
+          python3 amd_ci/lib/states.py --repo "$UPSTREAM" --pr "$PR" $ARGS \
+            --root "$AMD_CI_WORK" --out "$AMD_CI_WORK/out/states.json"
+
+      - name: Environment and host gate (no Studio)
+        run: |
+          set -euo pipefail
+          echo "AMD_CI_PY=$(command -v python3)" >> "$GITHUB_ENV"
+          # No torch here, so rocm/gpu read UNDETERMINED: the criteria gates prove the GPU ran.
+          python3 "$GITHUB_WORKSPACE/amd_ci/lib/gate.py" --no-torch --out "$AMD_CI_WORK/out/host.json"
+
+      - name: Differential
+        run: |
+          set +e
+          "$AMD_CI_PY" amd_ci/lib/differential.py \
+            --states "$AMD_CI_WORK/out/states.json" \
+            --probe amd_ci/probes/train5_probe.py \
+            --criteria amd_ci/criteria/train5_rocm.py \
+            --out-dir "$AMD_CI_WORK/out/gpu" \
+            --python "$AMD_CI_PY" -- --unit kr4u5b --state-repo unsloth --transformers 4.57.6 --trl 0.24.0 --cells env,ls_qwen3,lsh_qwen3 --companion-repo https://github.com/unslothai/unsloth-zoo --companion-base dea35cd77c744f5267bac15d13d55d40e436cd52 --companion-head dea35cd77c744f5267bac15d13d55d40e436cd52 --venv "$AMD_CI_WORK/tvenv" --tests tests/test_fused_label_smoothing_head.py tests/test_fused_label_smoothing_fallback.py tests/test_fused_label_smoothing.py --repeat ls_qwen3,lsh_qwen3 --tests-from-head tests/test_fused_label_smoothing_head.py tests/test_fused_label_smoothing_fallback.py
+          cat "$AMD_CI_WORK/out/gpu/VERDICT.md" >> "$GITHUB_STEP_SUMMARY"
+          # A finding keeps the job green; a NON-result (VOID / INCONCLUSIVE) does not.
+          python3 "$GITHUB_WORKSPACE/amd_ci/lib/announce.py" "$AMD_CI_WORK/out/gpu"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: pr18633-gpu
+          path: ${{ env.AMD_CI_WORK }}/out
+          retention-days: 7
+          if-no-files-found: warn
