@@ -1847,6 +1847,139 @@ def cluster_checks(root: Path, failures: list) -> None:
     guard("#84", c84)
 
 
+def nov21_checks(root: Path, failures: list) -> None:
+    """Controls for the 2026-11-21 decisions on scripts#876's open questions (each fails on the tree before them)."""
+    import parity as P
+    import plan as PL
+
+    def guard(name, fn):
+        try:
+            fn()
+        except Exception as exc:  # noqa: BLE001 - a crash on the old tree is that control failing
+            failures.append(f"{name}: {type(exc).__name__}: {str(exc)[:300]}")
+
+    sig = [1.0, 0.75, 0.4, 0.0]
+
+    def mk(stack, sampler, scheduler, sigmas, items):
+        return {"verdict": "ok", "tag": stack[0], "arm": {"stack": stack}, "parity": {
+            "resolved": {"steps": 3, "cfg": 1.0, "sampler": sampler, "scheduler": scheduler, "width": 64,
+                         "height": 64, "source": "x"},
+            "sigmas": sigmas, "denoiser_items": items, "denoiser_calls": items}}
+
+    # (1) an unstated Studio sampler / scheduler is covered by equal sigmas AND equal evaluation rows; a stated
+    # mismatch, a sigma mismatch, a pass mismatch, or a silent baseline still void
+    def c1():
+        res = P.check_pair(mk("studio", None, None, sig, 3), mk("blineui", "euler", "simple", list(sig), 3))
+        st = res["checks"]["settings"]
+        if st["status"] != "ok" or "covered" not in st["detail"]:
+            failures.append(f"open q1: unstated Studio sampler with equal sigmas + passes voided: {st}")
+        bad = P.check_pair(mk("studio", None, None, sig, 2), mk("blineui", "euler", "simple", list(sig), 3))
+        if bad["checks"]["settings"]["status"] != "mismatch":
+            failures.append(f"open q1 control: unstated sampler with unequal passes passed: {bad['checks']['settings']}")
+        bad = P.check_pair(mk("studio", None, None, sig, 3), mk("blineui", "euler", "simple", [1.0, 0.7, 0.4, 0.0], 3))
+        if bad["checks"]["settings"]["status"] != "mismatch":
+            failures.append("open q1 control: unstated sampler with different sigmas passed")
+        bad = P.check_pair(mk("studio", "dpmpp_2m", "simple", sig, 3), mk("blineui", "euler", "simple", list(sig), 3))
+        if bad["checks"]["settings"]["status"] != "mismatch":
+            failures.append("open q1 control: a stated, different Studio sampler passed")
+        bad = P.check_pair(mk("studio", "euler", "simple", sig, 3), mk("blineui", None, "simple", list(sig), 3))
+        if bad["checks"]["settings"]["status"] != "mismatch":
+            failures.append("open q1 control: an unstated baseline sampler was covered (only Studio's silence is)")
+        from backends.studio_inproc import scheduler_names
+        if scheduler_names("FlowMatchEulerDiscreteScheduler", {"FlowMatchEulerDiscreteScheduler": ["x", "y"]})[:2] \
+                != ("x", "y"):
+            failures.append("open q1: the card's studio.scheduler_map does not win over the generic table")
+    guard("open q1 sampler names", c1)
+
+    # (8) the planner's per-run overhead comes from the card's measured est_load_s, per GPU and stack
+    def c8():
+        card = {"family": "f", "kind": "image", "formats": {"int8": {"est_s_per_render": {"L4": 10.0},
+                "est_load_s": {"L4": {"studio": 30.0, "blineui": 90.0}}}}}
+        cell = {"variant": "int8", "warmup": 1, "n": 2, "short_n": 0, "options": {"arm": {"stack": "studio"}}}
+        if PL.est_cell_min(card, "colab:L4", cell) != round((30.0 + 3 * 10.0) / 60, 2):
+            failures.append(f"open q8: card est_load_s not used: {PL.est_cell_min(card, 'colab:L4', cell)}")
+        cell["options"]["arm"]["stack"] = "blineui"
+        if PL.load_s_estimate(card, "int8", "colab:A100-40", "blineui")[0] != 90.0:
+            failures.append("open q8: another GPU's measured load not used when the target has none")
+        if PL.load_s_estimate({"kind": "video", "formats": {}}, "x", "colab:L4", "studio")[0] != 240.0:
+            failures.append("open q8: the default for an unmeasured card changed")
+    guard("open q8 load time", c8)
+
+    # a request "frames" override runs a short clip on every arm of its own comparison id
+    def cframes():
+        cards = PL.load_cards(["wan2.2-5b"], None)
+        req = {"name": "x", "revisions": {"unsloth_sha": "a" * 40, "bline_ref": "v0"},
+               "models": [{"family": "wan2.2-5b", "frames": 41}],
+               "arms": [{"stack": "studio", "format": "fp16"}, {"stack": "blineui", "format": "fp16"}],
+               "targets": ["colab:A100-40"], "repeats": 3, "n": 1}
+        plan = PL.build_plan(req, cards)
+        cells = [c for c in plan["cells"] if c.get("family") == "wan2.2-5b"]
+        if not cells or any(c.get("frames") != 41 for c in cells) or \
+                not all("_f41" in (c["options"]["arm"]["comparison"]) for c in cells):
+            failures.append(f"frames override not applied to every arm: {[(c.get('tag'), c.get('frames')) for c in cells]}")
+    guard("frames override", cframes)
+
+    # a T4 Studio load reads the dense transformer: its prefetch keeps the weights other GPUs skip
+    def cdense():
+        import models as M
+        card = M.load_card("flux.3-klein")
+        l4 = PL.studio_prefetch(card, "int8", "colab:L4")
+        t4 = PL.studio_prefetch(card, "int8", "kaggle:T4x2")
+        snap = lambda pf: [e for e in pf.values() if e.get("file") is None]  # noqa: E731
+        if not snap(l4) or not all(e.get("ignore_patterns") for e in snap(l4)):
+            failures.append(f"dense_on: the L4 snapshot lost its ignore patterns: {l4}")
+        if not snap(t4) or any(e.get("ignore_patterns") for e in snap(t4)) or set(l4) == set(t4):
+            failures.append(f"dense_on: the T4 snapshot still skips the dense transformer: {t4}")
+    guard("dense_on T4 prefetch", cdense)
+
+    # card_timings: timed records only (no trial / probe / budget run), overhead = load + first-render excess
+    def ctimings():
+        import card_timings as CT
+        d = root / "nov21_timings"
+
+        def rec(tag, purpose, load, first, steady, budget=None):
+            r = {"verdict": "ok", "run_id": tag, "tag": tag, "timing": {"load_s": load, "first_render_s": first,
+                                                                         "steady_s_median": steady},
+                 "cell": {"card": "qwen-image-2.1", "options": {"target": {"name": "colab:L4",
+                                                                           "simulated_budget_gib": budget}}},
+                 "arm": {"stack": "studio", "format": "int8", "purpose": purpose}}
+            (d / tag).mkdir(parents = True, exist_ok = True)
+            (d / tag / "record.json").write_text(json.dumps(r))
+        rec("a", "timing", 60.0, 30.0, 10.0)
+        rec("b", "timing", 80.0, 10.0, 10.0)
+        rec("trial__x", "trial", 999.0, 1.0, 1.0)
+        rec("p", "parity", 999.0, 1.0, 1.0)
+        rec("bud", "timing", 999.0, 1.0, 1.0, budget = 8)
+        g = CT.gather([d])
+        vals = sorted(v for v, _ in g.get(("qwen-image-2.1", "int8", "L4", "studio"), {}).values())
+        if vals != [80.0, 80.0]:
+            failures.append(f"card_timings: expected two timed runs at 80 s overhead, got {vals} ({list(g)})")
+    guard("card_timings", ctimings)
+
+    # a precision difference the card accepts on some GPUs only (Studio's dense T4 text encoder) passes there and
+    # still voids on a bf16 card, where it means Studio's hosted encoder was missing
+    def cgpu():
+        import models as M
+        card = M.load_card("flux.3-klein")
+
+        def rec(stack, tname, te):
+            return {"verdict": "ok", "tag": stack, "arm": {"stack": stack, "format": "int8"},
+                    "cell": {"card": "flux.3-klein", "variant": "int8", "options": {"target": {"name": tname}}},
+                    "parity": {"precision": {"text_encoder": {"weights": te, "compute": te},
+                                             "transformer": {"weights": "int8_convrot" if stack == "blineui" else "int8",
+                                                             "compute": "int8"}}}}
+        for tname, want in (("colab:T4", None), ("colab:L4", "mismatch")):
+            a = rec("studio", tname, "float16")
+            b = rec("blineui", tname, "int8_convrot")
+            row, acc, obs = P.check_precision(a, b, card)
+            bad = [r for r in (row, obs) if r and r.get("status") == "mismatch"]
+            if want is None and (bad or not any(x["id"] == "t4_dense_text_encoder" for x in acc)):
+                failures.append(f"precision_on T4: Studio's dense T4 encoder voided or not reported: {row} {obs}")
+            if want == "mismatch" and not bad:
+                failures.append(f"precision_on control: a dense Studio encoder on L4 passed: {row} {obs} {acc}")
+    guard("gpu-scoped precision", cgpu)
+
+
 def main() -> int:
     t0 = time.time()
     import tempfile
@@ -1865,6 +1998,7 @@ def main() -> int:
     panel_checks(v2, failures)
     cluster_checks(v2, failures)
     shim_checks(v2, failures)
+    nov21_checks(v2, failures)
     kill_check(failures)
     for f in failures:
         print("FAIL:", f)

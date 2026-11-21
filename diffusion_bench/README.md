@@ -141,6 +141,7 @@ kills a hung cell at `--timeout`. `--set KEY=JSON` overrides spec defaults, dott
 | `plan.py` | request (cards x arms x targets) -> PLAN.json + cases.json: ABBA blocks, A/A pairs, parity probes, trial cell, lanes, NOT_RUN reasons from the card hints, CU estimate |
 | `parity.py` | parity gate per pair (settings, sigmas, passes, size, precision, noise, cache, card traps); `--plan PLAN --results DIR` gates a plan |
 | `report.py` | the one reporter: FASTER / SLOWER / TIE vs the A/A band, per-stack metrics, coverage, could-not-test |
+| `card_timings.py` | each card's measured per-run load overhead (`est_load_s` per GPU and stack) from real records; `--write` updates the cards the planner estimates from |
 | `models/` | one card per family: template defaults, formats (files, sources, precision, planning hints), traps; `BLINE_PIN.json` |
 | `builders/` | the card's baseline-UI file build steps (`build_file`, `run.py --card F --format X`) |
 | `targets/` | one adapter per target (`prepare` / `collect`), `vm_driver.py` (lanes, trial, gate, artifact), `fetch_files.py` |

@@ -61,6 +61,13 @@
       "file": null,
       "build": null,
       "note": "repo snapshot; Studio fetches its hosted prequant (unsloth/*-FP8, INT8 ConvRot) itself when the format asks for it"
+     },
+     "MOSS-Image-SFT-text_encoder-INT8-ConvRot.safetensors": {
+      "repo": "unsloth/MOSS-Image-SFT-FP8",
+      "file": "MOSS-Image-SFT-text_encoder-INT8-ConvRot.safetensors",
+      "build": null,
+      "sha256": "c07b3c0ab59233fb075344f1e3b57cbbe6d4585b96b58f71765bdc410d9de24f",
+      "note": "Studio's hosted encoder for this family (unsloth main 8b7cde79eb diffusion_te_prequant.py TE_INT8_CONVROT_FILES, published list): a Studio cell loads offline (local_files_only), so the VM prefetches it; without it Studio kept the dense bf16 encoder and the parity gate voided the pair (val_nov21 A100 trial: 'diffusion.te_prequant: int8:text_encoder:repo failed: Cannot find the requested files in the disk cache')"
      }
     }
    },
@@ -123,7 +130,17 @@
     "studio_refused": [
      "T4 (Studio killed while loading)"
     ]
-   }
+   },
+   "est_load_s": {
+    "A100-40": {
+     "blineui": 18.7,
+     "studio": 99.5
+    }
+   },
+   "est_load_basis": [
+    "A100-40 blineui: median of load_s + first-render excess over fresh-process timed runs in dbench_validation/r4",
+    "A100-40 studio: median of load_s + first-render excess over fresh-process timed runs in dbench_validation/r4"
+   ]
   },
   "bf16": {
    "studio": {
@@ -152,6 +169,13 @@
       "file": null,
       "build": null,
       "note": "repo snapshot; Studio fetches its hosted prequant (unsloth/*-FP8, INT8 ConvRot) itself when the format asks for it"
+     },
+     "MOSS-Image-SFT-text_encoder-INT8-ConvRot.safetensors": {
+      "repo": "unsloth/MOSS-Image-SFT-FP8",
+      "file": "MOSS-Image-SFT-text_encoder-INT8-ConvRot.safetensors",
+      "build": null,
+      "sha256": "c07b3c0ab59233fb075344f1e3b57cbbe6d4585b96b58f71765bdc410d9de24f",
+      "note": "Studio's hosted encoder for this family (unsloth main 8b7cde79eb diffusion_te_prequant.py TE_INT8_CONVROT_FILES, published list): a Studio cell loads offline (local_files_only), so the VM prefetches it; without it Studio kept the dense bf16 encoder and the parity gate voided the pair (val_nov21 A100 trial: 'diffusion.te_prequant: int8:text_encoder:repo failed: Cannot find the requested files in the disk cache')"
      }
     }
    },
@@ -240,6 +264,13 @@
       "file": null,
       "build": null,
       "note": "repo snapshot; Studio fetches its hosted prequant (unsloth/*-FP8, INT8 ConvRot) itself when the format asks for it"
+     },
+     "MOSS-Image-SFT-text_encoder-INT8-ConvRot.safetensors": {
+      "repo": "unsloth/MOSS-Image-SFT-FP8",
+      "file": "MOSS-Image-SFT-text_encoder-INT8-ConvRot.safetensors",
+      "build": null,
+      "sha256": "c07b3c0ab59233fb075344f1e3b57cbbe6d4585b96b58f71765bdc410d9de24f",
+      "note": "Studio's hosted encoder for this family (unsloth main 8b7cde79eb diffusion_te_prequant.py TE_INT8_CONVROT_FILES, published list): a Studio cell loads offline (local_files_only), so the VM prefetches it; without it Studio kept the dense bf16 encoder and the parity gate voided the pair (val_nov21 A100 trial: 'diffusion.te_prequant: int8:text_encoder:repo failed: Cannot find the requested files in the disk cache')"
      }
     }
    },

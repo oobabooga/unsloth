@@ -55,7 +55,20 @@
       "repo": "stabilityai/sdxl-turbo",
       "file": null,
       "build": null,
-      "note": "repo snapshot; Studio fetches its hosted prequant (unsloth/*-FP8, INT8 ConvRot) itself when the format asks for it"
+      "note": "diffusers-layout safetensors only (both the fp32 defaults and the .fp16 twins Studio picks for an fp16 load, 19.4 GiB): the whole repo is 52 GiB with the single-file, ONNX, Flax and OpenVINO copies, which the planner's disk guard skipped on the macOS runner (35 GiB free), so Studio's offline load found nothing (val_nov21 Mac trial)",
+      "ignore_patterns": [
+       "*.bin",
+       "*.onnx",
+       "*.onnx_data",
+       "*.msgpack",
+       "*.ckpt",
+       "sd_xl_turbo_1.0*.safetensors",
+       "*.png",
+       "*.jpg",
+       "*.pb",
+       "*openvino*",
+       "*.xml"
+      ]
      }
     }
    },
@@ -102,7 +115,17 @@
     "basis": "no measured round for this family and format",
     "cite": [],
     "studio_refused": []
-   }
+   },
+   "est_load_s": {
+    "T4": {
+     "blineui": 44.6,
+     "studio": 148.9
+    }
+   },
+   "est_load_basis": [
+    "T4 blineui: median of load_s + first-render excess over fresh-process timed runs in dbench_nov19, dbench_validation/t4b",
+    "T4 studio: median of load_s + first-render excess over fresh-process timed runs in dbench_nov19, dbench_validation/t4b"
+   ]
   }
  },
  "studio": {

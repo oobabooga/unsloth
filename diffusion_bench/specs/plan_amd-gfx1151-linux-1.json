@@ -17,6 +17,12 @@
     "transformer_quant": "none",
     "text_encoder_quant": "none",
     "generate": {},
+    "studio_scheduler_map": {
+     "FlowMatchEulerDiscreteScheduler": [
+      "euler",
+      "simple"
+     ]
+    },
     "speed_mode": "default",
     "target": {
      "name": "amd:gfx1151-linux",
@@ -36,7 +42,8 @@
      "purpose": "trial",
      "format": "bf16",
      "tier": "default"
-    }
+    },
+    "local_files_only": false
    },
    "env": {},
    "model": "Tongyi-MAI/Z-Image-Turbo",
@@ -63,6 +70,12 @@
     "transformer_quant": "none",
     "text_encoder_quant": "none",
     "generate": {},
+    "studio_scheduler_map": {
+     "FlowMatchEulerDiscreteScheduler": [
+      "euler",
+      "simple"
+     ]
+    },
     "speed_mode": "default",
     "target": {
      "name": "amd:gfx1151-linux",
@@ -74,8 +87,8 @@
     },
     "arm": {
      "stack": "studio",
-     "block": 1,
-     "order": "ABBA",
+     "block": 0,
+     "order": "parity",
      "aa_of": null,
      "label": "s_bf16",
      "comparison": "z-image-turbo_amd-gfx1151-linux",
@@ -83,7 +96,8 @@
      "format": "bf16",
      "tier": "default"
     },
-    "parity_probe": true
+    "parity_probe": true,
+    "local_files_only": false
    },
    "env": {},
    "model": "Tongyi-MAI/Z-Image-Turbo",
@@ -92,8 +106,63 @@
    "venv": {
     "profile": "studio"
    },
-   "short_n": 1,
-   "tag": "z-image-turbo_amd-gfx1151-linux__s_bf16__k1p0",
+   "short_n": 0,
+   "tag": "z-image-turbo_amd-gfx1151-linux__s_bf16__parity",
+   "family": "z-image-turbo"
+  },
+  {
+   "backend": "studio",
+   "kind": "image",
+   "width": 1024,
+   "height": 1024,
+   "steps": 7,
+   "guidance": 0.0,
+   "prompts": "image_24",
+   "n": 1,
+   "warmup": 1,
+   "options": {
+    "transformer_quant": "none",
+    "text_encoder_quant": "none",
+    "generate": {},
+    "studio_scheduler_map": {
+     "FlowMatchEulerDiscreteScheduler": [
+      "euler",
+      "simple"
+     ]
+    },
+    "speed_mode": "default",
+    "target": {
+     "name": "amd:gfx1151-linux",
+     "vm_id": "amd-gfx1151-linux-1",
+     "lane": null,
+     "account": null,
+     "simulated_budget_gib": null,
+     "concurrent_with": null
+    },
+    "arm": {
+     "stack": "studio",
+     "block": 0,
+     "order": "parity",
+     "aa_of": null,
+     "label": "s_bf16",
+     "comparison": "z-image-turbo_amd-gfx1151-linux",
+     "purpose": "parity",
+     "format": "bf16",
+     "tier": "default"
+    },
+    "parity_probe": true,
+    "local_files_only": false,
+    "negative_control": "steps 8 -> 7"
+   },
+   "env": {},
+   "model": "Tongyi-MAI/Z-Image-Turbo",
+   "variant": "bf16",
+   "card": "z-image-turbo",
+   "venv": {
+    "profile": "studio"
+   },
+   "short_n": 0,
+   "tag": "z-image-turbo_amd-gfx1151-linux__s_bf16__parity_negctl",
    "family": "z-image-turbo"
   },
   {
@@ -128,8 +197,8 @@
     },
     "arm": {
      "stack": "blineui",
-     "block": 1,
-     "order": "ABBA",
+     "block": 0,
+     "order": "parity",
      "aa_of": null,
      "label": "c_bf16",
      "comparison": "z-image-turbo_amd-gfx1151-linux",
@@ -143,15 +212,423 @@
    "variant": "bf16",
    "card": "z-image-turbo",
    "venv": "bench",
-   "short_n": 1,
+   "short_n": 0,
+   "tag": "z-image-turbo_amd-gfx1151-linux__c_bf16__parity",
+   "family": "z-image-turbo"
+  },
+  {
+   "backend": "studio",
+   "kind": "image",
+   "width": 1024,
+   "height": 1024,
+   "steps": 8,
+   "guidance": 0.0,
+   "prompts": "image_24",
+   "n": 2,
+   "warmup": 1,
+   "options": {
+    "transformer_quant": "none",
+    "text_encoder_quant": "none",
+    "generate": {},
+    "studio_scheduler_map": {
+     "FlowMatchEulerDiscreteScheduler": [
+      "euler",
+      "simple"
+     ]
+    },
+    "speed_mode": "default",
+    "target": {
+     "name": "amd:gfx1151-linux",
+     "vm_id": "amd-gfx1151-linux-1",
+     "lane": null,
+     "account": null,
+     "simulated_budget_gib": null,
+     "concurrent_with": null
+    },
+    "arm": {
+     "stack": "studio",
+     "block": 1,
+     "order": "ABBA",
+     "aa_of": null,
+     "label": "s_bf16",
+     "comparison": "z-image-turbo_amd-gfx1151-linux",
+     "purpose": "timing",
+     "format": "bf16",
+     "tier": "default"
+    }
+   },
+   "env": {},
+   "model": "Tongyi-MAI/Z-Image-Turbo",
+   "variant": "bf16",
+   "card": "z-image-turbo",
+   "venv": {
+    "profile": "studio"
+   },
+   "short_n": 0,
+   "tag": "z-image-turbo_amd-gfx1151-linux__s_bf16__k1p0",
+   "family": "z-image-turbo"
+  },
+  {
+   "backend": "blineui",
+   "kind": "image",
+   "width": 1024,
+   "height": 1024,
+   "steps": 8,
+   "guidance": 1.0,
+   "prompts": "image_24",
+   "n": 2,
+   "warmup": 1,
+   "options": {
+    "family": "z-image",
+    "files": {
+     "dit": "z_image_turbo_bf16.safetensors",
+     "te": "qwen_3_4b.safetensors",
+     "vae": "ae.safetensors"
+    },
+    "sampler": "res_multistep",
+    "scheduler": "simple",
+    "shift": 3.0,
+    "cache_bust": "sampler",
+    "template": "image_z_image_turbo.json",
+    "target": {
+     "name": "amd:gfx1151-linux",
+     "vm_id": "amd-gfx1151-linux-1",
+     "lane": null,
+     "account": null,
+     "simulated_budget_gib": null,
+     "concurrent_with": null
+    },
+    "arm": {
+     "stack": "blineui",
+     "block": 1,
+     "order": "ABBA",
+     "aa_of": null,
+     "label": "c_bf16",
+     "comparison": "z-image-turbo_amd-gfx1151-linux",
+     "purpose": "timing",
+     "format": "bf16",
+     "tier": null
+    }
+   },
+   "env": {},
+   "variant": "bf16",
+   "card": "z-image-turbo",
+   "venv": "bench",
+   "short_n": 0,
    "tag": "z-image-turbo_amd-gfx1151-linux__c_bf16__k1p1",
+   "family": "z-image-turbo"
+  },
+  {
+   "backend": "blineui",
+   "kind": "image",
+   "width": 1024,
+   "height": 1024,
+   "steps": 8,
+   "guidance": 1.0,
+   "prompts": "image_24",
+   "n": 2,
+   "warmup": 1,
+   "options": {
+    "family": "z-image",
+    "files": {
+     "dit": "z_image_turbo_bf16.safetensors",
+     "te": "qwen_3_4b.safetensors",
+     "vae": "ae.safetensors"
+    },
+    "sampler": "res_multistep",
+    "scheduler": "simple",
+    "shift": 3.0,
+    "cache_bust": "sampler",
+    "template": "image_z_image_turbo.json",
+    "target": {
+     "name": "amd:gfx1151-linux",
+     "vm_id": "amd-gfx1151-linux-1",
+     "lane": null,
+     "account": null,
+     "simulated_budget_gib": null,
+     "concurrent_with": null
+    },
+    "arm": {
+     "stack": "blineui",
+     "block": 1,
+     "order": "ABBA",
+     "aa_of": "z-image-turbo_amd-gfx1151-linux__c_bf16__k1p1",
+     "label": "c_bf16",
+     "comparison": "z-image-turbo_amd-gfx1151-linux",
+     "purpose": "timing",
+     "format": "bf16",
+     "tier": null
+    }
+   },
+   "env": {},
+   "variant": "bf16",
+   "card": "z-image-turbo",
+   "venv": "bench",
+   "short_n": 0,
+   "tag": "z-image-turbo_amd-gfx1151-linux__c_bf16__k1p2",
+   "family": "z-image-turbo"
+  },
+  {
+   "backend": "studio",
+   "kind": "image",
+   "width": 1024,
+   "height": 1024,
+   "steps": 8,
+   "guidance": 0.0,
+   "prompts": "image_24",
+   "n": 2,
+   "warmup": 1,
+   "options": {
+    "transformer_quant": "none",
+    "text_encoder_quant": "none",
+    "generate": {},
+    "studio_scheduler_map": {
+     "FlowMatchEulerDiscreteScheduler": [
+      "euler",
+      "simple"
+     ]
+    },
+    "speed_mode": "default",
+    "target": {
+     "name": "amd:gfx1151-linux",
+     "vm_id": "amd-gfx1151-linux-1",
+     "lane": null,
+     "account": null,
+     "simulated_budget_gib": null,
+     "concurrent_with": null
+    },
+    "arm": {
+     "stack": "studio",
+     "block": 1,
+     "order": "ABBA",
+     "aa_of": "z-image-turbo_amd-gfx1151-linux__s_bf16__k1p0",
+     "label": "s_bf16",
+     "comparison": "z-image-turbo_amd-gfx1151-linux",
+     "purpose": "timing",
+     "format": "bf16",
+     "tier": "default"
+    }
+   },
+   "env": {},
+   "model": "Tongyi-MAI/Z-Image-Turbo",
+   "variant": "bf16",
+   "card": "z-image-turbo",
+   "venv": {
+    "profile": "studio"
+   },
+   "short_n": 0,
+   "tag": "z-image-turbo_amd-gfx1151-linux__s_bf16__k1p3",
+   "family": "z-image-turbo"
+  },
+  {
+   "backend": "studio",
+   "kind": "image",
+   "width": 1024,
+   "height": 1024,
+   "steps": 8,
+   "guidance": 0.0,
+   "prompts": "image_24",
+   "n": 2,
+   "warmup": 1,
+   "options": {
+    "transformer_quant": "none",
+    "text_encoder_quant": "none",
+    "generate": {},
+    "studio_scheduler_map": {
+     "FlowMatchEulerDiscreteScheduler": [
+      "euler",
+      "simple"
+     ]
+    },
+    "speed_mode": "default",
+    "target": {
+     "name": "amd:gfx1151-linux",
+     "vm_id": "amd-gfx1151-linux-1",
+     "lane": null,
+     "account": null,
+     "simulated_budget_gib": null,
+     "concurrent_with": null
+    },
+    "arm": {
+     "stack": "studio",
+     "block": 2,
+     "order": "ABBA",
+     "aa_of": null,
+     "label": "s_bf16",
+     "comparison": "z-image-turbo_amd-gfx1151-linux",
+     "purpose": "timing",
+     "format": "bf16",
+     "tier": "default"
+    }
+   },
+   "env": {},
+   "model": "Tongyi-MAI/Z-Image-Turbo",
+   "variant": "bf16",
+   "card": "z-image-turbo",
+   "venv": {
+    "profile": "studio"
+   },
+   "short_n": 0,
+   "tag": "z-image-turbo_amd-gfx1151-linux__s_bf16__k2p0",
+   "family": "z-image-turbo"
+  },
+  {
+   "backend": "blineui",
+   "kind": "image",
+   "width": 1024,
+   "height": 1024,
+   "steps": 8,
+   "guidance": 1.0,
+   "prompts": "image_24",
+   "n": 2,
+   "warmup": 1,
+   "options": {
+    "family": "z-image",
+    "files": {
+     "dit": "z_image_turbo_bf16.safetensors",
+     "te": "qwen_3_4b.safetensors",
+     "vae": "ae.safetensors"
+    },
+    "sampler": "res_multistep",
+    "scheduler": "simple",
+    "shift": 3.0,
+    "cache_bust": "sampler",
+    "template": "image_z_image_turbo.json",
+    "target": {
+     "name": "amd:gfx1151-linux",
+     "vm_id": "amd-gfx1151-linux-1",
+     "lane": null,
+     "account": null,
+     "simulated_budget_gib": null,
+     "concurrent_with": null
+    },
+    "arm": {
+     "stack": "blineui",
+     "block": 2,
+     "order": "ABBA",
+     "aa_of": null,
+     "label": "c_bf16",
+     "comparison": "z-image-turbo_amd-gfx1151-linux",
+     "purpose": "timing",
+     "format": "bf16",
+     "tier": null
+    }
+   },
+   "env": {},
+   "variant": "bf16",
+   "card": "z-image-turbo",
+   "venv": "bench",
+   "short_n": 0,
+   "tag": "z-image-turbo_amd-gfx1151-linux__c_bf16__k2p1",
+   "family": "z-image-turbo"
+  },
+  {
+   "backend": "blineui",
+   "kind": "image",
+   "width": 1024,
+   "height": 1024,
+   "steps": 8,
+   "guidance": 1.0,
+   "prompts": "image_24",
+   "n": 2,
+   "warmup": 1,
+   "options": {
+    "family": "z-image",
+    "files": {
+     "dit": "z_image_turbo_bf16.safetensors",
+     "te": "qwen_3_4b.safetensors",
+     "vae": "ae.safetensors"
+    },
+    "sampler": "res_multistep",
+    "scheduler": "simple",
+    "shift": 3.0,
+    "cache_bust": "sampler",
+    "template": "image_z_image_turbo.json",
+    "target": {
+     "name": "amd:gfx1151-linux",
+     "vm_id": "amd-gfx1151-linux-1",
+     "lane": null,
+     "account": null,
+     "simulated_budget_gib": null,
+     "concurrent_with": null
+    },
+    "arm": {
+     "stack": "blineui",
+     "block": 2,
+     "order": "ABBA",
+     "aa_of": "z-image-turbo_amd-gfx1151-linux__c_bf16__k2p1",
+     "label": "c_bf16",
+     "comparison": "z-image-turbo_amd-gfx1151-linux",
+     "purpose": "timing",
+     "format": "bf16",
+     "tier": null
+    }
+   },
+   "env": {},
+   "variant": "bf16",
+   "card": "z-image-turbo",
+   "venv": "bench",
+   "short_n": 0,
+   "tag": "z-image-turbo_amd-gfx1151-linux__c_bf16__k2p2",
+   "family": "z-image-turbo"
+  },
+  {
+   "backend": "studio",
+   "kind": "image",
+   "width": 1024,
+   "height": 1024,
+   "steps": 8,
+   "guidance": 0.0,
+   "prompts": "image_24",
+   "n": 2,
+   "warmup": 1,
+   "options": {
+    "transformer_quant": "none",
+    "text_encoder_quant": "none",
+    "generate": {},
+    "studio_scheduler_map": {
+     "FlowMatchEulerDiscreteScheduler": [
+      "euler",
+      "simple"
+     ]
+    },
+    "speed_mode": "default",
+    "target": {
+     "name": "amd:gfx1151-linux",
+     "vm_id": "amd-gfx1151-linux-1",
+     "lane": null,
+     "account": null,
+     "simulated_budget_gib": null,
+     "concurrent_with": null
+    },
+    "arm": {
+     "stack": "studio",
+     "block": 2,
+     "order": "ABBA",
+     "aa_of": "z-image-turbo_amd-gfx1151-linux__s_bf16__k2p0",
+     "label": "s_bf16",
+     "comparison": "z-image-turbo_amd-gfx1151-linux",
+     "purpose": "timing",
+     "format": "bf16",
+     "tier": "default"
+    }
+   },
+   "env": {},
+   "model": "Tongyi-MAI/Z-Image-Turbo",
+   "variant": "bf16",
+   "card": "z-image-turbo",
+   "venv": {
+    "profile": "studio"
+   },
+   "short_n": 0,
+   "tag": "z-image-turbo_amd-gfx1151-linux__s_bf16__k2p3",
    "family": "z-image-turbo"
   }
  ],
  "plan_vm": {
   "vm_id": "amd-gfx1151-linux-1",
   "target": "amd:gfx1151-linux",
-  "purpose": "parity"
+  "purpose": "timing"
  },
  "downloads": {
   "z_image_turbo_bf16.safetensors": {
@@ -185,36 +662,79 @@
    "family": "z-image-turbo",
    "target": "amd:gfx1151-linux",
    "budget_gib": null,
-   "purpose": "parity",
+   "purpose": "timing",
    "arms": [
     "s_bf16",
     "c_bf16"
    ],
    "runs": {
     "s_bf16": [
-     "z-image-turbo_amd-gfx1151-linux__s_bf16__k1p0"
+     "z-image-turbo_amd-gfx1151-linux__s_bf16__k1p0",
+     "z-image-turbo_amd-gfx1151-linux__s_bf16__k1p3",
+     "z-image-turbo_amd-gfx1151-linux__s_bf16__k2p0",
+     "z-image-turbo_amd-gfx1151-linux__s_bf16__k2p3"
     ],
     "c_bf16": [
-     "z-image-turbo_amd-gfx1151-linux__c_bf16__k1p1"
+     "z-image-turbo_amd-gfx1151-linux__c_bf16__k1p1",
+     "z-image-turbo_amd-gfx1151-linux__c_bf16__k1p2",
+     "z-image-turbo_amd-gfx1151-linux__c_bf16__k2p1",
+     "z-image-turbo_amd-gfx1151-linux__c_bf16__k2p2"
     ]
    },
    "order": [
     "z-image-turbo_amd-gfx1151-linux__s_bf16__k1p0",
-    "z-image-turbo_amd-gfx1151-linux__c_bf16__k1p1"
+    "z-image-turbo_amd-gfx1151-linux__c_bf16__k1p1",
+    "z-image-turbo_amd-gfx1151-linux__c_bf16__k1p2",
+    "z-image-turbo_amd-gfx1151-linux__s_bf16__k1p3",
+    "z-image-turbo_amd-gfx1151-linux__s_bf16__k2p0",
+    "z-image-turbo_amd-gfx1151-linux__c_bf16__k2p1",
+    "z-image-turbo_amd-gfx1151-linux__c_bf16__k2p2",
+    "z-image-turbo_amd-gfx1151-linux__s_bf16__k2p3"
    ],
-   "aa_pairs": [],
+   "aa_pairs": [
+    [
+     "z-image-turbo_amd-gfx1151-linux__c_bf16__k1p1",
+     "z-image-turbo_amd-gfx1151-linux__c_bf16__k1p2"
+    ],
+    [
+     "z-image-turbo_amd-gfx1151-linux__s_bf16__k1p0",
+     "z-image-turbo_amd-gfx1151-linux__s_bf16__k1p3"
+    ],
+    [
+     "z-image-turbo_amd-gfx1151-linux__c_bf16__k2p1",
+     "z-image-turbo_amd-gfx1151-linux__c_bf16__k2p2"
+    ],
+    [
+     "z-image-turbo_amd-gfx1151-linux__s_bf16__k2p0",
+     "z-image-turbo_amd-gfx1151-linux__s_bf16__k2p3"
+    ]
+   ],
    "valid_if": "same vm_id and lane; SM clocks within 3% between the paired runs",
-   "est_min": 6.6,
+   "est_min": 32.0,
    "prefetch": [
     "Tongyi-MAI/Z-Image-Turbo:*"
+   ],
+   "parity_order": [
+    "z-image-turbo_amd-gfx1151-linux__s_bf16__parity",
+    "z-image-turbo_amd-gfx1151-linux__s_bf16__parity_negctl",
+    "z-image-turbo_amd-gfx1151-linux__c_bf16__parity"
    ],
    "parity_pairs": [
     {
      "format": "bf16",
-     "a": "z-image-turbo_amd-gfx1151-linux__s_bf16__k1p0",
-     "b": "z-image-turbo_amd-gfx1151-linux__c_bf16__k1p1",
+     "a": "z-image-turbo_amd-gfx1151-linux__s_bf16__parity",
+     "b": "z-image-turbo_amd-gfx1151-linux__c_bf16__parity",
      "quality": false,
      "waive": []
+    },
+    {
+     "format": "bf16",
+     "a": "z-image-turbo_amd-gfx1151-linux__s_bf16__parity_negctl",
+     "b": "z-image-turbo_amd-gfx1151-linux__c_bf16__parity",
+     "quality": false,
+     "waive": [],
+     "expect": "VOID",
+     "negative_control": "steps 8 -> 7"
     }
    ],
    "vm_id": "amd-gfx1151-linux-1",

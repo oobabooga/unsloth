@@ -230,6 +230,17 @@ def test_sources_and_planning():
         g = M.load_card(fam)["formats"]["gguf"]
         assert g["bline"]["files"]["dit"] == dit and g["bline"]["sources"][dit]["repo"].startswith("unsloth/"), fam
         assert not str(g["studio"].get("gguf_filename", "")).startswith("<"), fam
+        # the base the GGUF transformer is assembled with is prefetched (offline load), its dense transformer not
+        base = [e for e in g["studio"]["sources"].values() if e.get("file") is None]
+        assert base and all("transformer/*.safetensors" in (e.get("ignore_patterns") or []) for e in base), fam
+    # a Studio cell loads offline: every format whose Studio encoder is a hosted int8 ConvRot / fp8 file lists that
+    # file, so the VM prefetches it (val_nov21 A100 trial: without it Studio kept bf16 and the gate voided the pair)
+    for fam in ("flux.3-klein", "flux.3-klein-base", "qwen-image-2.1", "wan2.2-5b"):
+        for fmt, f in M.load_card(fam)["formats"].items():
+            w = ((f["studio"].get("precision") or {}).get("text_encoder") or {}).get("weights")
+            if w in ("int8_convrot", "fp8"):
+                files = [e.get("file") or "" for e in f["studio"]["sources"].values()]
+                assert any("text_encoder-" in x for x in files), (fam, fmt, files)
     # H3: Studio's audio VAE dtype is traced (no waiver needed), and the card names its standing format and why
     h = M.load_card("minimax-h3")
     assert all(f["studio"]["precision"]["audio_vae"]["weights"] == "fp32" for f in h["formats"].values())

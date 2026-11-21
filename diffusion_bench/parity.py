@@ -7,8 +7,10 @@ name, and waivers are printed in every report):
   settings     resolved steps / cfg / sampler / scheduler / shift / width / height / frames equal (numbers 1e-6);
                a card sampler_differs trap (accepted_difference, purposes ["timing"]) lists a sampler / scheduler
                difference on a TIMING pair instead of voiding it (and a same-length sigma difference with an
-               accepted scheduler); a quality pair stays strict
-  sigmas       the dumped sigma schedules have the same length and agree to 1e-6 (the H3 19-vs-20 pass bug)
+               accepted scheduler); a quality pair stays strict. A sampler / scheduler Studio does not state
+               (HTTP cells see no scheduler class) is covered when the dumped sigmas AND the evaluation rows are
+               equal on both stacks (named in the row); a stated, different name still voids
+  sigmas      the dumped sigma schedules have the same length and agree to 1e-6 (the H3 19-vs-20 pass bug)
   passes       denoiser evaluations equal (batch items: CFG batched or not costs the same work), and each stack's
                model calls equal the model card's ``expected_passes`` when the card states it
   size         output width / height / frames as rendered equal on both and equal to the resolved settings
@@ -208,6 +210,12 @@ def check_pair(a: dict, b: dict, card: Optional[dict] = None, quality: bool = Fa
     tol = max(SIGMA_TOL, float(tol_trap["sigma_tol"])) if tol_trap else SIGMA_TOL
     sigmas_equal = bool(ss_a and ss_b and len(ss_a) == len(ss_b) and all(len(x) == len(y) for x, y in zip(ss_a, ss_b))
                         and max(sigma_delta(x, y) for st_a, st_b in zip(ss_a, ss_b) for x, y in zip(st_a, st_b)) <= tol)
+    # an unstated Studio sampler / scheduler (HTTP cells see no scheduler class; some pipelines keep a family's own
+    # sampler) is covered by the work it did: equal dumped sigmas AND equal denoiser evaluation rows on both sides.
+    # A stated, different name still voids (unless the card accepts it for timing)
+    ia0, ib0 = pa.get("denoiser_items"), pb.get("denoiser_items")
+    passes_equal = ia0 is not None and ib0 is not None and ia0 == ib0
+    covered: list = []
     if ra and rb and not from_cell:
         mapped = cfg_mapped(a, b, ra, rb, card)
         diff, took = [], []
@@ -215,7 +223,16 @@ def check_pair(a: dict, b: dict, card: Optional[dict] = None, quality: bool = Fa
             if (ra.get(k) is None and rb.get(k) is None) or same_value(ra.get(k), rb.get(k)) or \
                     (k == "cfg" and mapped):
                 continue
-            if k in ("shift", "scheduler") and (ra.get(k) is None) != (rb.get(k) is None) and sigmas_equal:
+            one_unstated = (ra.get(k) is None) != (rb.get(k) is None)
+            if k in ("sampler", "scheduler") and one_unstated and sigmas_equal and passes_equal:
+                silent = la if ra.get(k) is None else lb
+                rec_silent = a if ra.get(k) is None else b
+                if (rec_silent.get("arm") or {}).get("stack", silent) == "studio":
+                    other = rb.get(k) if ra.get(k) is None else ra.get(k)
+                    covered.append(f"{k} unstated by studio (other {other!r}): covered by equal sigmas and "
+                                   f"{ia0} evaluation rows on both")
+                    continue
+            if k in ("shift", "scheduler") and one_unstated and sigmas_equal:
                 continue
             line = f"{k}: {la}={ra.get(k)!r} {lb}={rb.get(k)!r}"
             if k in acc_settings and ra.get(k) is not None and rb.get(k) is not None:
@@ -225,7 +242,8 @@ def check_pair(a: dict, b: dict, card: Optional[dict] = None, quality: bool = Fa
             else:
                 diff.append(line)
         checks["settings"] = _row(not diff, "; ".join(diff) or ("equal" + (f" ({mapped})" if mapped else "")
-                                                                + (f" (accepted for timing: {took})" if took else "")),
+                                                                + (f" (accepted for timing: {took})" if took else "")
+                                                                + (f" ({'; '.join(covered)})" if covered else "")),
                                   "settings" in waive)
     else:
         took = []
@@ -477,23 +495,46 @@ def side_precision(rec: dict, card: Optional[dict]) -> tuple:
     fmt = group_of(rec)["variant"]
     side = CARD_SIDE.get(stack or "")
     fentry = ((card or {}).get("formats") or {}).get(fmt) or {}
-    declared = ((fentry.get(side) or {}) if side else {}).get("precision")
+    sblock = (fentry.get(side) or {}) if side else {}
+    declared = sblock.get("precision")
     if isinstance(declared, dict) and declared:
         out = {c: {"weights": v.get("weights"), "compute": v.get("compute")} for c, v in declared.items()
                 if isinstance(v, dict)}
+        # ``precision_on.<GPU>``: what this stack runs on that GPU when it differs (Studio keeps its dense text
+        # encoder on a T4, and an fp16-only card has no bf16 VAE); read from Studio's own load log, card-cited
+        gpu = gpu_key(rec)
+        over = ((sblock.get("precision_on") or {}).get(gpu) or {}) if gpu else {}
+        for c, v in over.items():
+            if isinstance(v, dict):
+                out[c] = {"weights": v.get("weights"), "compute": v.get("compute")}
         # a component the card leaves unknown (weights null: never confirmed) takes the backend's STRONG report
         # of what it loaded (Studio's H3 audio VAE: the module's own parameter dtype)
         obs = _observed(rec)
         filled = [c for c, v in out.items() if v["weights"] is None and (obs.get(c) or {}).get("strong")]
         for c in filled:
             out[c] = {"weights": obs[c]["weights"], "compute": obs[c]["compute"]}
-        return out, f"card {fmt}.{side}" + (f" + backend report ({', '.join(filled)})" if filled else "")
+        return out, (f"card {fmt}.{side}" + (f" (precision_on {gpu}: {sorted(over)})" if over else "")
+                     + (f" + backend report ({', '.join(filled)})" if filled else ""))
     obs = _observed(rec)
     return {c: {"weights": v["weights"], "compute": v["compute"] if v["strong"] else None} for c, v in obs.items()}, \
         "backend report"
 
 
-def accepted_for(card: Optional[dict], fmt: str) -> dict:
+def gpu_key(rec: dict) -> Optional[str]:
+    """The record's target GPU key (plan.est_key: T4 / L4 / A100-40 / G4), None when unknown."""
+    tgt = rec.get("target") if isinstance(rec.get("target"), dict) else {}
+    tname = (((rec.get("cell") or {}).get("options") or {}).get("target") or {}).get("name") or tgt.get("name")
+    if not tname:
+        return None
+    try:
+        import plan as _plan  # noqa: PLC0415
+
+        return _plan.est_key(tname)
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def accepted_for(card: Optional[dict], fmt: str, gpu: Optional[str] = None) -> dict:
     """component -> [trap] of the card's accepted precision differences for this format (models.accepted_differences:
     traps with ``accepted_difference: true`` whose ``formats`` hold ``fmt``)."""
     out: dict = {}
@@ -508,6 +549,8 @@ def accepted_for(card: Optional[dict], fmt: str) -> dict:
     for t in traps:
         if gate_check_name(t.get("check")) not in (None, "precision"):
             continue
+        if t.get("gpus") and gpu not in t["gpus"]:
+            continue  # a difference the card accepts only on some GPUs (Studio's dense T4 text encoder)
         for comp in t.get("components") or []:
             out.setdefault(comp, []).append(t)
     return out
@@ -521,7 +564,8 @@ def check_precision(a: dict, b: dict, card: Optional[dict], waive: tuple = ()) -
     qa, src_a = side_precision(a, card)
     qb, src_b = side_precision(b, card)
     fmt = group_of(a)["variant"]
-    acc_map = accepted_for(card, fmt)
+    gpus = {gpu_key(a), gpu_key(b)}
+    acc_map = accepted_for(card, fmt, next(iter(gpus)) if len(gpus) == 1 else None)
     comps = sorted(set(qa) | set(qb))
     if not comps:
         return _row(None, "component precision missing on both", "precision" in waive), [], None

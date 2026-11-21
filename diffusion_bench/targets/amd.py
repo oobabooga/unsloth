@@ -46,7 +46,16 @@ def prepare(plan: dict, out_dir, plan_path: str | None = None, pr: int | None = 
         r = subprocess.run(cmd, capture_output = True, text = True)
         if r.returncode != 0:
             raise SystemExit(f"scaffold_diffusion failed for {vm['vm_id']}:\n{r.stdout[-3000:]}\n{r.stderr[-3000:]}")
+        import re  # noqa: PLC0415
+
+        m = re.search(r"refs/heads/(\S+)", r.stdout)
+        branch = m.group(1) if m else None
         made[vm["vm_id"]] = {"dir": str(dest), "workflow": [str(p) for p in (dest / ".github" / "workflows").glob("*.yml")],
+                             "branch": branch,
+                             # the workflow triggers on THIS branch only: a push to any other name starts no run and,
+                             # through the host queue, holds the exclusive slot until the queue expires it
+                             "queue": (f"python amd_ci/push_queue.py submit --dir {dest} --branch {branch}"
+                                       if branch else None),
                              "next": r.stdout[r.stdout.find("next ("):][:1200]}
     meta = {"kind": "amd", "vms": list(made), "scaffolds": made, "skipped": skipped,
             "note": "push is manual (the push triggers the run); read VERDICT.md, not the tick"}

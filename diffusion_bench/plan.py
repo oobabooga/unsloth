@@ -8,7 +8,8 @@ REQUEST.json:
   {
     "name": "validation_r1",
     "revisions": {"unsloth_sha": "<40 hex>", "bline_ref": "v0.45.4"},     # required for remote targets
-    "models": ["qwen-image-2.1", {"family": "flux3-klein", "formats": ["int8"], "n": 3}],
+    "models": ["qwen-image-2.1", {"family": "flux3-klein", "formats": ["int8"], "n": 3},
+               {"family": "wan2.2-5b", "frames": 41}],                     # frames: a short clip on every arm
     "arms": [{"stack": "studio", "format": "int8", "tier": "default"},
              {"stack": "blineui", "format": "int8"},
              {"stack": "studio", "format": "int8", "budget_gib": 12}],     # budget arms pair with same-budget arms
@@ -151,21 +152,26 @@ def file_sources(card: dict, fmt: str, stack: str = "blineui") -> tuple:
     return out, missing
 
 
-def studio_prefetch(card: dict, fmt: str) -> dict:
+def studio_prefetch(card: dict, fmt: str, tname: str | None = None) -> dict:
     """{repo: {"repo", "file"}} Studio loads for a format (``formats.<fmt>.studio.sources``): fetched into the VM's
-    HF cache before the cells, since a Studio cell runs with local_files_only (a timed load never downloads)."""
+    HF cache before the cells, since a Studio cell runs with local_files_only (a timed load never downloads).
+    An entry's ``dense_on`` (GPU keys) drops its ``ignore_patterns`` on those GPUs: Studio reads the dense weights
+    there (a T4 builds FLUX.3 klein's INT8 from the dense transformer, and the offline load failed on the missing
+    shards, val_nov21 T4 trial); the key then carries ":dense" so another target's entry is not overwritten."""
     srcs = (((card.get("formats") or {}).get(fmt) or {}).get("studio") or {}).get("sources") or {}
+    gpu = est_key(tname) if tname else None
     out = {}
     for key, e in srcs.items():
         if not isinstance(e, dict) or not e.get("repo") or str(e.get("repo")).startswith("<"):
             continue
         f = e.get("file")
         ent = {"repo": e["repo"], "file": None if (not f or str(f).startswith("<")) else f}
-        if not ent["file"] and e.get("ignore_patterns"):
+        dense = bool(gpu and gpu in (e.get("dense_on") or []))
+        if not ent["file"] and e.get("ignore_patterns") and not dense:
             # weights the format never loads (the dense transformer an int8 format replaces with Studio's hosted
             # file): a whole Qwen-Image-2.1 snapshot was 28 files, tens of GB, for an arm that read none of them
             ent["ignore_patterns"] = list(e["ignore_patterns"])
-        out[f"{e['repo']}:{f or '*'}"] = ent
+        out[f"{e['repo']}:{f or '*'}" + (":dense" if dense and e.get("ignore_patterns") else "")] = ent
     return out
 
 
@@ -221,6 +227,8 @@ def card_to_cell(card: dict, arm: dict, n: int, warmup: int) -> dict:
         cell["options"] = {**load, **fst, "generate": gen}
         if st.get("default_sampler"):  # what Studio's resident recipe runs when the record says "default"
             cell["options"]["studio_default_sampler"] = st["default_sampler"]
+        if st.get("scheduler_map"):  # the baseline's names for this family's resident scheduler classes
+            cell["options"]["studio_scheduler_map"] = st["scheduler_map"]
         if arm.get("tier"):
             cell["options"]["speed_mode"] = arm["tier"]
     elif stack in ("blineui", "sdcpp"):
@@ -411,9 +419,29 @@ def render_s_estimate(card: dict, fmt: str | None, tname: str) -> tuple:
     return (150.0 if video else 12.0) * SPEED_VS_L4.get(tname, 1.0), "default"
 
 
+def load_s_estimate(card: dict, fmt: str | None, tname: str, stack: str | None) -> tuple:
+    """(s of per-run overhead beyond the steady renders, basis) from the card's ``formats.<fmt>.est_load_s``
+    ({GPU key: {stack: s}}, measured by card_timings.py from real records: load + the first render's excess over a
+    steady one, i.e. compile and warm-up): the target's GPU and the cell's stack, else that stack on any measured GPU
+    (load is mostly disk and host work), else a 120 s image / 240 s video default."""
+    est = (((card.get("formats") or {}).get(fmt) or {}).get("est_load_s") or {}) if fmt else {}
+    key = est_key(tname)
+    st = "blineui" if stack in ("blineui", "bline") else stack
+    if key and isinstance(est.get(key), dict) and est[key].get(st) is not None:
+        return float(est[key][st]), f"card {fmt} {key} {st}"
+    other = [float(v[st]) for k, v in sorted(est.items()) if isinstance(v, dict) and v.get(st) is not None]
+    if other:
+        return max(other), f"card {fmt} {st} (largest measured GPU)"
+    return (240.0 if card.get("kind") == "video" else 120.0), "default"
+
+
 def est_cell_min(card: dict, tname: str, cell: dict) -> float:
     render_s, _ = render_s_estimate(card, cell.get("variant"), tname)
-    load_s = 240.0 if card.get("kind") == "video" else 120.0  # cards carry no load time (A's cited tables do)
+    d_frames = (card.get("defaults") or {}).get("frames")
+    if card.get("kind") == "video" and d_frames and cell.get("frames") and int(cell["frames"]) != int(d_frames):
+        render_s *= float(cell["frames"]) / float(d_frames)  # a request "frames" override: work ~ frames
+    stack = ((cell.get("options") or {}).get("arm") or {}).get("stack") or cell.get("backend")
+    load_s, _ = load_s_estimate(card, cell.get("variant"), tname, stack)
     renders = cell.get("warmup", 1) + cell.get("n", 5) + 2 * cell.get("short_n", 0)
     return round((load_s + renders * render_s) / 60.0, 2)
 
@@ -508,7 +536,11 @@ def build_plan(req: dict, cards: dict) -> dict:
                         ok = [a for a in ok if a.get("solo")]
                         if not ok:
                             continue
-                cmp_id = f"{slug(fam)}_{slug(t['name'])}" + (f"_b{bud:g}" if bud else "")
+                frames_ovr = m.get("frames")
+                if frames_ovr is not None and card.get("kind") != "video":
+                    raise SystemExit(f"model {fam}: \"frames\" overrides a video card's clip length only")
+                cmp_id = (f"{slug(fam)}_{slug(t['name'])}" + (f"_b{bud:g}" if bud else "")
+                          + (f"_f{int(frames_ovr)}" if frames_ovr is not None else ""))
                 seq = comparison_sequence(cmp_id, ok, repeats, once = t["purpose"] != "timing")
                 cmp = {"id": cmp_id, "family": fam, "target": t["name"], "budget_gib": bud or None,
                        "purpose": t["purpose"], "arms": [arm_label(a) for a in ok], "runs": {}, "order": [], "aa_pairs": [],
@@ -525,6 +557,12 @@ def build_plan(req: dict, cards: dict) -> dict:
                     except KeyError as exc:
                         failed = (arm_label(arm), str(exc))
                         break
+                    if frames_ovr is not None:
+                        # a short clip on BOTH stacks (same frames on every arm; a separate comparison id, never
+                        # pooled with the template length); the parity gate still checks resolved == rendered
+                        cell["frames"] = int(frames_ovr)
+                        cell.setdefault("options", {})["frames_override"] = {
+                            "frames": int(frames_ovr), "template": (card.get("defaults") or {}).get("frames")}
                     cell["tag"] = tag
                     cell["family"] = fam
                     cell["options"]["target"] = {"name": t["name"], "vm_id": None, "lane": None,
@@ -551,7 +589,7 @@ def build_plan(req: dict, cards: dict) -> dict:
                         if a["stack"] in ("blineui", "sdcpp"):
                             downloads.update(file_sources(card, a["format"], a["stack"])[0])
                         elif a["stack"] == "studio":
-                            pf = studio_prefetch(card, a["format"])
+                            pf = studio_prefetch(card, a["format"], t["name"])
                             prefetch.update(pf)
                             # which comparison needs which prefetch entry: each VM's export keeps only its own
                             # (common.plan_carry), never another VM's family snapshot

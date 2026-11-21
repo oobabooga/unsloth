@@ -116,11 +116,15 @@ SCHEDULER_CLASS = {"FlowMatchEulerDiscreteScheduler": ("euler", "simple"), "Eule
 SIGMA_FLAGS = (("use_karras_sigmas", "karras"), ("use_exponential_sigmas", "exponential"), ("use_beta_sigmas", "beta"))
 
 
-def scheduler_names(scheduler: Any) -> tuple:
-    """(sampler, schedule, class name) for a resident diffusers scheduler object (or a class name string)."""
+def scheduler_names(scheduler: Any, card_map: Optional[dict] = None) -> tuple:
+    """(sampler, schedule, class name) for a resident diffusers scheduler object (or a class name string). The
+    card's ``studio.scheduler_map`` ({class: [sampler, schedule]}, the baseline's names for that family) wins over
+    the generic table and its config flags: it is what a family's parity dumps showed."""
     if scheduler is None:
         return None, None, None
     name = scheduler if isinstance(scheduler, str) else type(scheduler).__name__
+    if card_map and isinstance(card_map.get(name), (list, tuple)) and len(card_map[name]) == 2:
+        return card_map[name][0], card_map[name][1], name
     sampler, sched = SCHEDULER_CLASS.get(name, (None, None))
     cfg = {} if isinstance(scheduler, str) else (getattr(scheduler, "config", None) or {})
     for flag, label in SIGMA_FLAGS:
@@ -149,13 +153,13 @@ def resident_shift(scheduler: Any) -> Optional[float]:
 
 
 def studio_sampler(record: Optional[dict], scheduler: Any = None, recipe_sampler: Optional[str] = None,
-                   card_default: Optional[str] = None) -> dict:
+                   card_default: Optional[str] = None, card_map: Optional[dict] = None) -> dict:
     """{sampler, scheduler, sampler_source} Studio ran for one generation. The per-generation record wins
     (``sampler`` is None unless Studio swapped the scheduler, ``schedule_type`` the resolved schedule); a None /
     "default" sampler is the resident one: a family recipe's own sampler (H3: res_multistep, Euler for PDD banks),
     else the pipeline's scheduler class, else the card's ``studio.default_sampler`` (HTTP: no class visible)."""
     record = record or {}
-    s_cls, sched_cls, cls_name = scheduler_names(scheduler)
+    s_cls, sched_cls, cls_name = scheduler_names(scheduler, card_map)
     sampler, src = record.get("sampler"), "studio generate record"
     if sampler in (None, "", "default"):
         if recipe_sampler:
@@ -465,7 +469,8 @@ class StudioBackend(Backend):
             recipe = ((shape.get("h3_recipe") or {}) if isinstance(shape, dict) else {}).get("sampler") \
                 or family_sampler(self.engine)
             extra["sampling"] = studio_sampler(res, resident_scheduler(self.engine), recipe,
-                                               self.opts.get("studio_default_sampler"))
+                                               self.opts.get("studio_default_sampler"),
+                                               self.opts.get("studio_scheduler_map"))
             extra["resident_shift"] = resident_shift(resident_scheduler(self.engine))
             self._last_extra = extra
             return Render(frames = frames, fps = res.get("fps"), extra = extra)
@@ -478,7 +483,8 @@ class StudioBackend(Backend):
         extra = {"seed": res.get("seed"), "engaged": engagement_snapshot(),
                  "applied_flow_shift": res.get("applied_flow_shift"),
                  "sampling": studio_sampler(res, resident_scheduler(self.engine), family_sampler(self.engine),
-                                            self.opts.get("studio_default_sampler")),
+                                            self.opts.get("studio_default_sampler"),
+                                            self.opts.get("studio_scheduler_map")),
                  "resident_shift": resident_shift(resident_scheduler(self.engine))}
         self._last_extra = extra
         if len(images) > 1:

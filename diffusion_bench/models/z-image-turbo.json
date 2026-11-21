@@ -123,7 +123,17 @@
      "outputs/dbench_validation/t4 (2026-11-18, unsloth ee57a65b4, trial__colab-t4-1 rc=-9 after 129 s)"
     ],
     "studio_refused": []
-   }
+   },
+   "est_load_s": {
+    "T4": {
+     "blineui": 92.1,
+     "studio": 191.5
+    }
+   },
+   "est_load_basis": [
+    "T4 blineui: median of load_s + first-render excess over fresh-process timed runs in dbench_nov19, dbench_validation/kgl",
+    "T4 studio: median of load_s + first-render excess over fresh-process timed runs in dbench_nov19, dbench_validation/kgl"
+   ]
   },
   "int8": {
    "studio": {
@@ -309,6 +319,12 @@
   "gen": {
    "steps": 8,
    "guidance": 0.0
+  },
+  "scheduler_map": {
+   "FlowMatchEulerDiscreteScheduler": [
+    "euler",
+    "simple"
+   ]
   }
  },
  "traps": [

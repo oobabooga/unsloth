@@ -63,6 +63,13 @@
       "file": null,
       "build": null,
       "note": "repo snapshot (Studio family base_repo, Studio ee57a65b4 studio/backend/core/inference/diffusion_families.py:1308; mirrored to unsloth/Krea-2-Turbo, :1910); int8 / fp8 DiT and the int8 TE come from the hosted unsloth/Krea-2-Turbo-FP8 prequant (:1309-1312)"
+     },
+     "Krea-2-Turbo-text_encoder-INT8-ConvRot.safetensors": {
+      "repo": "unsloth/Krea-2-Turbo-FP8",
+      "file": "Krea-2-Turbo-text_encoder-INT8-ConvRot.safetensors",
+      "build": null,
+      "sha256": "06da1dfad4a028b49c48b2331f13b569b443507a1fd3a66a82a78b26c6245baa",
+      "note": "Studio's hosted encoder for this family (unsloth main 8b7cde79eb diffusion_te_prequant.py TE_INT8_CONVROT_FILES, published list): a Studio cell loads offline (local_files_only), so the VM prefetches it; without it Studio kept the dense bf16 encoder and the parity gate voided the pair (val_nov21 A100 trial: 'diffusion.te_prequant: int8:text_encoder:repo failed: Cannot find the requested files in the disk cache')"
      }
     }
    },
@@ -161,6 +168,13 @@
       "file": null,
       "build": null,
       "note": "hosted prequant Studio fetches for int8 / fp8 (Studio ee57a65b4 studio/backend/core/inference/diffusion_families.py:1309-1312) and for the int8 TE"
+     },
+     "Krea-2-Turbo-text_encoder-INT8-ConvRot.safetensors": {
+      "repo": "unsloth/Krea-2-Turbo-FP8",
+      "file": "Krea-2-Turbo-text_encoder-INT8-ConvRot.safetensors",
+      "build": null,
+      "sha256": "06da1dfad4a028b49c48b2331f13b569b443507a1fd3a66a82a78b26c6245baa",
+      "note": "Studio's hosted encoder for this family (unsloth main 8b7cde79eb diffusion_te_prequant.py TE_INT8_CONVROT_FILES, published list): a Studio cell loads offline (local_files_only), so the VM prefetches it; without it Studio kept the dense bf16 encoder and the parity gate voided the pair (val_nov21 A100 trial: 'diffusion.te_prequant: int8:text_encoder:repo failed: Cannot find the requested files in the disk cache')"
      }
     }
    },
@@ -258,6 +272,13 @@
       "file": null,
       "build": null,
       "note": "hosted prequant Studio fetches for int8 / fp8 (Studio ee57a65b4 studio/backend/core/inference/diffusion_families.py:1309-1312) and for the int8 TE"
+     },
+     "Krea-2-Turbo-text_encoder-INT8-ConvRot.safetensors": {
+      "repo": "unsloth/Krea-2-Turbo-FP8",
+      "file": "Krea-2-Turbo-text_encoder-INT8-ConvRot.safetensors",
+      "build": null,
+      "sha256": "06da1dfad4a028b49c48b2331f13b569b443507a1fd3a66a82a78b26c6245baa",
+      "note": "Studio's hosted encoder for this family (unsloth main 8b7cde79eb diffusion_te_prequant.py TE_INT8_CONVROT_FILES, published list): a Studio cell loads offline (local_files_only), so the VM prefetches it; without it Studio kept the dense bf16 encoder and the parity gate voided the pair (val_nov21 A100 trial: 'diffusion.te_prequant: int8:text_encoder:repo failed: Cannot find the requested files in the disk cache')"
      }
     }
    },

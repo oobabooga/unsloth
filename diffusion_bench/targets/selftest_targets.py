@@ -229,11 +229,16 @@ def test_real_cards(work: Path) -> None:
     check(t4 and not any("bf16 support" in r["reason"] for r in dn["not_run"])
           and all(c["options"].get("dense_dtype") == "fp16" for c in t4),
           f"dense bf16 on a T4 runs at fp16 on both stacks ({len(t4)} cells, NOT_RUN {[r['reason'][:60] for r in dn['not_run']]})")
-    # a comparison left with one stack is not timed (qwen int8 on Kaggle: Studio refuses int8 on sm75)
-    q = [c for c in plan["comparisons"] if c["family"] == "qwen-image-2.1" and c["target"] == "kaggle:T4x2"]
-    check(not q and any(r["arm"] == "comparison" and "not timed" in r["reason"] for r in plan["not_run"]
-                        if r["family"] == "qwen-image-2.1" and r["target"] == "kaggle:T4x2"),
+    # a comparison left with one stack is not timed (FLUX.3 klein NVFP4 on G4: Studio refuses the family's NVFP4;
+    # Studio runs INT8 on sm75 since #17949 / #18441, so qwen int8 on Kaggle is a real pair now)
+    nv = P.build_plan({**req, "models": [{"family": "flux.3-klein", "formats": ["nvfp4"]}],
+                       "arms": [{"stack": "studio", "format": "nvfp4"}, {"stack": "blineui", "format": "nvfp4"}],
+                       "targets": ["colab:G4"]}, P.load_cards(["flux.3-klein"], None))
+    check(not nv["comparisons"] and any(r["arm"] == "comparison" and "not timed" in r["reason"]
+                                        for r in nv["not_run"]),
           "a one-stack comparison (the other stack blocked) is NOT_RUN, not timed alone")
+    q = [c for c in plan["comparisons"] if c["family"] == "qwen-image-2.1" and c["target"] == "kaggle:T4x2"]
+    check(bool(q), "qwen int8 on Kaggle T4x2 is a timed pair (Studio INT8 on sm75)")
     st = P.build_plan({**req, "models": ["minimax-h3"], "arms": [{"stack": "studio", "format": "int8_teint8"},
                                                                  {"stack": "blineui", "format": "int8"}],
                        "targets": ["tester:big"]}, P.load_cards(["minimax-h3"], None))  # no disk / VRAM hint there
@@ -947,6 +952,21 @@ def test_prepare(plan: dict, work: Path, allow_dirty: bool) -> None:
     check("TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL=1" in t and "unset CI" in t and "kill -$sig" in t,
           "amd linux: AOTriton asserted, CI unset, kill step")
     check("amd-gfx1151-windows-1" in m["skipped"], "amd windows: needs an anchor PR (skipped with a reason)")
+    sc = m["scaffolds"]["amd-gfx1151-linux-1"]
+    # the Windows plan route names the VM's cells (trial first): the probe's default prefixes match no plan tag
+    mw = amd.prepare(plan, work / "amd_win", plan_path = str(work / "plan.json"), pr = 18760, merged = True)
+    if "amd-gfx1151-windows-1" in mw.get("scaffolds", {}):
+        tw = Path(mw["scaffolds"]["amd-gfx1151-windows-1"]["workflow"][0]).read_text()
+        wtags = [c["tag"] for c in plan["cells"] if (c.get("options") or {}).get("target", {}).get("vm_id")
+                 == "amd-gfx1151-windows-1"]
+        trial_w = [t for t in wtags if t.startswith("trial__")]
+        check(bool(wtags) and all(f"'--only' '{t}'" in tw or f"--only {t}" in tw or f"'{t}'" in tw for t in wtags)
+              and trial_w and tw.find(trial_w[0]) < min(tw.find(t) for t in wtags if t not in trial_w),
+              "amd windows: the plan route passes every cell of the VM to the probe, trial first")
+    else:
+        check(False, f"amd windows: plan route not scaffolded: {mw.get('skipped')}")
+    check(sc.get("branch") and f"branches: [{sc['branch']}]" in t and f"--branch {sc['branch']}" in (sc.get("queue") or ""),
+          "amd: prepare names the one branch the workflow triggers on, and the queue command pushes to it")
     try:
         import yaml
 

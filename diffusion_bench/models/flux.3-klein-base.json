@@ -59,6 +59,13 @@
       "file": null,
       "build": null,
       "note": "repo snapshot; Studio fetches its hosted prequant (unsloth/*-FP8, INT8 ConvRot) itself when the format asks for it"
+     },
+     "flux-3-image-klein-base-text_encoder-INT8-ConvRot.safetensors": {
+      "repo": "unsloth/flux-3-image-klein-base-FP8",
+      "file": "flux-3-image-klein-base-text_encoder-INT8-ConvRot.safetensors",
+      "build": null,
+      "sha256": "14c48e107110bf3a3fa011a3e9a92341829833e9c2f83cfbae34370f684def80",
+      "note": "Studio's hosted encoder for this family (unsloth main 8b7cde79eb diffusion_te_prequant.py TE_INT8_CONVROT_FILES, published list): a Studio cell loads offline (local_files_only), so the VM prefetches it; without it Studio kept the dense bf16 encoder and the parity gate voided the pair (val_nov21 A100 trial: 'diffusion.te_prequant: int8:text_encoder:repo failed: Cannot find the requested files in the disk cache')"
      }
     }
    },
@@ -109,13 +116,24 @@
       "ignore_patterns": [
        "transformer/*.safetensors",
        "transformer/*.bin"
-      ]
+      ],
+      "dense_on": [
+       "T4"
+      ],
+      "dense_on_note": "on an fp16-only T4 Studio builds INT8 from the dense transformer (diffusion.py load_flux3_pipeline -> Flux3Transformer2DModel.from_pretrained) instead of the hosted INT8 file; the offline trial load failed on the two missing transformer shards (val_nov21 Colab T4 trial, unsloth 8b7cde79eb)"
      },
      "flux-3-image-klein-base-INT8.safetensors": {
       "repo": "unsloth/flux-3-image-klein-base-FP8",
       "file": "flux-3-image-klein-base-INT8.safetensors",
       "build": null,
       "note": "Studio's hosted int8 transformer for this format (status.resolved.transformer_quant.artifact prequant:unsloth/flux-3-image-klein-base-FP8/flux-3-image-klein-base-INT8.safetensors, pr876_recheck parity_3090 record)"
+     },
+     "flux-3-image-klein-base-text_encoder-INT8-ConvRot.safetensors": {
+      "repo": "unsloth/flux-3-image-klein-base-FP8",
+      "file": "flux-3-image-klein-base-text_encoder-INT8-ConvRot.safetensors",
+      "build": null,
+      "sha256": "14c48e107110bf3a3fa011a3e9a92341829833e9c2f83cfbae34370f684def80",
+      "note": "Studio's hosted encoder for this family (unsloth main 8b7cde79eb diffusion_te_prequant.py TE_INT8_CONVROT_FILES, published list): a Studio cell loads offline (local_files_only), so the VM prefetches it; without it Studio kept the dense bf16 encoder and the parity gate voided the pair (val_nov21 A100 trial: 'diffusion.te_prequant: int8:text_encoder:repo failed: Cannot find the requested files in the disk cache')"
      }
     }
    },
@@ -209,6 +227,13 @@
       "file": null,
       "build": null,
       "note": "repo snapshot; Studio fetches its hosted prequant (unsloth/*-FP8, INT8 ConvRot) itself when the format asks for it"
+     },
+     "flux-3-image-klein-base-text_encoder-INT8-ConvRot.safetensors": {
+      "repo": "unsloth/flux-3-image-klein-base-FP8",
+      "file": "flux-3-image-klein-base-text_encoder-INT8-ConvRot.safetensors",
+      "build": null,
+      "sha256": "14c48e107110bf3a3fa011a3e9a92341829833e9c2f83cfbae34370f684def80",
+      "note": "Studio's hosted encoder for this family (unsloth main 8b7cde79eb diffusion_te_prequant.py TE_INT8_CONVROT_FILES, published list): a Studio cell loads offline (local_files_only), so the VM prefetches it; without it Studio kept the dense bf16 encoder and the parity gate voided the pair (val_nov21 A100 trial: 'diffusion.te_prequant: int8:text_encoder:repo failed: Cannot find the requested files in the disk cache')"
      }
     }
    },
@@ -260,6 +285,13 @@
       "file": null,
       "build": null,
       "note": "repo snapshot; Studio fetches its hosted prequant (unsloth/*-FP8, INT8 ConvRot) itself when the format asks for it"
+     },
+     "flux-3-image-klein-base-text_encoder-INT8-ConvRot.safetensors": {
+      "repo": "unsloth/flux-3-image-klein-base-FP8",
+      "file": "flux-3-image-klein-base-text_encoder-INT8-ConvRot.safetensors",
+      "build": null,
+      "sha256": "14c48e107110bf3a3fa011a3e9a92341829833e9c2f83cfbae34370f684def80",
+      "note": "Studio's hosted encoder for this family (unsloth main 8b7cde79eb diffusion_te_prequant.py TE_INT8_CONVROT_FILES, published list): a Studio cell loads offline (local_files_only), so the VM prefetches it; without it Studio kept the dense bf16 encoder and the parity gate voided the pair (val_nov21 A100 trial: 'diffusion.te_prequant: int8:text_encoder:repo failed: Cannot find the requested files in the disk cache')"
      }
     }
    },
@@ -317,7 +349,18 @@
       "repo": "black-forest-labs/flux-3-image-klein-base",
       "file": null,
       "build": null,
-      "note": "text encoder / VAE / configs the GGUF transformer is assembled with"
+      "note": "text encoder / VAE / configs the GGUF transformer is assembled with",
+      "ignore_patterns": [
+       "transformer/*.safetensors",
+       "transformer/*.bin"
+      ]
+     },
+     "flux-3-image-klein-base-text_encoder-INT8-ConvRot.safetensors": {
+      "repo": "unsloth/flux-3-image-klein-base-FP8",
+      "file": "flux-3-image-klein-base-text_encoder-INT8-ConvRot.safetensors",
+      "build": null,
+      "sha256": "14c48e107110bf3a3fa011a3e9a92341829833e9c2f83cfbae34370f684def80",
+      "note": "Studio's hosted encoder for this family (unsloth main 8b7cde79eb diffusion_te_prequant.py TE_INT8_CONVROT_FILES, published list): a Studio cell loads offline (local_files_only), so the VM prefetches it; without it Studio kept the dense bf16 encoder and the parity gate voided the pair (val_nov21 A100 trial: 'diffusion.te_prequant: int8:text_encoder:repo failed: Cannot find the requested files in the disk cache')"
      }
     }
    },
@@ -391,6 +434,12 @@
   "gen": {
    "steps": 50,
    "guidance": 3.5
+  },
+  "scheduler_map": {
+   "FlowMatchEulerDiscreteScheduler": [
+    "euler",
+    "simple"
+   ]
   }
  },
  "traps": [

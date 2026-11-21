@@ -28,7 +28,7 @@
   "height": 1328,
   "frames": null,
   "fps": null,
-  "negative": "低分辨率，低画质，肢体畸形，手指畸形，画面过饱和，蜡像感，人脸无细节，过度光滑，画面具有AI感。构图混乱。文字模糊，扭曲",
+  "negative": "\u4f4e\u5206\u8fa8\u7387\uff0c\u4f4e\u753b\u8d28\uff0c\u80a2\u4f53\u7578\u5f62\uff0c\u624b\u6307\u7578\u5f62\uff0c\u753b\u9762\u8fc7\u9971\u548c\uff0c\u8721\u50cf\u611f\uff0c\u4eba\u8138\u65e0\u7ec6\u8282\uff0c\u8fc7\u5ea6\u5149\u6ed1\uff0c\u753b\u9762\u5177\u6709AI\u611f\u3002\u6784\u56fe\u6df7\u4e71\u3002\u6587\u5b57\u6a21\u7cca\uff0c\u626d\u66f2",
   "enhancer": false
  },
  "expected_passes": "steps * (2 if cfg > 1 else 1)",
@@ -60,6 +60,13 @@
       "file": null,
       "build": null,
       "note": "repo snapshot; Studio fetches its hosted prequant (unsloth/*-FP8, INT8 ConvRot) itself when the format asks for it"
+     },
+     "Qwen-Image-text_encoder-INT8-ConvRot.safetensors": {
+      "repo": "unsloth/Qwen-Image-FP8",
+      "file": "Qwen-Image-text_encoder-INT8-ConvRot.safetensors",
+      "build": null,
+      "sha256": "e33d1a53191c1f32fb6e23c9eecd8ee15a93b6a1f47f6a369ed265610924b3f4",
+      "note": "Studio's hosted encoder for this family (unsloth main 8b7cde79eb diffusion_te_prequant.py TE_INT8_CONVROT_FILES, published list): a Studio cell loads offline (local_files_only), so the VM prefetches it; without it Studio kept the dense bf16 encoder and the parity gate voided the pair (val_nov21 A100 trial: 'diffusion.te_prequant: int8:text_encoder:repo failed: Cannot find the requested files in the disk cache')"
      }
     }
    },
@@ -145,6 +152,13 @@
       "file": null,
       "build": null,
       "note": "repo snapshot; Studio fetches its hosted prequant (unsloth/*-FP8, INT8 ConvRot) itself when the format asks for it"
+     },
+     "Qwen-Image-text_encoder-INT8-ConvRot.safetensors": {
+      "repo": "unsloth/Qwen-Image-FP8",
+      "file": "Qwen-Image-text_encoder-INT8-ConvRot.safetensors",
+      "build": null,
+      "sha256": "e33d1a53191c1f32fb6e23c9eecd8ee15a93b6a1f47f6a369ed265610924b3f4",
+      "note": "Studio's hosted encoder for this family (unsloth main 8b7cde79eb diffusion_te_prequant.py TE_INT8_CONVROT_FILES, published list): a Studio cell loads offline (local_files_only), so the VM prefetches it; without it Studio kept the dense bf16 encoder and the parity gate voided the pair (val_nov21 A100 trial: 'diffusion.te_prequant: int8:text_encoder:repo failed: Cannot find the requested files in the disk cache')"
      }
     }
    },
@@ -175,7 +189,7 @@
    "guidance": 4.0,
    "width": 1328,
    "height": 1328,
-   "negative_prompt": "低分辨率，低画质，肢体畸形，手指畸形，画面过饱和，蜡像感，人脸无细节，过度光滑，画面具有AI感。构图混乱。文字模糊，扭曲"
+   "negative_prompt": "\u4f4e\u5206\u8fa8\u7387\uff0c\u4f4e\u753b\u8d28\uff0c\u80a2\u4f53\u7578\u5f62\uff0c\u624b\u6307\u7578\u5f62\uff0c\u753b\u9762\u8fc7\u9971\u548c\uff0c\u8721\u50cf\u611f\uff0c\u4eba\u8138\u65e0\u7ec6\u8282\uff0c\u8fc7\u5ea6\u5149\u6ed1\uff0c\u753b\u9762\u5177\u6709AI\u611f\u3002\u6784\u56fe\u6df7\u4e71\u3002\u6587\u5b57\u6a21\u7cca\uff0c\u626d\u66f2"
   }
  },
  "traps": [

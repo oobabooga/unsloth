@@ -107,6 +107,14 @@ def main() -> int:
             ap.error("--plan on Windows needs an anchor --pr N (amd_ci states); add --merged for a merged PR")
         plan_spec_rel = f"diffusion_bench/specs/plan_{args.vm}.json"
         args.spec = plan_spec_rel
+        if not args.only:
+            # the probe's default selection is the small spec's prefixes (tiny_* sdxlt_* zimg_* wan_*), which match
+            # no plan tag: name the VM's cells, trial first, or the run measures nothing (val_nov21 Windows trial:
+            # "no cells of plan_amd-gfx1151-windows-1.json match", INCONCLUSIVE)
+            import matrix  # noqa: PLC0415
+
+            tags = [c["tag"] for c in matrix.plan_spec(args.plan, args.vm)["cells"]]
+            args.only = [t for t in tags if t.startswith("trial__")] + [t for t in tags if not t.startswith("trial__")]
     elif args.pr is None:
         ap.error("--pr is required (or --plan --vm)")
 

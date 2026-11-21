@@ -204,10 +204,10 @@ jobs:
           if-no-files-found: warn
 
   m1_cells:
-    name: "amd:gfx1151-linux 2 cells (gfx1151, exclusive GPU)"
+    name: "amd:gfx1151-linux 11 cells (gfx1151, exclusive GPU)"
     needs: [t0_trial]
     runs-on: [self-hosted, Linux, strix-halo, devlab-dispatch]
-    timeout-minutes: 417
+    timeout-minutes: 481
     # The shared GPU group: one GPU measurement at a time across all branches.
     concurrency:
       group: amd-ci-gfx1151-gpu
@@ -329,8 +329,8 @@ jobs:
           "$AMD_CI_PY" "$GITHUB_WORKSPACE/diffusion_bench/amd/preflight_free.py" --min-free-gib 50 \
             --timeout-s 1800 --out "$AMD_CI_WORK/out/preflight.json"
 
-      - name: "Differential (amd:gfx1151-linux 2 cells)"
-        timeout-minutes: 222
+      - name: "Differential (amd:gfx1151-linux 11 cells)"
+        timeout-minutes: 286
         run: |
           set +e
           # harness invariants (gen_workflow.py): AOTriton opt-in on, CI unset, both asserted
@@ -346,7 +346,7 @@ jobs:
             --probe diffusion_bench/amd/diffusion_probe.py \
             --criteria diffusion_bench/amd/criteria_no_regression.py \
             --out-dir "$AMD_CI_WORK/out/gpu" \
-            --python "$AMD_CI_PY" -- --spec diffusion_bench/specs/plan_amd-gfx1151-linux-1.json --budget-min 88.66 --cell-timeout 3600 --only z-image-turbo_amd-gfx1151-linux__s_bf16__k1p0 --only z-image-turbo_amd-gfx1151-linux__c_bf16__k1p1 --state-only head=z-image-turbo_amd-gfx1151-linux__s_bf16__k1p0
+            --python "$AMD_CI_PY" -- --spec diffusion_bench/specs/plan_amd-gfx1151-linux-1.json --budget-min 120.9 --cell-timeout 3600 --only z-image-turbo_amd-gfx1151-linux__s_bf16__parity --only z-image-turbo_amd-gfx1151-linux__s_bf16__parity_negctl --only z-image-turbo_amd-gfx1151-linux__c_bf16__parity --only z-image-turbo_amd-gfx1151-linux__s_bf16__k1p0 --only z-image-turbo_amd-gfx1151-linux__c_bf16__k1p1 --only z-image-turbo_amd-gfx1151-linux__c_bf16__k1p2 --only z-image-turbo_amd-gfx1151-linux__s_bf16__k1p3 --only z-image-turbo_amd-gfx1151-linux__s_bf16__k2p0 --only z-image-turbo_amd-gfx1151-linux__c_bf16__k2p1 --only z-image-turbo_amd-gfx1151-linux__c_bf16__k2p2 --only z-image-turbo_amd-gfx1151-linux__s_bf16__k2p3 --state-only head=z-image-turbo_amd-gfx1151-linux__s_bf16__parity
           cat "$AMD_CI_WORK/out/gpu/VERDICT.md" >> "$GITHUB_STEP_SUMMARY"
           python3 "$GITHUB_WORKSPACE/amd_ci/lib/announce.py" "$AMD_CI_WORK/out/gpu"
 

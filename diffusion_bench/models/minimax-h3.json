@@ -250,7 +250,17 @@
     "studio_refused": []
    },
    "min_disk_gib": 180.0,
-   "min_disk_basis": "peak on one VM with builders/build_bline_files.py --drop-sources (own fetches freed before the quant tool, TE shards 12 of 14): Studio int8 54.4 GiB (hosted INT8 ConvRot DiT 18.9 + int8 TE 25.3 + vae 9.7 + audio 0.6) + baseline TE build 53.1 shards + 48.0 merged source over the built DiT 19.5 = ~175 GiB; was ~271 GiB with every official shard (dit 61.7 + te 62.1 + vae 9.7) kept in the hub cache until the comparison ended"
+   "min_disk_basis": "peak on one VM with builders/build_bline_files.py --drop-sources (own fetches freed before the quant tool, TE shards 12 of 14): Studio int8 54.4 GiB (hosted INT8 ConvRot DiT 18.9 + int8 TE 25.3 + vae 9.7 + audio 0.6) + baseline TE build 53.1 shards + 48.0 merged source over the built DiT 19.5 = ~175 GiB; was ~271 GiB with every official shard (dit 61.7 + te 62.1 + vae 9.7) kept in the hub cache until the comparison ended",
+   "est_load_s": {
+    "A100-40": {
+     "blineui": 147.5,
+     "studio": 284.8
+    }
+   },
+   "est_load_basis": [
+    "A100-40 blineui: median of load_s + first-render excess over fresh-process timed runs in dbench_nov19",
+    "A100-40 studio: median of load_s + first-render excess over fresh-process timed runs in dbench_nov19"
+   ]
   },
   "fp8": {
    "studio": {
