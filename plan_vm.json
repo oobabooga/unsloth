@@ -1,0 +1,158 @@
+{
+ "vm": {
+  "vm_id": "amd-gfx1151-linux-1",
+  "target": "amd:gfx1151-linux",
+  "kind": "amd",
+  "gpu": "gfx1151",
+  "lanes": 1,
+  "lane_mode": "single",
+  "lane_mode_effective": "single",
+  "purpose": "timing",
+  "account": null,
+  "comparisons": [
+   "wan2-2-5b_amd-gfx1151-linux"
+  ],
+  "slots": [
+   [
+    {
+     "tag": "trial__amd-gfx1151-linux-1",
+     "lane": 0,
+     "stack": "studio",
+     "timed": false,
+     "comparison": null,
+     "est_min": 5.0,
+     "trial": true
+    }
+   ],
+   [
+    {
+     "tag": "wan2-2-5b_amd-gfx1151-linux__s_fp16__parity",
+     "lane": 0,
+     "stack": "studio",
+     "timed": false,
+     "parity": true,
+     "comparison": "wan2-2-5b_amd-gfx1151-linux",
+     "family": "wan2.2-5b",
+     "est_min": 10.0
+    }
+   ],
+   [
+    {
+     "tag": "wan2-2-5b_amd-gfx1151-linux__s_fp16__parity_negctl",
+     "lane": 0,
+     "stack": "studio",
+     "timed": false,
+     "parity": true,
+     "comparison": "wan2-2-5b_amd-gfx1151-linux",
+     "family": "wan2.2-5b",
+     "est_min": 10.0
+    }
+   ],
+   [
+    {
+     "tag": "wan2-2-5b_amd-gfx1151-linux__c_fp16__parity",
+     "lane": 0,
+     "stack": "blineui",
+     "timed": false,
+     "parity": true,
+     "comparison": "wan2-2-5b_amd-gfx1151-linux",
+     "family": "wan2.2-5b",
+     "est_min": 10.0
+    }
+   ],
+   [
+    {
+     "tag": "wan2-2-5b_amd-gfx1151-linux__s_fp16__k1p0",
+     "lane": 0,
+     "stack": "studio",
+     "timed": true,
+     "family": "wan2.2-5b",
+     "comparison": "wan2-2-5b_amd-gfx1151-linux",
+     "est_min": 20.0
+    }
+   ],
+   [
+    {
+     "tag": "wan2-2-5b_amd-gfx1151-linux__c_fp16__k1p1",
+     "lane": 0,
+     "stack": "blineui",
+     "timed": true,
+     "family": "wan2.2-5b",
+     "comparison": "wan2-2-5b_amd-gfx1151-linux",
+     "est_min": 20.0
+    }
+   ],
+   [
+    {
+     "tag": "wan2-2-5b_amd-gfx1151-linux__c_fp16__k1p2",
+     "lane": 0,
+     "stack": "blineui",
+     "timed": true,
+     "family": "wan2.2-5b",
+     "comparison": "wan2-2-5b_amd-gfx1151-linux",
+     "est_min": 20.0
+    }
+   ],
+   [
+    {
+     "tag": "wan2-2-5b_amd-gfx1151-linux__s_fp16__k1p3",
+     "lane": 0,
+     "stack": "studio",
+     "timed": true,
+     "family": "wan2.2-5b",
+     "comparison": "wan2-2-5b_amd-gfx1151-linux",
+     "est_min": 20.0
+    }
+   ],
+   [
+    {
+     "tag": "wan2-2-5b_amd-gfx1151-linux__s_fp16__k2p0",
+     "lane": 0,
+     "stack": "studio",
+     "timed": true,
+     "family": "wan2.2-5b",
+     "comparison": "wan2-2-5b_amd-gfx1151-linux",
+     "est_min": 20.0
+    }
+   ],
+   [
+    {
+     "tag": "wan2-2-5b_amd-gfx1151-linux__c_fp16__k2p1",
+     "lane": 0,
+     "stack": "blineui",
+     "timed": true,
+     "family": "wan2.2-5b",
+     "comparison": "wan2-2-5b_amd-gfx1151-linux",
+     "est_min": 20.0
+    }
+   ],
+   [
+    {
+     "tag": "wan2-2-5b_amd-gfx1151-linux__c_fp16__k2p2",
+     "lane": 0,
+     "stack": "blineui",
+     "timed": true,
+     "family": "wan2.2-5b",
+     "comparison": "wan2-2-5b_amd-gfx1151-linux",
+     "est_min": 20.0
+    }
+   ],
+   [
+    {
+     "tag": "wan2-2-5b_amd-gfx1151-linux__s_fp16__k2p3",
+     "lane": 0,
+     "stack": "studio",
+     "timed": true,
+     "family": "wan2.2-5b",
+     "comparison": "wan2-2-5b_amd-gfx1151-linux",
+     "est_min": 20.0
+    }
+   ]
+  ],
+  "est_min": 255.0,
+  "est_cu": 0.0
+ },
+ "base_sha": "8b7cde79ebf5a901b2fd936bbee214fb8c7562c7",
+ "bline_ref": "v0.46.2",
+ "branch": "amd-ci-nov21-r4wand"
+}
