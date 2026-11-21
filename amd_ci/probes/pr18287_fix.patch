@@ -1,0 +1,106 @@
+diff --git a/unsloth/_gpu_init.py b/unsloth/_gpu_init.py
+index 40c5f04b2e..12b89f2877 100644
+--- a/unsloth/_gpu_init.py
++++ b/unsloth/_gpu_init.py
+@@ -232,14 +232,27 @@ try:
+         from .distributed_debug import keep_debug_nccl_env
+         _restore_nccl_debug = keep_debug_nccl_env()
+         del keep_debug_nccl_env
+-    from .parallel_env import ALLOCATOR_ENV as _ALLOCATOR_ENV, apply_late_allocator_env
++    from .parallel_env import (
++        ALLOCATOR_ENV as _ALLOCATOR_ENV,
++        apply_late_allocator_env,
++        cuda_started,
++    )
+ 
+     _allocator_env_before = {k: os.environ.get(k) for k in _ALLOCATOR_ENV}
++    # Zoo exports its allocator settings before its own import starts CUDA, so only a process whose CUDA was
++    # already running (a torchrun rank > 0 binds its device at import) missed them.
++    _cuda_started_before = cuda_started()
+     import unsloth_zoo
+ 
+-    # A torchrun rank > 0 started CUDA when it bound its device: give it zoo's allocator settings too.
+-    apply_late_allocator_env(_allocator_env_before)
+-    del _ALLOCATOR_ENV, _allocator_env_before, apply_late_allocator_env
++    if _cuda_started_before:
++        apply_late_allocator_env(_allocator_env_before)
++    del (
++        _ALLOCATOR_ENV,
++        _allocator_env_before,
++        _cuda_started_before,
++        apply_late_allocator_env,
++        cuda_started,
++    )
+ 
+     if _restore_nccl_debug is not None:
+         _restore_nccl_debug()
+diff --git a/unsloth/parallel_env.py b/unsloth/parallel_env.py
+index f82cac1fdd..b23edc2d46 100644
+--- a/unsloth/parallel_env.py
++++ b/unsloth/parallel_env.py
+@@ -35,6 +35,8 @@ from __future__ import annotations
+ 
+ import math
+ import os
++import sys
++import warnings
+ 
+ __all__ = [
+     "ParallelSpec",
+@@ -315,23 +317,36 @@ ALLOCATOR_ENV = ("PYTORCH_ALLOC_CONF", "PYTORCH_CUDA_ALLOC_CONF", "PYTORCH_HIP_A
+ 
+ 
+ def _allocator_env_value(torch, environ):
+-    """The caching allocator settings this torch reads from the environment (None when unset)."""
+-    legacy = (
+-        "PYTORCH_HIP_ALLOC_CONF"
+-        if getattr(torch.version, "hip", None)
+-        else "PYTORCH_CUDA_ALLOC_CONF"
+-    )
++    """The caching allocator settings this torch reads from the environment (None when unset): the first of its
++    variables that is set wins, an empty one included."""
++    hip = bool(getattr(torch.version, "hip", None))
+     try:
+         major, minor = (int(x) for x in torch.__version__.split(".")[:2])
+     except ValueError:
+         major, minor = 2, 10
+-    names = ("PYTORCH_ALLOC_CONF", legacy) if (major, minor) >= (2, 10) else (legacy,)
++    if (major, minor) >= (2, 10):
++        # c10/core/AllocatorConfig.cpp from 2.10: the legacy names still come first, on every platform.
++        names = ("PYTORCH_CUDA_ALLOC_CONF", "PYTORCH_HIP_ALLOC_CONF", "PYTORCH_ALLOC_CONF")
++    elif hip:
++        # c10/cuda/CUDAAllocatorConfig.h: ROCm builds fall back to the HIP name when the CUDA one is unset.
++        names = ("PYTORCH_CUDA_ALLOC_CONF", "PYTORCH_HIP_ALLOC_CONF")
++    else:
++        names = ("PYTORCH_CUDA_ALLOC_CONF",)
+     for name in names:
+-        if environ.get(name):
++        if environ.get(name) is not None:
+             return environ[name]
+     return None
+ 
+ 
++def cuda_started():
++    """Whether CUDA (or HIP) has started in this process, without importing torch or starting it."""
++    torch = sys.modules.get("torch")
++    try:
++        return bool(torch is not None and torch.cuda.is_initialized())
++    except Exception:
++        return False
++
++
+ def apply_late_allocator_env(before, environ = None):
+     """`bind_local_cuda_device` starts CUDA on torchrun ranks > 0 at import, which fixes the caching allocator's
+     settings before unsloth_zoo exports its default (expandable_segments): those ranks ran without it while rank 0
+@@ -355,7 +370,10 @@ def apply_late_allocator_env(before, environ = None):
+             value = ",".join(x for x in (value, "expandable_segments:False") if x)
+         if not value:
+             return None
+-        setter(value)
++        with warnings.catch_warnings():
++            # torch 2.10+ deprecates the name (FutureWarning) but keeps it as an alias of the accelerator setter.
++            warnings.simplefilter("ignore", FutureWarning)
++            setter(value)
+         return value
+     except Exception:
+         return None
