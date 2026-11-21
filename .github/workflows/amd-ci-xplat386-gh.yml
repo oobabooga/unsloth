@@ -1,0 +1,142 @@
+name: "xplat: llama.cpp pin-set change, base vs head (CPU, Vulkan, Metal)"
+
+# Kit in xplat/: states.json (upstream tag + expected tree hashes), pins_base.diff (tag -> merged pin set),
+# change.diff (merged pin set -> repinned), prepare_states.py, xplat_tests.py (observe), xplat_compare.py (judge),
+# inkling2-hd128-s42.gguf (test-llama-archs inkling2 with head size 128, seed 42; tiny_hd128.patch made it).
+# Each job builds base and head on the same runner and compares them. Reuse: regenerate the two diffs,
+# states.json and the branch name; nothing else is change-specific (the expect-* flags are per backend).
+
+on:
+  push:
+    branches: [amd-ci-xplat386-gh]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  linux-cpu:
+    name: "CPU (ubuntu-24.04)"
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+        with: { persist-credentials: false }
+      - name: Prepare states
+        run: python3 xplat/prepare_states.py --kit xplat --root "$RUNNER_TEMP/w"
+      - name: Build base and head
+        run: |
+          set +e
+          fail=0
+          for s in base head; do
+            d="$RUNNER_TEMP/w/src/$s"
+            cmake -S "$d" -B "$d/build" -DCMAKE_BUILD_TYPE=Release -DLLAMA_BUILD_TESTS=ON -DLLAMA_CURL=OFF \
+              -DGGML_NATIVE=OFF > "$RUNNER_TEMP/cmake_$s.log" 2>&1 || { tail -40 "$RUNNER_TEMP/cmake_$s.log"; fail=1; }
+            cmake --build "$d/build" -j "$(nproc)" --target test-backend-ops test-llama-archs llama-perplexity > "$RUNNER_TEMP/build_$s.log" 2>&1
+            rc=$?
+            echo "$s build rc=$rc"; echo "BUILD_RC_$s=$rc" >> "$GITHUB_ENV"
+            [ "$rc" -ne 0 ] && { grep -n -A8 "error:" "$RUNNER_TEMP/build_$s.log" | head -80; fail=1; }
+          done
+          exit $fail
+      - name: Tests
+        if: always()
+        run: |
+          set +e
+          for s in base head; do
+            python3 xplat/xplat_tests.py --bin "$RUNNER_TEMP/w/src/$s/build/bin" --state $s --out "$RUNNER_TEMP/out" \
+              --ngl 0 --models xplat/inkling2-hd128-s42.gguf --tiny-archs inkling2
+          done
+          python3 xplat/xplat_compare.py --out "$RUNNER_TEMP/out" --leg linux-cpu \
+            --build-rc "base=${BUILD_RC_base:-?},head=${BUILD_RC_head:-?}" --expect-quant-banded yes
+          rc=$?
+          cat "$RUNNER_TEMP/out/VERDICT_linux-cpu.md" >> "$GITHUB_STEP_SUMMARY"
+          exit $rc
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with: { name: xplat-linux-cpu, path: "${{ runner.temp }}/out", retention-days: 7 }
+
+  linux-vulkan:
+    name: "Vulkan lavapipe (ubuntu-24.04)"
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+        with: { persist-credentials: false }
+      - name: Vulkan toolchain
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q libvulkan-dev glslc spirv-headers mesa-vulkan-drivers vulkan-tools
+          vulkaninfo --summary | head -40 || true
+      - name: Prepare states
+        run: python3 xplat/prepare_states.py --kit xplat --root "$RUNNER_TEMP/w"
+      - name: Build base and head
+        run: |
+          set +e
+          fail=0
+          for s in base head; do
+            d="$RUNNER_TEMP/w/src/$s"
+            cmake -S "$d" -B "$d/build" -DCMAKE_BUILD_TYPE=Release -DLLAMA_BUILD_TESTS=ON -DLLAMA_CURL=OFF \
+              -DGGML_NATIVE=OFF -DGGML_VULKAN=ON > "$RUNNER_TEMP/cmake_$s.log" 2>&1 || { tail -40 "$RUNNER_TEMP/cmake_$s.log"; fail=1; }
+            cmake --build "$d/build" -j "$(nproc)" --target test-backend-ops test-llama-archs llama-perplexity > "$RUNNER_TEMP/build_$s.log" 2>&1
+            rc=$?
+            echo "$s build rc=$rc"; echo "BUILD_RC_$s=$rc" >> "$GITHUB_ENV"
+            [ "$rc" -ne 0 ] && { grep -n -A8 "error:" "$RUNNER_TEMP/build_$s.log" | head -80; fail=1; }
+          done
+          exit $fail
+      - name: Tests
+        if: always()
+        run: |
+          set +e
+          for s in base head; do
+            python3 xplat/xplat_tests.py --bin "$RUNNER_TEMP/w/src/$s/build/bin" --state $s --out "$RUNNER_TEMP/out" \
+              --ngl 99 --tbo-backend Vulkan0 --models xplat/inkling2-hd128-s42.gguf --timeout 3600
+          done
+          python3 xplat/xplat_compare.py --out "$RUNNER_TEMP/out" --leg linux-vulkan \
+            --build-rc "base=${BUILD_RC_base:-?},head=${BUILD_RC_head:-?}" --expect-banded no --expect-quant-banded no
+          rc=$?
+          cat "$RUNNER_TEMP/out/VERDICT_linux-vulkan.md" >> "$GITHUB_STEP_SUMMARY"
+          exit $rc
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with: { name: xplat-linux-vulkan, path: "${{ runner.temp }}/out", retention-days: 7 }
+
+  macos-metal:
+    name: "Metal (macos-15, Apple Silicon)"
+    runs-on: macos-15
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+        with: { persist-credentials: false }
+      - name: Prepare states
+        run: python3 xplat/prepare_states.py --kit xplat --root "$RUNNER_TEMP/w"
+      - name: Build base and head
+        run: |
+          set +e
+          sysctl -n machdep.cpu.brand_string; sw_vers
+          fail=0
+          for s in base head; do
+            d="$RUNNER_TEMP/w/src/$s"
+            cmake -S "$d" -B "$d/build" -DCMAKE_BUILD_TYPE=Release -DLLAMA_BUILD_TESTS=ON -DLLAMA_CURL=OFF \
+              -DGGML_METAL=ON -DGGML_METAL_EMBED_LIBRARY=ON > "$RUNNER_TEMP/cmake_$s.log" 2>&1 || { tail -40 "$RUNNER_TEMP/cmake_$s.log"; fail=1; }
+            cmake --build "$d/build" -j "$(sysctl -n hw.logicalcpu)" --target test-backend-ops test-llama-archs llama-perplexity > "$RUNNER_TEMP/build_$s.log" 2>&1
+            rc=$?
+            echo "$s build rc=$rc"; echo "BUILD_RC_$s=$rc" >> "$GITHUB_ENV"
+            [ "$rc" -ne 0 ] && { grep -n -A8 "error:" "$RUNNER_TEMP/build_$s.log" | head -80; fail=1; }
+          done
+          exit $fail
+      - name: Tests
+        if: always()
+        run: |
+          set +e
+          for s in base head; do
+            python3 xplat/xplat_tests.py --bin "$RUNNER_TEMP/w/src/$s/build/bin" --state $s --out "$RUNNER_TEMP/out" \
+              --ngl 99 --tbo-backend MTL0 --models xplat/inkling2-hd128-s42.gguf --timeout 3600
+          done
+          python3 xplat/xplat_compare.py --out "$RUNNER_TEMP/out" --leg macos-metal \
+            --build-rc "base=${BUILD_RC_base:-?},head=${BUILD_RC_head:-?}" --expect-banded no --expect-quant-banded no
+          rc=$?
+          cat "$RUNNER_TEMP/out/VERDICT_macos-metal.md" >> "$GITHUB_STEP_SUMMARY"
+          exit $rc
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with: { name: xplat-macos-metal, path: "${{ runner.temp }}/out", retention-days: 7 }
