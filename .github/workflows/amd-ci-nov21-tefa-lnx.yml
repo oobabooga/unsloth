@@ -1,0 +1,37 @@
+name: "AMD CI: Studio PR 18787 text-encoder flash attention, sd-cli on gfx1151 (lnx, nov21)"
+
+on:
+  push:
+    branches: [amd-ci-nov21-tefa-lnx]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+
+  gfx1151:
+    name: "gfx1151 Linux RADV: sd-cli --diffusion-fa vs --flash-attn off,diffusion=on,te=on (exclusive GPU)"
+    runs-on: [self-hosted, Linux, strix-halo, devlab-dispatch]
+    timeout-minutes: 300
+    concurrency:
+      group: amd-ci-gfx1151-gpu
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
+      - name: Probe
+        run: |
+          set +e
+          OUT="$RUNNER_TEMP/out"; mkdir -p "$OUT"
+          PY=python3
+          if python3 -m venv "$RUNNER_TEMP/v" >/dev/null 2>&1 && "$RUNNER_TEMP/v/bin/pip" install -q pillow numpy psutil >/dev/null 2>&1; then PY="$RUNNER_TEMP/v/bin/python"; fi
+          if [ "${TEFA_ZIMAGE:-1}" = 1 ]; then "$PY" amd_ci/vkpicks/te_fa_probe.py --work "$RUNNER_TEMP/w" --out "$OUT/zimage" --rounds 2; echo "zimage probe rc=$?"; fi
+          "$PY" amd_ci/vkpicks/te_fa_matrix_probe.py --work "$RUNNER_TEMP/w" --out "$OUT/klein" --rounds 3
+          echo "klein matrix probe rc=$?"
+          rm -rf "${RUNNER_TEMP:?}/w"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
+        if: always()
+        with:
+          name: tefa-out-linux
+          path: ${{ runner.temp }}/out
+          retention-days: 7
