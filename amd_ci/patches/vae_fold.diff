@@ -1,0 +1,291 @@
+diff --git a/studio/backend/core/inference/diffusion_vae_strips.py b/studio/backend/core/inference/diffusion_vae_strips.py
+index a4956dc729..c5d842feba 100644
+--- a/studio/backend/core/inference/diffusion_vae_strips.py
++++ b/studio/backend/core/inference/diffusion_vae_strips.py
+@@ -24,6 +24,7 @@ from __future__ import annotations
+ 
+ import os
+ import threading
++import weakref
+ from functools import lru_cache
+ from typing import Any, Optional
+ 
+@@ -601,6 +602,108 @@ def _up_rows(
+         )  # fmt: skip
+ 
+ 
++# Nearest 2x + conv3x3(p1) as one ConvTranspose2d(k4, s2, p1) whose taps are the 3x3 taps summed in fp32 (rounded once
++# to the conv dtype): 2.25x fewer MACs and the 2x map is never written. Rounding-level only (1024 px decode vs the 2x
++# path: LPIPS 7e-5 bf16, 1e-6 fp16 T4; PSNR vs fp32 -0.04 to -0.28 dB). Measured on the FLUX.1 / Z-Image / FLUX.2 VAEs
++# (strip decode, cuDNN 9.24), 1024 / 2048 px: T4 fp16 1.11-1.14x, A100 1.06-1.12x, L4 1.05-1.11x, RTX PRO 6000
++# 1.07-1.13x per decode. ``UNSLOTH_VAE_UPSAMPLE_FOLD``: ``0`` off, ``1`` on any device (CUDA, ROCm, MPS, CPU); unset:
++# the measured CUDA cards only (MIOpen / MPS transposed convs unmeasured).
++UPSAMPLE_FOLD_ENV = "UNSLOTH_VAE_UPSAMPLE_FOLD"
++_FOLD_CAPS = frozenset({(7, 5), (8, 0), (8, 9), (12, 0)})
++# Output elements up to which one transposed conv covers the whole map (the measured shape: FLUX.1 1024 px's last
++# upsample is 2^28); larger maps fold strip by strip (bounded workspace, one copy into the output).
++FOLD_FULL_MAX_ELEMS = 1 << 28
++_FOLD_TAPS = {0: (2,), 1: (1, 2), 2: (0, 1), 3: (0,)}
++# conv -> ((data_ptr, dtype, device, shape, version), folded): dies with the conv, and a ``.data`` swap (Studio's fp32
++# retry, module.to) changes the key, which weight identity + version alone miss.
++_FOLD_CACHE: Any = weakref.WeakKeyDictionary()
++_FOLD_CALLS = [0]
++
++
++def _fold_mode() -> str:
++    raw = os.environ.get(UPSAMPLE_FOLD_ENV, "").strip().lower()
++    if raw in fused._FALSE:
++        return "off"
++    return "force" if raw in ("1", "on", "true", "yes", "force") else "auto"
++
++
++def _fold_on(x: Any) -> bool:
++    mode = _fold_mode()
++    if mode == "off":
++        return False
++    if mode == "force":
++        return True
++    torch = fused._torch()
++    if not x.is_cuda or getattr(torch.version, "hip", None):
++        return False
++    try:
++        return tuple(torch.cuda.get_device_capability(x.device)) in _FOLD_CAPS
++    except Exception:  # noqa: BLE001
++        return False
++
++
++def folded_upsample_weight(conv: Any) -> Any:
++    """The ConvTranspose2d(k4, s2, p1) kernel equal to nearest_2x then ``conv`` (3x3, p1): taps summed in fp32, one
++    rounding to the conv dtype, channels-last like the conv. Cached per conv while its weight tensor and version hold."""
++    torch = fused._torch()
++    w = conv.weight
++    key = (w.data_ptr(), w.dtype, w.device, tuple(w.shape), w._version)
++    hit = _FOLD_CACHE.get(conv)
++    if hit is not None and hit[0] == key:
++        return hit[1]
++    wf = w.detach().float()
++    cout, cin = wf.shape[:2]
++    wt = wf.new_zeros(cin, cout, 4, 4)
++    for a in range(4):
++        for b in range(4):
++            acc = wf.new_zeros(cout, cin)
++            for i in _FOLD_TAPS[a]:
++                for j in _FOLD_TAPS[b]:
++                    acc += wf[:, :, i, j]
++            wt[:, :, a, b] = acc.t()
++    wt = wt.to(w.dtype).contiguous(memory_format = torch.channels_last)
++    _FOLD_CACHE[conv] = (key, wt)
++    return wt
++
++
++def _fold_ok(conv: Any, x: Any) -> bool:
++    return (
++        tuple(conv.kernel_size) == (3, 3)
++        and tuple(conv.stride) == (1, 1)
++        and tuple(conv.padding) == (1, 1)
++        and tuple(conv.dilation) == (1, 1)
++        and conv.groups == 1
++        and conv.padding_mode == "zeros"
++        and x.dim() == 4
++        and x.dtype == conv.weight.dtype
++    )
++
++
++def _fold_upsample(
++    conv: Any,
++    x: Any,
++    bias: Any,
++    full_max: Optional[int] = None,
++) -> Any:
++    """conv(nearest_2x(x)) (+ ``bias``) via the folded transposed conv: one call over the map up to ``full_max`` output
++    elements, else per strip of input rows with a one-row halo (rows [a - 1, b + 1) give output rows [2a, 2b))."""
++    F = fused._torch().nn.functional
++    wt = folded_upsample_weight(conv)
++    _FOLD_CALLS[0] += 1
++    _, _, h, w = x.shape
++    elems = conv.out_channels * 4 * h * w
++    if elems <= (FOLD_FULL_MAX_ELEMS if full_max is None else full_max):
++        return _owned_cl(F.conv_transpose2d(x, wt, bias, stride = 2, padding = 1))
++    out = _empty_cl(conv.out_channels, 2 * h, 2 * w, x)
++    for a, b in _strips(h, elems):
++        lo, hi = max(0, a - 1), min(h, b + 1)
++        # padding 0 on rows: strip output row o' is full output row 2 lo + o' - 1
++        ys = F.conv_transpose2d(x.narrow(2, lo, hi - lo), wt, bias, stride = 2, padding = (0, 1))
++        first = 2 * (a - lo) + 1
++        out.narrow(2, 2 * a, 2 * (b - a)).copy_(ys.narrow(2, first, 2 * (b - a)))
++    return out
++
++
+ def _upsample(
+     up: Any,
+     x: Any,
+@@ -608,8 +711,12 @@ def _upsample(
+ ) -> tuple:
+     """(conv(nearest_2x(x)) in strips of input rows, the conv bias still to add). The 2x rows are written straight
+     into the padded strip; ``defer_bias``: cuDNN writes the bias-free conv into the output and the bias is returned
+-    for the next stage to fold in, else the bias is added here."""
++    for the next stage to fold in, else the bias is added here. On the fold's cards one transposed conv replaces both
++    (``UPSAMPLE_FOLD_ENV``)."""
+     conv = up.conv
++    if _fold_on(x) and _fold_ok(conv, x):
++        out = _fold_upsample(conv, x, None if defer_bias else conv.bias)
++        return out, (conv.bias if defer_bias else None)
+     _, c, h, w = x.shape
+     out = _empty_cl(conv.out_channels, 2 * h, 2 * w, x)
+     for a, b in _strips(h, out.numel()):
+diff --git a/studio/backend/tests/test_diffusion_vae_upsample_fold.py b/studio/backend/tests/test_diffusion_vae_upsample_fold.py
+new file mode 100644
+index 0000000000..f42c2bb9c7
+--- /dev/null
++++ b/studio/backend/tests/test_diffusion_vae_upsample_fold.py
+@@ -0,0 +1,150 @@
++# SPDX-License-Identifier: AGPL-3.0-only
++# Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
++
++"""Strip decode upsample fold (diffusion_vae_strips): nearest 2x + conv3x3(p1) as one ConvTranspose2d(k4, s2, p1).
++CPU: the fold equals the 2x chain to fp32-summed-weight rounding (fp64 here: ~1e-15), whole map and strip by strip with
++the one-row halo; the gate keeps unmeasured devices on the 2x path; the folded kernel follows in-place weight edits."""
++
++from __future__ import annotations
++
++import sys
++from pathlib import Path
++
++import pytest
++
++_BACKEND = Path(__file__).resolve().parents[1]
++if str(_BACKEND) not in sys.path:
++    sys.path.insert(0, str(_BACKEND))
++
++torch = pytest.importorskip("torch")
++F = torch.nn.functional
++from core.inference import diffusion_vae_strips as st  # noqa: E402
++
++
++@pytest.fixture(autouse = True)
++def _clean(monkeypatch):
++    monkeypatch.delenv(st.UPSAMPLE_FOLD_ENV, raising = False)
++    st._FOLD_CACHE.clear()  # noqa: SLF001
++    yield
++    st._FOLD_CACHE.clear()  # noqa: SLF001
++
++
++def _chain(
++    conv,
++    x,
++    bias = True,
++):
++    return F.conv2d(
++        F.interpolate(x, scale_factor = 2.0, mode = "nearest"),
++        conv.weight,
++        conv.bias if bias else None,
++        padding = 1,
++    )
++
++
++def _case(
++    cin = 6,
++    cout = 5,
++    h = 9,
++    w = 7,
++    dtype = torch.float64,
++):
++    torch.manual_seed(0)
++    conv = torch.nn.Conv2d(cin, cout, 3, padding = 1).to(dtype)
++    x = torch.randn(1, cin, h, w, dtype = dtype).contiguous(memory_format = torch.channels_last)
++    return conv, x
++
++
++@pytest.mark.parametrize("bias", [True, False])
++def test_whole_map_fold_matches_the_2x_chain(bias):
++    conv, x = _case()
++    y = st._fold_upsample(conv, x, conv.bias if bias else None)  # noqa: SLF001
++    ref = _chain(conv, x, bias)
++    assert y.shape == ref.shape and y.is_contiguous(memory_format = torch.channels_last)
++    assert (y - ref).abs().max().item() < 1e-6  # fp32-summed taps, fp64 data
++
++
++@pytest.mark.parametrize("h", [1, 2, 5, 13])
++def test_strip_fold_matches_the_whole_map(monkeypatch, h):
++    """Strips with the one-row halo, including the first / last strip and single-row maps."""
++    conv, x = _case(h = h)
++    monkeypatch.setattr(
++        st, "STRIP_ELEMS", conv.out_channels * 4 * 2 * x.shape[-1]
++    )  # 2 input rows per strip
++    whole = st._fold_upsample(conv, x, conv.bias)  # noqa: SLF001
++    strips = st._fold_upsample(conv, x, conv.bias, full_max = 0)  # noqa: SLF001
++    assert torch.equal(whole, strips)
++    assert (strips - _chain(conv, x)).abs().max().item() < 1e-6
++
++
++def test_folded_taps_follow_in_place_weight_edits():
++    conv, x = _case()
++    a = st.folded_upsample_weight(conv)
++    assert st.folded_upsample_weight(conv) is a  # cached
++    with torch.no_grad():
++        conv.weight.mul_(2)  # e.g. a merged LoRA
++    b = st.folded_upsample_weight(conv)
++    assert b is not a and torch.allclose(b, 2 * a)
++
++
++def test_gate_keeps_unmeasured_devices_on_the_2x_path(monkeypatch):
++    conv, x = _case(dtype = torch.float32)
++    up = type("Upsample2D", (), {"conv": conv})()
++    calls = st._FOLD_CALLS[0]  # noqa: SLF001
++    out, pend = st._upsample(up, x, False)  # noqa: SLF001 - CPU, auto: the 2x path
++    assert st._FOLD_CALLS[0] == calls and pend is None  # noqa: SLF001
++    monkeypatch.setenv(st.UPSAMPLE_FOLD_ENV, "1")
++    out2, pend2 = st._upsample(up, x, True)  # noqa: SLF001 - forced: folded, bias deferred
++    assert st._FOLD_CALLS[0] == calls + 1 and pend2 is conv.bias  # noqa: SLF001
++    assert (out2 + conv.bias.view(1, -1, 1, 1) - out).abs().max().item() < 1e-5
++    monkeypatch.setenv(st.UPSAMPLE_FOLD_ENV, "0")
++    st._upsample(up, x, False)  # noqa: SLF001
++    assert st._FOLD_CALLS[0] == calls + 1  # noqa: SLF001
++
++
++def test_auto_arms_only_the_measured_cuda_cards(monkeypatch):
++    x = torch.empty(1)
++    assert not st._fold_on(x)  # noqa: SLF001 - CPU
++    fake = type("T", (), {"is_cuda": True, "device": "cuda:0"})()
++    monkeypatch.setattr(torch.version, "hip", None)
++    for cap, want in (
++        ((8, 0), True),
++        ((12, 0), True),
++        ((8, 9), True),
++        ((7, 5), True),
++        ((10, 0), False),
++        ((9, 0), False),
++        ((8, 6), False),
++    ):
++        monkeypatch.setattr(torch.cuda, "get_device_capability", lambda d, c = cap: c)
++        assert st._fold_on(fake) is want, cap  # noqa: SLF001
++    monkeypatch.setattr(torch.version, "hip", "6.4")
++    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda d: (8, 0))
++    assert not st._fold_on(fake)  # noqa: SLF001 - ROCm (MIOpen) unmeasured
++
++
++def test_non_3x3_or_dtype_mismatch_keeps_the_2x_path(monkeypatch):
++    monkeypatch.setenv(st.UPSAMPLE_FOLD_ENV, "1")
++    conv, x = _case(dtype = torch.float32)
++    assert st._fold_ok(conv, x)  # noqa: SLF001
++    assert not st._fold_ok(conv, x.double())  # noqa: SLF001
++    c5 = torch.nn.Conv2d(6, 5, 5, padding = 2)
++    assert not st._fold_ok(c5, x)  # noqa: SLF001
++
++
++def test_fold_follows_a_data_swap_like_the_fp32_retry(monkeypatch):
++    """Studio's fp32 decode retry (diffusion_vae_upcast) swaps ``.data`` under the same Parameter: version unchanged."""
++    from core.inference import diffusion_vae_upcast as upcast
++
++    monkeypatch.setenv(st.UPSAMPLE_FOLD_ENV, "1")
++    conv, x = _case(dtype = torch.bfloat16)
++    up = type("Upsample2D", (), {"conv": conv})()
++    st._upsample(up, x, False)  # noqa: SLF001 - folds and caches the bf16 taps
++    token = upcast.upcast_keeping_storage(conv)
++    try:
++        y, _ = st._upsample(up, x.float(), False)  # noqa: SLF001
++        assert y.dtype == torch.float32
++        assert (y - _chain(conv, x.float())).abs().max().item() < 1e-5
++    finally:
++        upcast.restore_storage(token)
++    assert st._upsample(up, x, False)[0].dtype == torch.bfloat16  # noqa: SLF001
