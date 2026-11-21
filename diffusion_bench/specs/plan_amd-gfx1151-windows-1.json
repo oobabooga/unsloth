@@ -1,0 +1,1305 @@
+{
+ "name": "amd_nov21_win:amd-gfx1151-windows-1",
+ "description": "plan.py VM amd-gfx1151-windows-1 (amd:gfx1151-windows)",
+ "defaults": {},
+ "cells": [
+  {
+   "backend": "studio",
+   "kind": "video",
+   "width": 1280,
+   "height": 704,
+   "steps": 20,
+   "guidance": 5.0,
+   "negative_prompt": "\u8272\u8c03\u8273\u4e3d\uff0c\u8fc7\u66dd\uff0c\u9759\u6001\uff0c\u7ec6\u8282\u6a21\u7cca\u4e0d\u6e05\uff0c\u5b57\u5e55\uff0c\u98ce\u683c\uff0c\u4f5c\u54c1\uff0c\u753b\u4f5c\uff0c\u753b\u9762\uff0c\u9759\u6b62\uff0c\u6574\u4f53\u53d1\u7070\uff0c\u6700\u5dee\u8d28\u91cf\uff0c\u4f4e\u8d28\u91cf\uff0cJPEG\u538b\u7f29\u6b8b\u7559\uff0c\u4e11\u964b\u7684\uff0c\u6b8b\u7f3a\u7684\uff0c\u591a\u4f59\u7684\u624b\u6307\uff0c\u753b\u5f97\u4e0d\u597d\u7684\u624b\u90e8\uff0c\u753b\u5f97\u4e0d\u597d\u7684\u8138\u90e8\uff0c\u7578\u5f62\u7684\uff0c\u6bc1\u5bb9\u7684\uff0c\u5f62\u6001\u7578\u5f62\u7684\u80a2\u4f53\uff0c\u624b\u6307\u878d\u5408\uff0c\u9759\u6b62\u4e0d\u52a8\u7684\u753b\u9762\uff0c\u6742\u4e71\u7684\u80cc\u666f\uff0c\u4e09\u6761\u817f\uff0c\u80cc\u666f\u4eba\u5f88\u591a\uff0c\u5012\u7740\u8d70",
+   "prompts": "video_3",
+   "n": 1,
+   "warmup": 0,
+   "options": {
+    "transformer_quant": "none",
+    "generate": {},
+    "speed_mode": "default",
+    "target": {
+     "name": "amd:gfx1151-windows",
+     "vm_id": "amd-gfx1151-windows-1",
+     "lane": null,
+     "account": null,
+     "simulated_budget_gib": null,
+     "concurrent_with": null
+    },
+    "arm": {
+     "stack": "studio",
+     "block": 0,
+     "order": "trial",
+     "aa_of": null,
+     "label": "s_fp16",
+     "comparison": "wan2-2-5b_amd-gfx1151-windows",
+     "purpose": "trial",
+     "format": "fp16",
+     "tier": "default"
+    }
+   },
+   "env": {},
+   "frames": 21,
+   "fps": 24,
+   "model": "Wan-AI/Wan2.2-TI2V-5B-Diffusers",
+   "variant": "fp16",
+   "card": "wan2.2-5b",
+   "venv": {
+    "profile": "studio"
+   },
+   "short_n": 0,
+   "tag": "trial__amd-gfx1151-windows-1",
+   "family": "wan2.2-5b"
+  },
+  {
+   "backend": "studio",
+   "kind": "video",
+   "width": 1280,
+   "height": 704,
+   "steps": 20,
+   "guidance": 5.0,
+   "negative_prompt": "\u8272\u8c03\u8273\u4e3d\uff0c\u8fc7\u66dd\uff0c\u9759\u6001\uff0c\u7ec6\u8282\u6a21\u7cca\u4e0d\u6e05\uff0c\u5b57\u5e55\uff0c\u98ce\u683c\uff0c\u4f5c\u54c1\uff0c\u753b\u4f5c\uff0c\u753b\u9762\uff0c\u9759\u6b62\uff0c\u6574\u4f53\u53d1\u7070\uff0c\u6700\u5dee\u8d28\u91cf\uff0c\u4f4e\u8d28\u91cf\uff0cJPEG\u538b\u7f29\u6b8b\u7559\uff0c\u4e11\u964b\u7684\uff0c\u6b8b\u7f3a\u7684\uff0c\u591a\u4f59\u7684\u624b\u6307\uff0c\u753b\u5f97\u4e0d\u597d\u7684\u624b\u90e8\uff0c\u753b\u5f97\u4e0d\u597d\u7684\u8138\u90e8\uff0c\u7578\u5f62\u7684\uff0c\u6bc1\u5bb9\u7684\uff0c\u5f62\u6001\u7578\u5f62\u7684\u80a2\u4f53\uff0c\u624b\u6307\u878d\u5408\uff0c\u9759\u6b62\u4e0d\u52a8\u7684\u753b\u9762\uff0c\u6742\u4e71\u7684\u80cc\u666f\uff0c\u4e09\u6761\u817f\uff0c\u80cc\u666f\u4eba\u5f88\u591a\uff0c\u5012\u7740\u8d70",
+   "prompts": "video_3",
+   "n": 1,
+   "warmup": 1,
+   "options": {
+    "transformer_quant": "none",
+    "generate": {},
+    "speed_mode": "default",
+    "target": {
+     "name": "amd:gfx1151-windows",
+     "vm_id": "amd-gfx1151-windows-1",
+     "lane": null,
+     "account": null,
+     "simulated_budget_gib": null,
+     "concurrent_with": null
+    },
+    "arm": {
+     "stack": "studio",
+     "block": 1,
+     "order": "ABBA",
+     "aa_of": null,
+     "label": "s_fp16",
+     "comparison": "wan2-2-5b_amd-gfx1151-windows",
+     "purpose": "timing",
+     "format": "fp16",
+     "tier": "default"
+    }
+   },
+   "env": {},
+   "frames": 21,
+   "fps": 24,
+   "model": "Wan-AI/Wan2.2-TI2V-5B-Diffusers",
+   "variant": "fp16",
+   "card": "wan2.2-5b",
+   "venv": {
+    "profile": "studio"
+   },
+   "short_n": 1,
+   "tag": "wan2-2-5b_amd-gfx1151-windows__s_fp16__k1p0",
+   "family": "wan2.2-5b"
+  },
+  {
+   "backend": "studio",
+   "kind": "video",
+   "width": 1280,
+   "height": 704,
+   "steps": 20,
+   "guidance": 5.0,
+   "negative_prompt": "\u8272\u8c03\u8273\u4e3d\uff0c\u8fc7\u66dd\uff0c\u9759\u6001\uff0c\u7ec6\u8282\u6a21\u7cca\u4e0d\u6e05\uff0c\u5b57\u5e55\uff0c\u98ce\u683c\uff0c\u4f5c\u54c1\uff0c\u753b\u4f5c\uff0c\u753b\u9762\uff0c\u9759\u6b62\uff0c\u6574\u4f53\u53d1\u7070\uff0c\u6700\u5dee\u8d28\u91cf\uff0c\u4f4e\u8d28\u91cf\uff0cJPEG\u538b\u7f29\u6b8b\u7559\uff0c\u4e11\u964b\u7684\uff0c\u6b8b\u7f3a\u7684\uff0c\u591a\u4f59\u7684\u624b\u6307\uff0c\u753b\u5f97\u4e0d\u597d\u7684\u624b\u90e8\uff0c\u753b\u5f97\u4e0d\u597d\u7684\u8138\u90e8\uff0c\u7578\u5f62\u7684\uff0c\u6bc1\u5bb9\u7684\uff0c\u5f62\u6001\u7578\u5f62\u7684\u80a2\u4f53\uff0c\u624b\u6307\u878d\u5408\uff0c\u9759\u6b62\u4e0d\u52a8\u7684\u753b\u9762\uff0c\u6742\u4e71\u7684\u80cc\u666f\uff0c\u4e09\u6761\u817f\uff0c\u80cc\u666f\u4eba\u5f88\u591a\uff0c\u5012\u7740\u8d70",
+   "prompts": "video_3",
+   "n": 1,
+   "warmup": 1,
+   "options": {
+    "transformer_quant": "none",
+    "generate": {},
+    "speed_mode": "default",
+    "target": {
+     "name": "amd:gfx1151-windows",
+     "vm_id": "amd-gfx1151-windows-1",
+     "lane": null,
+     "account": null,
+     "simulated_budget_gib": null,
+     "concurrent_with": null
+    },
+    "arm": {
+     "stack": "studio",
+     "block": 1,
+     "order": "ABBA",
+     "aa_of": "wan2-2-5b_amd-gfx1151-windows__s_fp16__k1p0",
+     "label": "s_fp16",
+     "comparison": "wan2-2-5b_amd-gfx1151-windows",
+     "purpose": "timing",
+     "format": "fp16",
+     "tier": "default"
+    }
+   },
+   "env": {},
+   "frames": 21,
+   "fps": 24,
+   "model": "Wan-AI/Wan2.2-TI2V-5B-Diffusers",
+   "variant": "fp16",
+   "card": "wan2.2-5b",
+   "venv": {
+    "profile": "studio"
+   },
+   "short_n": 1,
+   "tag": "wan2-2-5b_amd-gfx1151-windows__s_fp16__k1p1",
+   "family": "wan2.2-5b"
+  },
+  {
+   "backend": "studio",
+   "kind": "video",
+   "width": 1280,
+   "height": 704,
+   "steps": 20,
+   "guidance": 5.0,
+   "negative_prompt": "\u8272\u8c03\u8273\u4e3d\uff0c\u8fc7\u66dd\uff0c\u9759\u6001\uff0c\u7ec6\u8282\u6a21\u7cca\u4e0d\u6e05\uff0c\u5b57\u5e55\uff0c\u98ce\u683c\uff0c\u4f5c\u54c1\uff0c\u753b\u4f5c\uff0c\u753b\u9762\uff0c\u9759\u6b62\uff0c\u6574\u4f53\u53d1\u7070\uff0c\u6700\u5dee\u8d28\u91cf\uff0c\u4f4e\u8d28\u91cf\uff0cJPEG\u538b\u7f29\u6b8b\u7559\uff0c\u4e11\u964b\u7684\uff0c\u6b8b\u7f3a\u7684\uff0c\u591a\u4f59\u7684\u624b\u6307\uff0c\u753b\u5f97\u4e0d\u597d\u7684\u624b\u90e8\uff0c\u753b\u5f97\u4e0d\u597d\u7684\u8138\u90e8\uff0c\u7578\u5f62\u7684\uff0c\u6bc1\u5bb9\u7684\uff0c\u5f62\u6001\u7578\u5f62\u7684\u80a2\u4f53\uff0c\u624b\u6307\u878d\u5408\uff0c\u9759\u6b62\u4e0d\u52a8\u7684\u753b\u9762\uff0c\u6742\u4e71\u7684\u80cc\u666f\uff0c\u4e09\u6761\u817f\uff0c\u80cc\u666f\u4eba\u5f88\u591a\uff0c\u5012\u7740\u8d70",
+   "prompts": "video_3",
+   "n": 1,
+   "warmup": 1,
+   "options": {
+    "transformer_quant": "none",
+    "generate": {},
+    "speed_mode": "default",
+    "target": {
+     "name": "amd:gfx1151-windows",
+     "vm_id": "amd-gfx1151-windows-1",
+     "lane": null,
+     "account": null,
+     "simulated_budget_gib": null,
+     "concurrent_with": null
+    },
+    "arm": {
+     "stack": "studio",
+     "block": 1,
+     "order": "ABBA",
+     "aa_of": "wan2-2-5b_amd-gfx1151-windows__s_fp16__k1p0",
+     "label": "s_fp16",
+     "comparison": "wan2-2-5b_amd-gfx1151-windows",
+     "purpose": "timing",
+     "format": "fp16",
+     "tier": "default"
+    }
+   },
+   "env": {},
+   "frames": 21,
+   "fps": 24,
+   "model": "Wan-AI/Wan2.2-TI2V-5B-Diffusers",
+   "variant": "fp16",
+   "card": "wan2.2-5b",
+   "venv": {
+    "profile": "studio"
+   },
+   "short_n": 1,
+   "tag": "wan2-2-5b_amd-gfx1151-windows__s_fp16__k1p2",
+   "family": "wan2.2-5b"
+  },
+  {
+   "backend": "studio",
+   "kind": "image",
+   "width": 1024,
+   "height": 1024,
+   "steps": 25,
+   "guidance": 1.0,
+   "prompts": "image_24",
+   "n": 1,
+   "warmup": 1,
+   "options": {
+    "transformer_quant": "none",
+    "text_encoder_quant": "none",
+    "generate": {},
+    "speed_mode": "default",
+    "target": {
+     "name": "amd:gfx1151-windows",
+     "vm_id": "amd-gfx1151-windows-1",
+     "lane": null,
+     "account": null,
+     "simulated_budget_gib": null,
+     "concurrent_with": null
+    },
+    "arm": {
+     "stack": "studio",
+     "block": 1,
+     "order": "ABBA",
+     "aa_of": null,
+     "label": "s_bf16",
+     "comparison": "qwen-image-2-1_amd-gfx1151-windows",
+     "purpose": "timing",
+     "format": "bf16",
+     "tier": "default"
+    }
+   },
+   "env": {},
+   "model": "Qwen/Qwen-Image-2.1",
+   "variant": "bf16",
+   "card": "qwen-image-2.1",
+   "venv": {
+    "profile": "studio"
+   },
+   "short_n": 1,
+   "tag": "qwen-image-2-1_amd-gfx1151-windows__s_bf16__k1p0",
+   "family": "qwen-image-2.1"
+  },
+  {
+   "backend": "studio",
+   "kind": "image",
+   "width": 1024,
+   "height": 1024,
+   "steps": 25,
+   "guidance": 1.0,
+   "prompts": "image_24",
+   "n": 1,
+   "warmup": 1,
+   "options": {
+    "transformer_quant": "auto",
+    "generate": {},
+    "speed_mode": "default",
+    "text_encoder_quant": "auto",
+    "target": {
+     "name": "amd:gfx1151-windows",
+     "vm_id": "amd-gfx1151-windows-1",
+     "lane": null,
+     "account": null,
+     "simulated_budget_gib": null,
+     "concurrent_with": null
+    },
+    "arm": {
+     "stack": "studio",
+     "block": 1,
+     "order": "ABBA",
+     "aa_of": null,
+     "label": "s_int8_auto",
+     "comparison": "qwen-image-2-1_amd-gfx1151-windows",
+     "purpose": "timing",
+     "format": "int8",
+     "tier": "default"
+    }
+   },
+   "env": {},
+   "model": "Qwen/Qwen-Image-2.1",
+   "variant": "int8",
+   "card": "qwen-image-2.1",
+   "venv": {
+    "profile": "studio"
+   },
+   "short_n": 1,
+   "tag": "qwen-image-2-1_amd-gfx1151-windows__s_int8_auto__k1p1",
+   "family": "qwen-image-2.1"
+  },
+  {
+   "backend": "studio",
+   "kind": "image",
+   "width": 1024,
+   "height": 1024,
+   "steps": 25,
+   "guidance": 1.0,
+   "prompts": "image_24",
+   "n": 1,
+   "warmup": 1,
+   "options": {
+    "transformer_quant": "auto",
+    "generate": {},
+    "speed_mode": "default",
+    "text_encoder_quant": "auto",
+    "target": {
+     "name": "amd:gfx1151-windows",
+     "vm_id": "amd-gfx1151-windows-1",
+     "lane": null,
+     "account": null,
+     "simulated_budget_gib": null,
+     "concurrent_with": null
+    },
+    "arm": {
+     "stack": "studio",
+     "block": 1,
+     "order": "ABBA",
+     "aa_of": "qwen-image-2-1_amd-gfx1151-windows__s_int8_auto__k1p1",
+     "label": "s_int8_auto",
+     "comparison": "qwen-image-2-1_amd-gfx1151-windows",
+     "purpose": "timing",
+     "format": "int8",
+     "tier": "default"
+    }
+   },
+   "env": {},
+   "model": "Qwen/Qwen-Image-2.1",
+   "variant": "int8",
+   "card": "qwen-image-2.1",
+   "venv": {
+    "profile": "studio"
+   },
+   "short_n": 1,
+   "tag": "qwen-image-2-1_amd-gfx1151-windows__s_int8_auto__k1p2",
+   "family": "qwen-image-2.1"
+  },
+  {
+   "backend": "studio",
+   "kind": "image",
+   "width": 1024,
+   "height": 1024,
+   "steps": 25,
+   "guidance": 1.0,
+   "prompts": "image_24",
+   "n": 1,
+   "warmup": 1,
+   "options": {
+    "transformer_quant": "none",
+    "text_encoder_quant": "none",
+    "generate": {},
+    "speed_mode": "default",
+    "target": {
+     "name": "amd:gfx1151-windows",
+     "vm_id": "amd-gfx1151-windows-1",
+     "lane": null,
+     "account": null,
+     "simulated_budget_gib": null,
+     "concurrent_with": null
+    },
+    "arm": {
+     "stack": "studio",
+     "block": 1,
+     "order": "ABBA",
+     "aa_of": "qwen-image-2-1_amd-gfx1151-windows__s_bf16__k1p0",
+     "label": "s_bf16",
+     "comparison": "qwen-image-2-1_amd-gfx1151-windows",
+     "purpose": "timing",
+     "format": "bf16",
+     "tier": "default"
+    }
+   },
+   "env": {},
+   "model": "Qwen/Qwen-Image-2.1",
+   "variant": "bf16",
+   "card": "qwen-image-2.1",
+   "venv": {
+    "profile": "studio"
+   },
+   "short_n": 1,
+   "tag": "qwen-image-2-1_amd-gfx1151-windows__s_bf16__k1p3",
+   "family": "qwen-image-2.1"
+  },
+  {
+   "backend": "studio",
+   "kind": "image",
+   "width": 1024,
+   "height": 1024,
+   "steps": 25,
+   "guidance": 1.0,
+   "prompts": "image_24",
+   "n": 1,
+   "warmup": 1,
+   "options": {
+    "transformer_quant": "none",
+    "text_encoder_quant": "none",
+    "generate": {},
+    "speed_mode": "default",
+    "target": {
+     "name": "amd:gfx1151-windows",
+     "vm_id": "amd-gfx1151-windows-1",
+     "lane": null,
+     "account": null,
+     "simulated_budget_gib": null,
+     "concurrent_with": null
+    },
+    "arm": {
+     "stack": "studio",
+     "block": 2,
+     "order": "ABBA",
+     "aa_of": null,
+     "label": "s_bf16",
+     "comparison": "qwen-image-2-1_amd-gfx1151-windows",
+     "purpose": "timing",
+     "format": "bf16",
+     "tier": "default"
+    }
+   },
+   "env": {},
+   "model": "Qwen/Qwen-Image-2.1",
+   "variant": "bf16",
+   "card": "qwen-image-2.1",
+   "venv": {
+    "profile": "studio"
+   },
+   "short_n": 1,
+   "tag": "qwen-image-2-1_amd-gfx1151-windows__s_bf16__k2p0",
+   "family": "qwen-image-2.1"
+  },
+  {
+   "backend": "studio",
+   "kind": "image",
+   "width": 1024,
+   "height": 1024,
+   "steps": 25,
+   "guidance": 1.0,
+   "prompts": "image_24",
+   "n": 1,
+   "warmup": 1,
+   "options": {
+    "transformer_quant": "auto",
+    "generate": {},
+    "speed_mode": "default",
+    "text_encoder_quant": "auto",
+    "target": {
+     "name": "amd:gfx1151-windows",
+     "vm_id": "amd-gfx1151-windows-1",
+     "lane": null,
+     "account": null,
+     "simulated_budget_gib": null,
+     "concurrent_with": null
+    },
+    "arm": {
+     "stack": "studio",
+     "block": 2,
+     "order": "ABBA",
+     "aa_of": null,
+     "label": "s_int8_auto",
+     "comparison": "qwen-image-2-1_amd-gfx1151-windows",
+     "purpose": "timing",
+     "format": "int8",
+     "tier": "default"
+    }
+   },
+   "env": {},
+   "model": "Qwen/Qwen-Image-2.1",
+   "variant": "int8",
+   "card": "qwen-image-2.1",
+   "venv": {
+    "profile": "studio"
+   },
+   "short_n": 1,
+   "tag": "qwen-image-2-1_amd-gfx1151-windows__s_int8_auto__k2p1",
+   "family": "qwen-image-2.1"
+  },
+  {
+   "backend": "studio",
+   "kind": "image",
+   "width": 1024,
+   "height": 1024,
+   "steps": 25,
+   "guidance": 1.0,
+   "prompts": "image_24",
+   "n": 1,
+   "warmup": 1,
+   "options": {
+    "transformer_quant": "auto",
+    "generate": {},
+    "speed_mode": "default",
+    "text_encoder_quant": "auto",
+    "target": {
+     "name": "amd:gfx1151-windows",
+     "vm_id": "amd-gfx1151-windows-1",
+     "lane": null,
+     "account": null,
+     "simulated_budget_gib": null,
+     "concurrent_with": null
+    },
+    "arm": {
+     "stack": "studio",
+     "block": 2,
+     "order": "ABBA",
+     "aa_of": "qwen-image-2-1_amd-gfx1151-windows__s_int8_auto__k2p1",
+     "label": "s_int8_auto",
+     "comparison": "qwen-image-2-1_amd-gfx1151-windows",
+     "purpose": "timing",
+     "format": "int8",
+     "tier": "default"
+    }
+   },
+   "env": {},
+   "model": "Qwen/Qwen-Image-2.1",
+   "variant": "int8",
+   "card": "qwen-image-2.1",
+   "venv": {
+    "profile": "studio"
+   },
+   "short_n": 1,
+   "tag": "qwen-image-2-1_amd-gfx1151-windows__s_int8_auto__k2p2",
+   "family": "qwen-image-2.1"
+  },
+  {
+   "backend": "studio",
+   "kind": "image",
+   "width": 1024,
+   "height": 1024,
+   "steps": 25,
+   "guidance": 1.0,
+   "prompts": "image_24",
+   "n": 1,
+   "warmup": 1,
+   "options": {
+    "transformer_quant": "none",
+    "text_encoder_quant": "none",
+    "generate": {},
+    "speed_mode": "default",
+    "target": {
+     "name": "amd:gfx1151-windows",
+     "vm_id": "amd-gfx1151-windows-1",
+     "lane": null,
+     "account": null,
+     "simulated_budget_gib": null,
+     "concurrent_with": null
+    },
+    "arm": {
+     "stack": "studio",
+     "block": 2,
+     "order": "ABBA",
+     "aa_of": "qwen-image-2-1_amd-gfx1151-windows__s_bf16__k2p0",
+     "label": "s_bf16",
+     "comparison": "qwen-image-2-1_amd-gfx1151-windows",
+     "purpose": "timing",
+     "format": "bf16",
+     "tier": "default"
+    }
+   },
+   "env": {},
+   "model": "Qwen/Qwen-Image-2.1",
+   "variant": "bf16",
+   "card": "qwen-image-2.1",
+   "venv": {
+    "profile": "studio"
+   },
+   "short_n": 1,
+   "tag": "qwen-image-2-1_amd-gfx1151-windows__s_bf16__k2p3",
+   "family": "qwen-image-2.1"
+  },
+  {
+   "backend": "studio",
+   "kind": "image",
+   "width": 1024,
+   "height": 1024,
+   "steps": 16,
+   "guidance": 1.0,
+   "prompts": "image_24",
+   "n": 1,
+   "warmup": 1,
+   "options": {
+    "transformer_quant": "none",
+    "text_encoder_quant": "none",
+    "generate": {},
+    "speed_mode": "default",
+    "target": {
+     "name": "amd:gfx1151-windows",
+     "vm_id": "amd-gfx1151-windows-1",
+     "lane": null,
+     "account": null,
+     "simulated_budget_gib": null,
+     "concurrent_with": null
+    },
+    "arm": {
+     "stack": "studio",
+     "block": 1,
+     "order": "ABBA",
+     "aa_of": null,
+     "label": "s_bf16",
+     "comparison": "flux-3-klein_amd-gfx1151-windows",
+     "purpose": "timing",
+     "format": "bf16",
+     "tier": "default"
+    }
+   },
+   "env": {},
+   "model": "black-forest-labs/flux-3-image-klein",
+   "variant": "bf16",
+   "card": "flux.3-klein",
+   "venv": {
+    "profile": "studio"
+   },
+   "short_n": 1,
+   "tag": "flux-3-klein_amd-gfx1151-windows__s_bf16__k1p0",
+   "family": "flux.3-klein"
+  },
+  {
+   "backend": "studio",
+   "kind": "image",
+   "width": 1024,
+   "height": 1024,
+   "steps": 16,
+   "guidance": 1.0,
+   "prompts": "image_24",
+   "n": 1,
+   "warmup": 1,
+   "options": {
+    "transformer_quant": "auto",
+    "generate": {},
+    "speed_mode": "default",
+    "text_encoder_quant": "auto",
+    "target": {
+     "name": "amd:gfx1151-windows",
+     "vm_id": "amd-gfx1151-windows-1",
+     "lane": null,
+     "account": null,
+     "simulated_budget_gib": null,
+     "concurrent_with": null
+    },
+    "arm": {
+     "stack": "studio",
+     "block": 1,
+     "order": "ABBA",
+     "aa_of": null,
+     "label": "s_int8_auto",
+     "comparison": "flux-3-klein_amd-gfx1151-windows",
+     "purpose": "timing",
+     "format": "int8",
+     "tier": "default"
+    }
+   },
+   "env": {},
+   "model": "black-forest-labs/flux-3-image-klein",
+   "variant": "int8",
+   "card": "flux.3-klein",
+   "venv": {
+    "profile": "studio"
+   },
+   "short_n": 1,
+   "tag": "flux-3-klein_amd-gfx1151-windows__s_int8_auto__k1p1",
+   "family": "flux.3-klein"
+  },
+  {
+   "backend": "studio",
+   "kind": "image",
+   "width": 1024,
+   "height": 1024,
+   "steps": 16,
+   "guidance": 1.0,
+   "prompts": "image_24",
+   "n": 1,
+   "warmup": 1,
+   "options": {
+    "transformer_quant": "auto",
+    "generate": {},
+    "speed_mode": "default",
+    "text_encoder_quant": "auto",
+    "target": {
+     "name": "amd:gfx1151-windows",
+     "vm_id": "amd-gfx1151-windows-1",
+     "lane": null,
+     "account": null,
+     "simulated_budget_gib": null,
+     "concurrent_with": null
+    },
+    "arm": {
+     "stack": "studio",
+     "block": 1,
+     "order": "ABBA",
+     "aa_of": "flux-3-klein_amd-gfx1151-windows__s_int8_auto__k1p1",
+     "label": "s_int8_auto",
+     "comparison": "flux-3-klein_amd-gfx1151-windows",
+     "purpose": "timing",
+     "format": "int8",
+     "tier": "default"
+    }
+   },
+   "env": {},
+   "model": "black-forest-labs/flux-3-image-klein",
+   "variant": "int8",
+   "card": "flux.3-klein",
+   "venv": {
+    "profile": "studio"
+   },
+   "short_n": 1,
+   "tag": "flux-3-klein_amd-gfx1151-windows__s_int8_auto__k1p2",
+   "family": "flux.3-klein"
+  },
+  {
+   "backend": "studio",
+   "kind": "image",
+   "width": 1024,
+   "height": 1024,
+   "steps": 16,
+   "guidance": 1.0,
+   "prompts": "image_24",
+   "n": 1,
+   "warmup": 1,
+   "options": {
+    "transformer_quant": "none",
+    "text_encoder_quant": "none",
+    "generate": {},
+    "speed_mode": "default",
+    "target": {
+     "name": "amd:gfx1151-windows",
+     "vm_id": "amd-gfx1151-windows-1",
+     "lane": null,
+     "account": null,
+     "simulated_budget_gib": null,
+     "concurrent_with": null
+    },
+    "arm": {
+     "stack": "studio",
+     "block": 1,
+     "order": "ABBA",
+     "aa_of": "flux-3-klein_amd-gfx1151-windows__s_bf16__k1p0",
+     "label": "s_bf16",
+     "comparison": "flux-3-klein_amd-gfx1151-windows",
+     "purpose": "timing",
+     "format": "bf16",
+     "tier": "default"
+    }
+   },
+   "env": {},
+   "model": "black-forest-labs/flux-3-image-klein",
+   "variant": "bf16",
+   "card": "flux.3-klein",
+   "venv": {
+    "profile": "studio"
+   },
+   "short_n": 1,
+   "tag": "flux-3-klein_amd-gfx1151-windows__s_bf16__k1p3",
+   "family": "flux.3-klein"
+  },
+  {
+   "backend": "studio",
+   "kind": "image",
+   "width": 1024,
+   "height": 1024,
+   "steps": 16,
+   "guidance": 1.0,
+   "prompts": "image_24",
+   "n": 1,
+   "warmup": 1,
+   "options": {
+    "transformer_quant": "none",
+    "text_encoder_quant": "none",
+    "generate": {},
+    "speed_mode": "default",
+    "target": {
+     "name": "amd:gfx1151-windows",
+     "vm_id": "amd-gfx1151-windows-1",
+     "lane": null,
+     "account": null,
+     "simulated_budget_gib": null,
+     "concurrent_with": null
+    },
+    "arm": {
+     "stack": "studio",
+     "block": 2,
+     "order": "ABBA",
+     "aa_of": null,
+     "label": "s_bf16",
+     "comparison": "flux-3-klein_amd-gfx1151-windows",
+     "purpose": "timing",
+     "format": "bf16",
+     "tier": "default"
+    }
+   },
+   "env": {},
+   "model": "black-forest-labs/flux-3-image-klein",
+   "variant": "bf16",
+   "card": "flux.3-klein",
+   "venv": {
+    "profile": "studio"
+   },
+   "short_n": 1,
+   "tag": "flux-3-klein_amd-gfx1151-windows__s_bf16__k2p0",
+   "family": "flux.3-klein"
+  },
+  {
+   "backend": "studio",
+   "kind": "image",
+   "width": 1024,
+   "height": 1024,
+   "steps": 16,
+   "guidance": 1.0,
+   "prompts": "image_24",
+   "n": 1,
+   "warmup": 1,
+   "options": {
+    "transformer_quant": "auto",
+    "generate": {},
+    "speed_mode": "default",
+    "text_encoder_quant": "auto",
+    "target": {
+     "name": "amd:gfx1151-windows",
+     "vm_id": "amd-gfx1151-windows-1",
+     "lane": null,
+     "account": null,
+     "simulated_budget_gib": null,
+     "concurrent_with": null
+    },
+    "arm": {
+     "stack": "studio",
+     "block": 2,
+     "order": "ABBA",
+     "aa_of": null,
+     "label": "s_int8_auto",
+     "comparison": "flux-3-klein_amd-gfx1151-windows",
+     "purpose": "timing",
+     "format": "int8",
+     "tier": "default"
+    }
+   },
+   "env": {},
+   "model": "black-forest-labs/flux-3-image-klein",
+   "variant": "int8",
+   "card": "flux.3-klein",
+   "venv": {
+    "profile": "studio"
+   },
+   "short_n": 1,
+   "tag": "flux-3-klein_amd-gfx1151-windows__s_int8_auto__k2p1",
+   "family": "flux.3-klein"
+  },
+  {
+   "backend": "studio",
+   "kind": "image",
+   "width": 1024,
+   "height": 1024,
+   "steps": 16,
+   "guidance": 1.0,
+   "prompts": "image_24",
+   "n": 1,
+   "warmup": 1,
+   "options": {
+    "transformer_quant": "auto",
+    "generate": {},
+    "speed_mode": "default",
+    "text_encoder_quant": "auto",
+    "target": {
+     "name": "amd:gfx1151-windows",
+     "vm_id": "amd-gfx1151-windows-1",
+     "lane": null,
+     "account": null,
+     "simulated_budget_gib": null,
+     "concurrent_with": null
+    },
+    "arm": {
+     "stack": "studio",
+     "block": 2,
+     "order": "ABBA",
+     "aa_of": "flux-3-klein_amd-gfx1151-windows__s_int8_auto__k2p1",
+     "label": "s_int8_auto",
+     "comparison": "flux-3-klein_amd-gfx1151-windows",
+     "purpose": "timing",
+     "format": "int8",
+     "tier": "default"
+    }
+   },
+   "env": {},
+   "model": "black-forest-labs/flux-3-image-klein",
+   "variant": "int8",
+   "card": "flux.3-klein",
+   "venv": {
+    "profile": "studio"
+   },
+   "short_n": 1,
+   "tag": "flux-3-klein_amd-gfx1151-windows__s_int8_auto__k2p2",
+   "family": "flux.3-klein"
+  },
+  {
+   "backend": "studio",
+   "kind": "image",
+   "width": 1024,
+   "height": 1024,
+   "steps": 16,
+   "guidance": 1.0,
+   "prompts": "image_24",
+   "n": 1,
+   "warmup": 1,
+   "options": {
+    "transformer_quant": "none",
+    "text_encoder_quant": "none",
+    "generate": {},
+    "speed_mode": "default",
+    "target": {
+     "name": "amd:gfx1151-windows",
+     "vm_id": "amd-gfx1151-windows-1",
+     "lane": null,
+     "account": null,
+     "simulated_budget_gib": null,
+     "concurrent_with": null
+    },
+    "arm": {
+     "stack": "studio",
+     "block": 2,
+     "order": "ABBA",
+     "aa_of": "flux-3-klein_amd-gfx1151-windows__s_bf16__k2p0",
+     "label": "s_bf16",
+     "comparison": "flux-3-klein_amd-gfx1151-windows",
+     "purpose": "timing",
+     "format": "bf16",
+     "tier": "default"
+    }
+   },
+   "env": {},
+   "model": "black-forest-labs/flux-3-image-klein",
+   "variant": "bf16",
+   "card": "flux.3-klein",
+   "venv": {
+    "profile": "studio"
+   },
+   "short_n": 1,
+   "tag": "flux-3-klein_amd-gfx1151-windows__s_bf16__k2p3",
+   "family": "flux.3-klein"
+  },
+  {
+   "backend": "studio",
+   "kind": "image",
+   "width": 1024,
+   "height": 1024,
+   "steps": 8,
+   "guidance": 0.0,
+   "prompts": "image_24",
+   "n": 1,
+   "warmup": 1,
+   "options": {
+    "transformer_quant": "none",
+    "text_encoder_quant": "none",
+    "generate": {},
+    "speed_mode": "default",
+    "target": {
+     "name": "amd:gfx1151-windows",
+     "vm_id": "amd-gfx1151-windows-1",
+     "lane": null,
+     "account": null,
+     "simulated_budget_gib": null,
+     "concurrent_with": null
+    },
+    "arm": {
+     "stack": "studio",
+     "block": 1,
+     "order": "ABBA",
+     "aa_of": null,
+     "label": "s_bf16",
+     "comparison": "z-image-turbo_amd-gfx1151-windows",
+     "purpose": "timing",
+     "format": "bf16",
+     "tier": "default"
+    }
+   },
+   "env": {},
+   "model": "Tongyi-MAI/Z-Image-Turbo",
+   "variant": "bf16",
+   "card": "z-image-turbo",
+   "venv": {
+    "profile": "studio"
+   },
+   "short_n": 1,
+   "tag": "z-image-turbo_amd-gfx1151-windows__s_bf16__k1p0",
+   "family": "z-image-turbo"
+  },
+  {
+   "backend": "studio",
+   "kind": "image",
+   "width": 1024,
+   "height": 1024,
+   "steps": 8,
+   "guidance": 0.0,
+   "prompts": "image_24",
+   "n": 1,
+   "warmup": 1,
+   "options": {
+    "transformer_quant": "none",
+    "text_encoder_quant": "none",
+    "generate": {},
+    "speed_mode": "default",
+    "target": {
+     "name": "amd:gfx1151-windows",
+     "vm_id": "amd-gfx1151-windows-1",
+     "lane": null,
+     "account": null,
+     "simulated_budget_gib": null,
+     "concurrent_with": null
+    },
+    "arm": {
+     "stack": "studio",
+     "block": 1,
+     "order": "ABBA",
+     "aa_of": "z-image-turbo_amd-gfx1151-windows__s_bf16__k1p0",
+     "label": "s_bf16",
+     "comparison": "z-image-turbo_amd-gfx1151-windows",
+     "purpose": "timing",
+     "format": "bf16",
+     "tier": "default"
+    }
+   },
+   "env": {},
+   "model": "Tongyi-MAI/Z-Image-Turbo",
+   "variant": "bf16",
+   "card": "z-image-turbo",
+   "venv": {
+    "profile": "studio"
+   },
+   "short_n": 1,
+   "tag": "z-image-turbo_amd-gfx1151-windows__s_bf16__k1p1",
+   "family": "z-image-turbo"
+  },
+  {
+   "backend": "studio",
+   "kind": "image",
+   "width": 1024,
+   "height": 1024,
+   "steps": 8,
+   "guidance": 0.0,
+   "prompts": "image_24",
+   "n": 1,
+   "warmup": 1,
+   "options": {
+    "transformer_quant": "none",
+    "text_encoder_quant": "none",
+    "generate": {},
+    "speed_mode": "default",
+    "target": {
+     "name": "amd:gfx1151-windows",
+     "vm_id": "amd-gfx1151-windows-1",
+     "lane": null,
+     "account": null,
+     "simulated_budget_gib": null,
+     "concurrent_with": null
+    },
+    "arm": {
+     "stack": "studio",
+     "block": 1,
+     "order": "ABBA",
+     "aa_of": "z-image-turbo_amd-gfx1151-windows__s_bf16__k1p0",
+     "label": "s_bf16",
+     "comparison": "z-image-turbo_amd-gfx1151-windows",
+     "purpose": "timing",
+     "format": "bf16",
+     "tier": "default"
+    }
+   },
+   "env": {},
+   "model": "Tongyi-MAI/Z-Image-Turbo",
+   "variant": "bf16",
+   "card": "z-image-turbo",
+   "venv": {
+    "profile": "studio"
+   },
+   "short_n": 1,
+   "tag": "z-image-turbo_amd-gfx1151-windows__s_bf16__k1p2",
+   "family": "z-image-turbo"
+  }
+ ],
+ "plan_vm": {
+  "vm_id": "amd-gfx1151-windows-1",
+  "target": "amd:gfx1151-windows",
+  "purpose": "timing"
+ },
+ "downloads": {},
+ "prefetch": {
+  "black-forest-labs/flux-3-image-klein:*": {
+   "repo": "black-forest-labs/flux-3-image-klein",
+   "file": null
+  },
+  "Tongyi-MAI/Z-Image-Turbo:*": {
+   "repo": "Tongyi-MAI/Z-Image-Turbo",
+   "file": null
+  },
+  "Qwen/Qwen-Image-2.1:*": {
+   "repo": "Qwen/Qwen-Image-2.1",
+   "file": null
+  },
+  "Wan-AI/Wan2.2-TI2V-5B-Diffusers:*": {
+   "repo": "Wan-AI/Wan2.2-TI2V-5B-Diffusers",
+   "file": null
+  }
+ },
+ "comparisons": [
+  {
+   "id": "flux-3-klein_amd-gfx1151-windows",
+   "family": "flux.3-klein",
+   "target": "amd:gfx1151-windows",
+   "budget_gib": null,
+   "purpose": "timing",
+   "arms": [
+    "s_bf16",
+    "s_int8_auto"
+   ],
+   "runs": {
+    "s_bf16": [
+     "flux-3-klein_amd-gfx1151-windows__s_bf16__k1p0",
+     "flux-3-klein_amd-gfx1151-windows__s_bf16__k1p3",
+     "flux-3-klein_amd-gfx1151-windows__s_bf16__k2p0",
+     "flux-3-klein_amd-gfx1151-windows__s_bf16__k2p3"
+    ],
+    "s_int8_auto": [
+     "flux-3-klein_amd-gfx1151-windows__s_int8_auto__k1p1",
+     "flux-3-klein_amd-gfx1151-windows__s_int8_auto__k1p2",
+     "flux-3-klein_amd-gfx1151-windows__s_int8_auto__k2p1",
+     "flux-3-klein_amd-gfx1151-windows__s_int8_auto__k2p2"
+    ]
+   },
+   "order": [
+    "flux-3-klein_amd-gfx1151-windows__s_bf16__k1p0",
+    "flux-3-klein_amd-gfx1151-windows__s_int8_auto__k1p1",
+    "flux-3-klein_amd-gfx1151-windows__s_int8_auto__k1p2",
+    "flux-3-klein_amd-gfx1151-windows__s_bf16__k1p3",
+    "flux-3-klein_amd-gfx1151-windows__s_bf16__k2p0",
+    "flux-3-klein_amd-gfx1151-windows__s_int8_auto__k2p1",
+    "flux-3-klein_amd-gfx1151-windows__s_int8_auto__k2p2",
+    "flux-3-klein_amd-gfx1151-windows__s_bf16__k2p3"
+   ],
+   "aa_pairs": [
+    [
+     "flux-3-klein_amd-gfx1151-windows__s_int8_auto__k1p1",
+     "flux-3-klein_amd-gfx1151-windows__s_int8_auto__k1p2"
+    ],
+    [
+     "flux-3-klein_amd-gfx1151-windows__s_bf16__k1p0",
+     "flux-3-klein_amd-gfx1151-windows__s_bf16__k1p3"
+    ],
+    [
+     "flux-3-klein_amd-gfx1151-windows__s_int8_auto__k2p1",
+     "flux-3-klein_amd-gfx1151-windows__s_int8_auto__k2p2"
+    ],
+    [
+     "flux-3-klein_amd-gfx1151-windows__s_bf16__k2p0",
+     "flux-3-klein_amd-gfx1151-windows__s_bf16__k2p3"
+    ]
+   ],
+   "valid_if": "same vm_id and lane; SM clocks within 3% between the paired runs",
+   "est_min": 26.2,
+   "prefetch": [
+    "black-forest-labs/flux-3-image-klein:*"
+   ],
+   "parity_pairs": [],
+   "vm_id": "amd-gfx1151-windows-1",
+   "lane": 0
+  },
+  {
+   "id": "z-image-turbo_amd-gfx1151-windows",
+   "family": "z-image-turbo",
+   "target": "amd:gfx1151-windows",
+   "budget_gib": null,
+   "purpose": "timing",
+   "arms": [
+    "s_bf16"
+   ],
+   "runs": {
+    "s_bf16": [
+     "z-image-turbo_amd-gfx1151-windows__s_bf16__k1p0",
+     "z-image-turbo_amd-gfx1151-windows__s_bf16__k1p1",
+     "z-image-turbo_amd-gfx1151-windows__s_bf16__k1p2"
+    ]
+   },
+   "order": [
+    "z-image-turbo_amd-gfx1151-windows__s_bf16__k1p0",
+    "z-image-turbo_amd-gfx1151-windows__s_bf16__k1p1",
+    "z-image-turbo_amd-gfx1151-windows__s_bf16__k1p2"
+   ],
+   "aa_pairs": [
+    [
+     "z-image-turbo_amd-gfx1151-windows__s_bf16__k1p0",
+     "z-image-turbo_amd-gfx1151-windows__s_bf16__k1p1"
+    ],
+    [
+     "z-image-turbo_amd-gfx1151-windows__s_bf16__k1p0",
+     "z-image-turbo_amd-gfx1151-windows__s_bf16__k1p2"
+    ]
+   ],
+   "valid_if": "same vm_id and lane; SM clocks within 3% between the paired runs",
+   "est_min": 10.3,
+   "prefetch": [
+    "Tongyi-MAI/Z-Image-Turbo:*"
+   ],
+   "parity_pairs": [],
+   "vm_id": "amd-gfx1151-windows-1",
+   "lane": 0
+  },
+  {
+   "id": "qwen-image-2-1_amd-gfx1151-windows",
+   "family": "qwen-image-2.1",
+   "target": "amd:gfx1151-windows",
+   "budget_gib": null,
+   "purpose": "timing",
+   "arms": [
+    "s_bf16",
+    "s_int8_auto"
+   ],
+   "runs": {
+    "s_bf16": [
+     "qwen-image-2-1_amd-gfx1151-windows__s_bf16__k1p0",
+     "qwen-image-2-1_amd-gfx1151-windows__s_bf16__k1p3",
+     "qwen-image-2-1_amd-gfx1151-windows__s_bf16__k2p0",
+     "qwen-image-2-1_amd-gfx1151-windows__s_bf16__k2p3"
+    ],
+    "s_int8_auto": [
+     "qwen-image-2-1_amd-gfx1151-windows__s_int8_auto__k1p1",
+     "qwen-image-2-1_amd-gfx1151-windows__s_int8_auto__k1p2",
+     "qwen-image-2-1_amd-gfx1151-windows__s_int8_auto__k2p1",
+     "qwen-image-2-1_amd-gfx1151-windows__s_int8_auto__k2p2"
+    ]
+   },
+   "order": [
+    "qwen-image-2-1_amd-gfx1151-windows__s_bf16__k1p0",
+    "qwen-image-2-1_amd-gfx1151-windows__s_int8_auto__k1p1",
+    "qwen-image-2-1_amd-gfx1151-windows__s_int8_auto__k1p2",
+    "qwen-image-2-1_amd-gfx1151-windows__s_bf16__k1p3",
+    "qwen-image-2-1_amd-gfx1151-windows__s_bf16__k2p0",
+    "qwen-image-2-1_amd-gfx1151-windows__s_int8_auto__k2p1",
+    "qwen-image-2-1_amd-gfx1151-windows__s_int8_auto__k2p2",
+    "qwen-image-2-1_amd-gfx1151-windows__s_bf16__k2p3"
+   ],
+   "aa_pairs": [
+    [
+     "qwen-image-2-1_amd-gfx1151-windows__s_int8_auto__k1p1",
+     "qwen-image-2-1_amd-gfx1151-windows__s_int8_auto__k1p2"
+    ],
+    [
+     "qwen-image-2-1_amd-gfx1151-windows__s_bf16__k1p0",
+     "qwen-image-2-1_amd-gfx1151-windows__s_bf16__k1p3"
+    ],
+    [
+     "qwen-image-2-1_amd-gfx1151-windows__s_int8_auto__k2p1",
+     "qwen-image-2-1_amd-gfx1151-windows__s_int8_auto__k2p2"
+    ],
+    [
+     "qwen-image-2-1_amd-gfx1151-windows__s_bf16__k2p0",
+     "qwen-image-2-1_amd-gfx1151-windows__s_bf16__k2p3"
+    ]
+   ],
+   "valid_if": "same vm_id and lane; SM clocks within 3% between the paired runs",
+   "est_min": 32.1,
+   "prefetch": [
+    "Qwen/Qwen-Image-2.1:*"
+   ],
+   "parity_pairs": [],
+   "vm_id": "amd-gfx1151-windows-1",
+   "lane": 0
+  },
+  {
+   "id": "wan2-2-5b_amd-gfx1151-windows",
+   "family": "wan2.2-5b",
+   "target": "amd:gfx1151-windows",
+   "budget_gib": null,
+   "purpose": "timing",
+   "arms": [
+    "s_fp16"
+   ],
+   "runs": {
+    "s_fp16": [
+     "wan2-2-5b_amd-gfx1151-windows__s_fp16__k1p0",
+     "wan2-2-5b_amd-gfx1151-windows__s_fp16__k1p1",
+     "wan2-2-5b_amd-gfx1151-windows__s_fp16__k1p2"
+    ]
+   },
+   "order": [
+    "wan2-2-5b_amd-gfx1151-windows__s_fp16__k1p0",
+    "wan2-2-5b_amd-gfx1151-windows__s_fp16__k1p1",
+    "wan2-2-5b_amd-gfx1151-windows__s_fp16__k1p2"
+   ],
+   "aa_pairs": [
+    [
+     "wan2-2-5b_amd-gfx1151-windows__s_fp16__k1p0",
+     "wan2-2-5b_amd-gfx1151-windows__s_fp16__k1p1"
+    ],
+    [
+     "wan2-2-5b_amd-gfx1151-windows__s_fp16__k1p0",
+     "wan2-2-5b_amd-gfx1151-windows__s_fp16__k1p2"
+    ]
+   ],
+   "valid_if": "same vm_id and lane; SM clocks within 3% between the paired runs",
+   "est_min": 66.0,
+   "prefetch": [
+    "Wan-AI/Wan2.2-TI2V-5B-Diffusers:*"
+   ],
+   "parity_pairs": [],
+   "vm_id": "amd-gfx1151-windows-1",
+   "lane": 0
+  }
+ ],
+ "revisions": {
+  "unsloth_sha": "8b7cde79ebf5a901b2fd936bbee214fb8c7562c7",
+  "bline_ref": "v0.46.2"
+ }
+}
