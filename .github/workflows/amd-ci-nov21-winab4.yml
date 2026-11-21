@@ -30,7 +30,7 @@ name: "AMD CI (Windows): diffusion_bench PR 18760 (regression)"
 
 on:
   push:
-    branches: [amd-ci-nov21-winab3]
+    branches: [amd-ci-nov21-winab4]
   workflow_dispatch:
 
 permissions:
