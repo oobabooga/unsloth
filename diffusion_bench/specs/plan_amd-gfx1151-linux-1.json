@@ -1,0 +1,229 @@
+{
+ "name": "amdl:amd-gfx1151-linux-1",
+ "description": "plan.py VM amd-gfx1151-linux-1 (amd:gfx1151-linux)",
+ "defaults": {},
+ "cells": [
+  {
+   "backend": "studio",
+   "kind": "image",
+   "width": 1024,
+   "height": 1024,
+   "steps": 8,
+   "guidance": 0.0,
+   "prompts": "image_24",
+   "n": 1,
+   "warmup": 0,
+   "options": {
+    "transformer_quant": "none",
+    "text_encoder_quant": "none",
+    "generate": {},
+    "speed_mode": "default",
+    "target": {
+     "name": "amd:gfx1151-linux",
+     "vm_id": "amd-gfx1151-linux-1",
+     "lane": null,
+     "account": null,
+     "simulated_budget_gib": null,
+     "concurrent_with": null
+    },
+    "arm": {
+     "stack": "studio",
+     "block": 0,
+     "order": "trial",
+     "aa_of": null,
+     "label": "s_bf16",
+     "comparison": "z-image-turbo_amd-gfx1151-linux",
+     "purpose": "trial",
+     "format": "bf16",
+     "tier": "default"
+    }
+   },
+   "env": {},
+   "model": "Tongyi-MAI/Z-Image-Turbo",
+   "variant": "bf16",
+   "card": "z-image-turbo",
+   "venv": {
+    "profile": "studio"
+   },
+   "short_n": 0,
+   "tag": "trial__amd-gfx1151-linux-1",
+   "family": "z-image-turbo"
+  },
+  {
+   "backend": "studio",
+   "kind": "image",
+   "width": 1024,
+   "height": 1024,
+   "steps": 8,
+   "guidance": 0.0,
+   "prompts": "image_24",
+   "n": 1,
+   "warmup": 1,
+   "options": {
+    "transformer_quant": "none",
+    "text_encoder_quant": "none",
+    "generate": {},
+    "speed_mode": "default",
+    "target": {
+     "name": "amd:gfx1151-linux",
+     "vm_id": "amd-gfx1151-linux-1",
+     "lane": null,
+     "account": null,
+     "simulated_budget_gib": null,
+     "concurrent_with": null
+    },
+    "arm": {
+     "stack": "studio",
+     "block": 1,
+     "order": "ABBA",
+     "aa_of": null,
+     "label": "s_bf16",
+     "comparison": "z-image-turbo_amd-gfx1151-linux",
+     "purpose": "parity",
+     "format": "bf16",
+     "tier": "default"
+    },
+    "parity_probe": true
+   },
+   "env": {},
+   "model": "Tongyi-MAI/Z-Image-Turbo",
+   "variant": "bf16",
+   "card": "z-image-turbo",
+   "venv": {
+    "profile": "studio"
+   },
+   "short_n": 1,
+   "tag": "z-image-turbo_amd-gfx1151-linux__s_bf16__k1p0",
+   "family": "z-image-turbo"
+  },
+  {
+   "backend": "blineui",
+   "kind": "image",
+   "width": 1024,
+   "height": 1024,
+   "steps": 8,
+   "guidance": 1.0,
+   "prompts": "image_24",
+   "n": 1,
+   "warmup": 1,
+   "options": {
+    "family": "z-image",
+    "files": {
+     "dit": "z_image_turbo_bf16.safetensors",
+     "te": "qwen_3_4b.safetensors",
+     "vae": "ae.safetensors"
+    },
+    "sampler": "res_multistep",
+    "scheduler": "simple",
+    "shift": 3.0,
+    "cache_bust": "sampler",
+    "template": "image_z_image_turbo.json",
+    "target": {
+     "name": "amd:gfx1151-linux",
+     "vm_id": "amd-gfx1151-linux-1",
+     "lane": null,
+     "account": null,
+     "simulated_budget_gib": null,
+     "concurrent_with": null
+    },
+    "arm": {
+     "stack": "blineui",
+     "block": 1,
+     "order": "ABBA",
+     "aa_of": null,
+     "label": "c_bf16",
+     "comparison": "z-image-turbo_amd-gfx1151-linux",
+     "purpose": "parity",
+     "format": "bf16",
+     "tier": null
+    },
+    "parity_probe": true
+   },
+   "env": {},
+   "variant": "bf16",
+   "card": "z-image-turbo",
+   "venv": "bench",
+   "short_n": 1,
+   "tag": "z-image-turbo_amd-gfx1151-linux__c_bf16__k1p1",
+   "family": "z-image-turbo"
+  }
+ ],
+ "plan_vm": {
+  "vm_id": "amd-gfx1151-linux-1",
+  "target": "amd:gfx1151-linux",
+  "purpose": "parity"
+ },
+ "downloads": {
+  "z_image_turbo_bf16.safetensors": {
+   "repo": "Tongyi-MAI/Z-Image-Turbo",
+   "file": "transformer/",
+   "build": "scripts/imgcmp_nov5/prep_files.py --group zimage (dit: shards merged, cast bf16 -> z_image_turbo_official_dit_bf16)",
+   "official_repo": "Tongyi-MAI/Z-Image-Turbo"
+  },
+  "qwen_3_4b.safetensors": {
+   "repo": "black-forest-labs/FLUX.2-klein-4B",
+   "file": "text_encoder/",
+   "build": "scripts/imgcmp_nov5/prep_files.py --group klein (te: the two Qwen3-4B shards merged -> qwen3_4b_klein_merged)",
+   "official_repo": "black-forest-labs/FLUX.2-klein-4B"
+  },
+  "ae.safetensors": {
+   "repo": "unsloth/FLUX.1-schnell",
+   "file": "ae.safetensors",
+   "official_repo": "black-forest-labs/FLUX.1-schnell",
+   "sha256": "afc8e28272cd15db3919bacdb6918ce9c1ed22e96cb12c4d5ed0fba823529e38"
+  }
+ },
+ "prefetch": {
+  "Tongyi-MAI/Z-Image-Turbo:*": {
+   "repo": "Tongyi-MAI/Z-Image-Turbo",
+   "file": null
+  }
+ },
+ "comparisons": [
+  {
+   "id": "z-image-turbo_amd-gfx1151-linux",
+   "family": "z-image-turbo",
+   "target": "amd:gfx1151-linux",
+   "budget_gib": null,
+   "purpose": "parity",
+   "arms": [
+    "s_bf16",
+    "c_bf16"
+   ],
+   "runs": {
+    "s_bf16": [
+     "z-image-turbo_amd-gfx1151-linux__s_bf16__k1p0"
+    ],
+    "c_bf16": [
+     "z-image-turbo_amd-gfx1151-linux__c_bf16__k1p1"
+    ]
+   },
+   "order": [
+    "z-image-turbo_amd-gfx1151-linux__s_bf16__k1p0",
+    "z-image-turbo_amd-gfx1151-linux__c_bf16__k1p1"
+   ],
+   "aa_pairs": [],
+   "valid_if": "same vm_id and lane; SM clocks within 3% between the paired runs",
+   "est_min": 6.6,
+   "prefetch": [
+    "Tongyi-MAI/Z-Image-Turbo:*"
+   ],
+   "parity_pairs": [
+    {
+     "format": "bf16",
+     "a": "z-image-turbo_amd-gfx1151-linux__s_bf16__k1p0",
+     "b": "z-image-turbo_amd-gfx1151-linux__c_bf16__k1p1",
+     "quality": false,
+     "waive": []
+    }
+   ],
+   "vm_id": "amd-gfx1151-linux-1",
+   "lane": 0
+  }
+ ],
+ "revisions": {
+  "unsloth_sha": "8b7cde79ebf5a901b2fd936bbee214fb8c7562c7",
+  "zoo_sha": "9b3fccb098a01b12b7c3336fcde5b76f43a4cce2",
+  "bline_ref": "v0.46.2"
+ }
+}

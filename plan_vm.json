@@ -1,0 +1,56 @@
+{
+ "vm": {
+  "vm_id": "amd-gfx1151-linux-1",
+  "target": "amd:gfx1151-linux",
+  "kind": "amd",
+  "gpu": "gfx1151",
+  "lanes": 1,
+  "lane_mode": "single",
+  "lane_mode_effective": "single",
+  "purpose": "parity",
+  "account": null,
+  "comparisons": [
+   "z-image-turbo_amd-gfx1151-linux"
+  ],
+  "slots": [
+   [
+    {
+     "tag": "trial__amd-gfx1151-linux-1",
+     "lane": 0,
+     "stack": "studio",
+     "timed": false,
+     "comparison": null,
+     "est_min": 1.64,
+     "trial": true
+    }
+   ],
+   [
+    {
+     "tag": "z-image-turbo_amd-gfx1151-linux__s_bf16__k1p0",
+     "lane": 0,
+     "stack": "studio",
+     "timed": false,
+     "family": "z-image-turbo",
+     "comparison": "z-image-turbo_amd-gfx1151-linux",
+     "est_min": 3.28
+    }
+   ],
+   [
+    {
+     "tag": "z-image-turbo_amd-gfx1151-linux__c_bf16__k1p1",
+     "lane": 0,
+     "stack": "blineui",
+     "timed": false,
+     "family": "z-image-turbo",
+     "comparison": "z-image-turbo_amd-gfx1151-linux",
+     "est_min": 3.28
+    }
+   ]
+  ],
+  "est_min": 68.2,
+  "est_cu": 0.0
+ },
+ "base_sha": "8b7cde79ebf5a901b2fd936bbee214fb8c7562c7",
+ "bline_ref": "v0.46.2",
+ "branch": "amd-ci-dbench-amd-gfx1151-linux-1"
+}
