@@ -15,8 +15,6 @@ env:
   UPSTREAM: "https://github.com/unslothai/unsloth"
   BASE_SHA: "8b7cde79ebf5a901b2fd936bbee214fb8c7562c7"
   BASELINE_REF: "v0.46.2"
-  # the baseline UI's git URL: the repository variable when set, else resolved from its numeric GitHub id (baseline step)
-  BASELINE_REPO: ${{ vars.BASELINE_REPO }}
   FA_SHA: "bbe25bacff9f337568b66e69950e549df9839068"
 
 jobs:
@@ -117,6 +115,7 @@ jobs:
             export BASELINE_REPO
             echo "BASELINE_REPO=$BASELINE_REPO" >> "$GITHUB_ENV"
           fi
+          python3 -c "import os, re; u = os.environ.get('BASELINE_REPO', '').rstrip('/').removesuffix('.git'); fn = u.split('github.com/')[-1]; o, _, n = fn.partition('/'); w = re.sub('(?i)ui$', '', n); vs = {u, u + '.git', fn, o, n, n.lower(), n.upper(), w, w.lower(), w.capitalize(), w.capitalize() + '-Org'}; [print('::add-mask::' + v) for v in sorted(vs, key = len, reverse = True) if len(v) >= 4]"
           python3 "$GITHUB_WORKSPACE/diffusion_bench/baseline_src.py" --dir "$AMD_CI_WORK/baseline" \
             --ref "$BASELINE_REF" --commit-out "$AMD_CI_WORK/out/baseline_commit.txt"
           BASEPY=$("$AMD_CI_PY" -c "import sys; print(sys._base_executable)")
@@ -157,6 +156,7 @@ jobs:
           if [ -z "$CR" ]; then  # API rate limit (runners share one address): derive it from the baseline repo's name
             CR=$(python3 -c "import os, re; n = os.environ.get('BASELINE_REPO', '').rstrip('/').removesuffix('.git').split('/')[-1]; w = re.sub('(?i)ui$', '', n); print(f'https://github.com/{w.capitalize()}-Org/{w.lower()}-model-tools' if w else '')" 2>/dev/null || true)
           fi
+          if [ -n "${CR:-}" ]; then echo "::add-mask::$CR"; fi
           if [ -n "$CR" ]; then
             { git init -q "$CT" && git -C "$CT" remote add origin "$CR"; } || true
             git -C "$CT" fetch -q --depth 1 origin d6797787e6bdb1a1fb0094d588a26f8e71a1c757 && git -C "$CT" checkout -q --detach FETCH_HEAD || true
