@@ -1,0 +1,43 @@
+name: "AMD CI: Studio PR 18787 text-encoder flash attention, sd-cli on gfx1151 (win, nov21)"
+
+on:
+  push:
+    branches: [amd-ci-nov21-tefa-win]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+
+  gfx1151:
+    name: "gfx1151 Windows proprietary: sd-cli --diffusion-fa vs --flash-attn off,diffusion=on,te=on"
+    runs-on: [self-hosted, Windows, strix-halo, devlab-dispatch]
+    timeout-minutes: 300
+    defaults:
+      run:
+        shell: powershell
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
+      - name: Probe
+        run: |
+          $ErrorActionPreference = "Continue"
+          Write-Output "runner=[$env:RUNNER_NAME]"
+          $OUT = Join-Path $env:RUNNER_TEMP 'out'
+          New-Item -ItemType Directory -Force $OUT | Out-Null
+          $SYS = "C:\Program Files\Python312\python.exe"
+          $V = Join-Path $env:RUNNER_TEMP 'v'
+          & $SYS -m venv $V
+          & "$V\Scripts\python.exe" -m pip install -q pillow numpy psutil
+          $PY = "$V\Scripts\python.exe"
+          if (-not (Test-Path $PY)) { $PY = $SYS }
+          & $PY amd_ci\vkpicks\te_fa_probe.py --work (Join-Path $env:RUNNER_TEMP 'w') --out $OUT --rounds 2
+          Write-Output "probe rc=$LASTEXITCODE"
+          Remove-Item -Recurse -Force (Join-Path $env:RUNNER_TEMP 'w') -ErrorAction SilentlyContinue
+          exit 0
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
+        if: always()
+        with:
+          name: tefa-out-windows
+          path: ${{ runner.temp }}\out
+          retention-days: 7
