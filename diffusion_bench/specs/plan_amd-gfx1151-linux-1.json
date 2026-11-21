@@ -1,0 +1,1522 @@
+{
+ "name": "amd_nov21_r1small:amd-gfx1151-linux-1",
+ "description": "plan.py VM amd-gfx1151-linux-1 (amd:gfx1151-linux)",
+ "defaults": {},
+ "cells": [
+  {
+   "backend": "studio",
+   "kind": "image",
+   "width": 1024,
+   "height": 1024,
+   "steps": 16,
+   "guidance": 1.0,
+   "prompts": "image_24",
+   "n": 1,
+   "warmup": 0,
+   "options": {
+    "transformer_quant": "none",
+    "text_encoder_quant": "none",
+    "generate": {},
+    "speed_mode": "default",
+    "target": {
+     "name": "amd:gfx1151-linux",
+     "vm_id": "amd-gfx1151-linux-1",
+     "lane": null,
+     "account": null,
+     "simulated_budget_gib": null,
+     "concurrent_with": null
+    },
+    "arm": {
+     "stack": "studio",
+     "block": 0,
+     "order": "trial",
+     "aa_of": null,
+     "label": "s_bf16",
+     "comparison": "flux-3-klein_amd-gfx1151-linux",
+     "purpose": "trial",
+     "format": "bf16",
+     "tier": "default"
+    },
+    "local_files_only": false
+   },
+   "env": {},
+   "model": "unsloth/flux-3-image-klein",
+   "variant": "bf16",
+   "card": "flux.3-klein",
+   "venv": {
+    "profile": "studio"
+   },
+   "short_n": 0,
+   "tag": "trial__amd-gfx1151-linux-1",
+   "family": "flux.3-klein"
+  },
+  {
+   "backend": "studio",
+   "kind": "image",
+   "width": 1024,
+   "height": 1024,
+   "steps": 16,
+   "guidance": 1.0,
+   "prompts": "image_24",
+   "n": 1,
+   "warmup": 1,
+   "options": {
+    "transformer_quant": "none",
+    "text_encoder_quant": "none",
+    "generate": {},
+    "speed_mode": "default",
+    "target": {
+     "name": "amd:gfx1151-linux",
+     "vm_id": "amd-gfx1151-linux-1",
+     "lane": null,
+     "account": null,
+     "simulated_budget_gib": null,
+     "concurrent_with": null
+    },
+    "arm": {
+     "stack": "studio",
+     "block": 0,
+     "order": "parity",
+     "aa_of": null,
+     "label": "s_bf16",
+     "comparison": "flux-3-klein_amd-gfx1151-linux",
+     "purpose": "parity",
+     "format": "bf16",
+     "tier": "default"
+    },
+    "parity_probe": true,
+    "local_files_only": false
+   },
+   "env": {},
+   "model": "unsloth/flux-3-image-klein",
+   "variant": "bf16",
+   "card": "flux.3-klein",
+   "venv": {
+    "profile": "studio"
+   },
+   "short_n": 0,
+   "tag": "flux-3-klein_amd-gfx1151-linux__s_bf16__parity",
+   "family": "flux.3-klein"
+  },
+  {
+   "backend": "studio",
+   "kind": "image",
+   "width": 1024,
+   "height": 1024,
+   "steps": 15,
+   "guidance": 1.0,
+   "prompts": "image_24",
+   "n": 1,
+   "warmup": 1,
+   "options": {
+    "transformer_quant": "none",
+    "text_encoder_quant": "none",
+    "generate": {},
+    "speed_mode": "default",
+    "target": {
+     "name": "amd:gfx1151-linux",
+     "vm_id": "amd-gfx1151-linux-1",
+     "lane": null,
+     "account": null,
+     "simulated_budget_gib": null,
+     "concurrent_with": null
+    },
+    "arm": {
+     "stack": "studio",
+     "block": 0,
+     "order": "parity",
+     "aa_of": null,
+     "label": "s_bf16",
+     "comparison": "flux-3-klein_amd-gfx1151-linux",
+     "purpose": "parity",
+     "format": "bf16",
+     "tier": "default"
+    },
+    "parity_probe": true,
+    "local_files_only": false,
+    "negative_control": "steps 16 -> 15"
+   },
+   "env": {},
+   "model": "unsloth/flux-3-image-klein",
+   "variant": "bf16",
+   "card": "flux.3-klein",
+   "venv": {
+    "profile": "studio"
+   },
+   "short_n": 0,
+   "tag": "flux-3-klein_amd-gfx1151-linux__s_bf16__parity_negctl",
+   "family": "flux.3-klein"
+  },
+  {
+   "backend": "studio",
+   "kind": "image",
+   "width": 1024,
+   "height": 1024,
+   "steps": 16,
+   "guidance": 1.0,
+   "prompts": "image_24",
+   "n": 1,
+   "warmup": 1,
+   "options": {
+    "transformer_quant": "none",
+    "text_encoder_quant": "none",
+    "generate": {},
+    "speed_mode": "default",
+    "target": {
+     "name": "amd:gfx1151-linux",
+     "vm_id": "amd-gfx1151-linux-1",
+     "lane": null,
+     "account": null,
+     "simulated_budget_gib": null,
+     "concurrent_with": null
+    },
+    "arm": {
+     "stack": "studio",
+     "block": 0,
+     "order": "parity",
+     "aa_of": null,
+     "label": "s_bf16_notune",
+     "comparison": "flux-3-klein_amd-gfx1151-linux",
+     "purpose": "parity",
+     "format": "bf16",
+     "tier": "default"
+    },
+    "parity_probe": true,
+    "local_files_only": false
+   },
+   "env": {
+    "UNSLOTH_DIFFUSION_ROCM_TUNABLEOP": "0"
+   },
+   "model": "unsloth/flux-3-image-klein",
+   "variant": "bf16",
+   "card": "flux.3-klein",
+   "venv": {
+    "profile": "studio"
+   },
+   "short_n": 0,
+   "tag": "flux-3-klein_amd-gfx1151-linux__s_bf16_notune__parity",
+   "family": "flux.3-klein"
+  },
+  {
+   "backend": "blineui",
+   "kind": "image",
+   "width": 1024,
+   "height": 1024,
+   "steps": 16,
+   "guidance": 1.0,
+   "prompts": "image_24",
+   "n": 1,
+   "warmup": 1,
+   "options": {
+    "family": "flux3-klein",
+    "files": {
+     "dit": "flux3-image-klein-bf16.safetensors",
+     "te": "qwen3vl_4b_bf16.safetensors",
+     "vae": "flux2-vae.safetensors"
+    },
+    "sampler": "euler",
+    "scheduler": "simple",
+    "shift": 1.93586,
+    "cache_bust": "sampler",
+    "template": "image_flux3_klein_distilled_t2i.json",
+    "target": {
+     "name": "amd:gfx1151-linux",
+     "vm_id": "amd-gfx1151-linux-1",
+     "lane": null,
+     "account": null,
+     "simulated_budget_gib": null,
+     "concurrent_with": null
+    },
+    "arm": {
+     "stack": "blineui",
+     "block": 0,
+     "order": "parity",
+     "aa_of": null,
+     "label": "c_bf16",
+     "comparison": "flux-3-klein_amd-gfx1151-linux",
+     "purpose": "parity",
+     "format": "bf16",
+     "tier": null
+    },
+    "parity_probe": true
+   },
+   "env": {},
+   "variant": "bf16",
+   "card": "flux.3-klein",
+   "venv": "bench",
+   "short_n": 0,
+   "tag": "flux-3-klein_amd-gfx1151-linux__c_bf16__parity",
+   "family": "flux.3-klein"
+  },
+  {
+   "backend": "studio",
+   "kind": "image",
+   "width": 1024,
+   "height": 1024,
+   "steps": 16,
+   "guidance": 1.0,
+   "prompts": "image_24",
+   "n": 1,
+   "warmup": 1,
+   "options": {
+    "transformer_quant": "auto",
+    "generate": {},
+    "speed_mode": "default",
+    "text_encoder_quant": "auto",
+    "target": {
+     "name": "amd:gfx1151-linux",
+     "vm_id": "amd-gfx1151-linux-1",
+     "lane": null,
+     "account": null,
+     "simulated_budget_gib": null,
+     "concurrent_with": null
+    },
+    "arm": {
+     "stack": "studio",
+     "block": 0,
+     "order": "parity",
+     "aa_of": null,
+     "label": "s_int8_auto",
+     "comparison": "flux-3-klein_amd-gfx1151-linux",
+     "purpose": "parity",
+     "format": "int8",
+     "tier": "default"
+    },
+    "parity_probe": true,
+    "local_files_only": false
+   },
+   "env": {},
+   "model": "unsloth/flux-3-image-klein",
+   "variant": "int8",
+   "card": "flux.3-klein",
+   "venv": {
+    "profile": "studio"
+   },
+   "short_n": 0,
+   "tag": "flux-3-klein_amd-gfx1151-linux__s_int8_auto__parity",
+   "family": "flux.3-klein"
+  },
+  {
+   "backend": "blineui",
+   "kind": "image",
+   "width": 1024,
+   "height": 1024,
+   "steps": 16,
+   "guidance": 1.0,
+   "prompts": "image_24",
+   "n": 1,
+   "warmup": 1,
+   "options": {
+    "family": "flux3-klein",
+    "files": {
+     "dit": "flux3-image-klein-int8-convrot.safetensors",
+     "te": "qwen3vl_4b_int8_convrot.safetensors",
+     "vae": "flux2-vae.safetensors"
+    },
+    "sampler": "euler",
+    "scheduler": "simple",
+    "shift": 1.93586,
+    "cache_bust": "sampler",
+    "template": "image_flux3_klein_distilled_t2i.json",
+    "target": {
+     "name": "amd:gfx1151-linux",
+     "vm_id": "amd-gfx1151-linux-1",
+     "lane": null,
+     "account": null,
+     "simulated_budget_gib": null,
+     "concurrent_with": null
+    },
+    "arm": {
+     "stack": "blineui",
+     "block": 0,
+     "order": "parity",
+     "aa_of": null,
+     "label": "c_int8",
+     "comparison": "flux-3-klein_amd-gfx1151-linux",
+     "purpose": "parity",
+     "format": "int8",
+     "tier": null
+    },
+    "parity_probe": true
+   },
+   "env": {},
+   "variant": "int8",
+   "card": "flux.3-klein",
+   "venv": "bench",
+   "short_n": 0,
+   "tag": "flux-3-klein_amd-gfx1151-linux__c_int8__parity",
+   "family": "flux.3-klein"
+  },
+  {
+   "backend": "studio",
+   "kind": "image",
+   "width": 1024,
+   "height": 1024,
+   "steps": 16,
+   "guidance": 1.0,
+   "prompts": "image_24",
+   "n": 2,
+   "warmup": 1,
+   "options": {
+    "transformer_quant": "none",
+    "text_encoder_quant": "none",
+    "generate": {},
+    "speed_mode": "default",
+    "target": {
+     "name": "amd:gfx1151-linux",
+     "vm_id": "amd-gfx1151-linux-1",
+     "lane": null,
+     "account": null,
+     "simulated_budget_gib": null,
+     "concurrent_with": null
+    },
+    "arm": {
+     "stack": "studio",
+     "block": 1,
+     "order": "ABBA",
+     "aa_of": null,
+     "label": "s_bf16",
+     "comparison": "flux-3-klein_amd-gfx1151-linux",
+     "purpose": "timing",
+     "format": "bf16",
+     "tier": "default"
+    }
+   },
+   "env": {},
+   "model": "unsloth/flux-3-image-klein",
+   "variant": "bf16",
+   "card": "flux.3-klein",
+   "venv": {
+    "profile": "studio"
+   },
+   "short_n": 1,
+   "tag": "flux-3-klein_amd-gfx1151-linux__s_bf16__k1p0",
+   "family": "flux.3-klein"
+  },
+  {
+   "backend": "studio",
+   "kind": "image",
+   "width": 1024,
+   "height": 1024,
+   "steps": 16,
+   "guidance": 1.0,
+   "prompts": "image_24",
+   "n": 2,
+   "warmup": 1,
+   "options": {
+    "transformer_quant": "none",
+    "text_encoder_quant": "none",
+    "generate": {},
+    "speed_mode": "default",
+    "target": {
+     "name": "amd:gfx1151-linux",
+     "vm_id": "amd-gfx1151-linux-1",
+     "lane": null,
+     "account": null,
+     "simulated_budget_gib": null,
+     "concurrent_with": null
+    },
+    "arm": {
+     "stack": "studio",
+     "block": 1,
+     "order": "ABBA",
+     "aa_of": null,
+     "label": "s_bf16_notune",
+     "comparison": "flux-3-klein_amd-gfx1151-linux",
+     "purpose": "timing",
+     "format": "bf16",
+     "tier": "default"
+    }
+   },
+   "env": {
+    "UNSLOTH_DIFFUSION_ROCM_TUNABLEOP": "0"
+   },
+   "model": "unsloth/flux-3-image-klein",
+   "variant": "bf16",
+   "card": "flux.3-klein",
+   "venv": {
+    "profile": "studio"
+   },
+   "short_n": 1,
+   "tag": "flux-3-klein_amd-gfx1151-linux__s_bf16_notune__k1p1",
+   "family": "flux.3-klein"
+  },
+  {
+   "backend": "studio",
+   "kind": "image",
+   "width": 1024,
+   "height": 1024,
+   "steps": 16,
+   "guidance": 1.0,
+   "prompts": "image_24",
+   "n": 2,
+   "warmup": 1,
+   "options": {
+    "transformer_quant": "auto",
+    "generate": {},
+    "speed_mode": "default",
+    "text_encoder_quant": "auto",
+    "target": {
+     "name": "amd:gfx1151-linux",
+     "vm_id": "amd-gfx1151-linux-1",
+     "lane": null,
+     "account": null,
+     "simulated_budget_gib": null,
+     "concurrent_with": null
+    },
+    "arm": {
+     "stack": "studio",
+     "block": 1,
+     "order": "ABBA",
+     "aa_of": null,
+     "label": "s_int8_auto",
+     "comparison": "flux-3-klein_amd-gfx1151-linux",
+     "purpose": "timing",
+     "format": "int8",
+     "tier": "default"
+    }
+   },
+   "env": {},
+   "model": "unsloth/flux-3-image-klein",
+   "variant": "int8",
+   "card": "flux.3-klein",
+   "venv": {
+    "profile": "studio"
+   },
+   "short_n": 1,
+   "tag": "flux-3-klein_amd-gfx1151-linux__s_int8_auto__k1p2",
+   "family": "flux.3-klein"
+  },
+  {
+   "backend": "blineui",
+   "kind": "image",
+   "width": 1024,
+   "height": 1024,
+   "steps": 16,
+   "guidance": 1.0,
+   "prompts": "image_24",
+   "n": 2,
+   "warmup": 1,
+   "options": {
+    "family": "flux3-klein",
+    "files": {
+     "dit": "flux3-image-klein-bf16.safetensors",
+     "te": "qwen3vl_4b_bf16.safetensors",
+     "vae": "flux2-vae.safetensors"
+    },
+    "sampler": "euler",
+    "scheduler": "simple",
+    "shift": 1.93586,
+    "cache_bust": "sampler",
+    "template": "image_flux3_klein_distilled_t2i.json",
+    "target": {
+     "name": "amd:gfx1151-linux",
+     "vm_id": "amd-gfx1151-linux-1",
+     "lane": null,
+     "account": null,
+     "simulated_budget_gib": null,
+     "concurrent_with": null
+    },
+    "arm": {
+     "stack": "blineui",
+     "block": 1,
+     "order": "ABBA",
+     "aa_of": null,
+     "label": "c_bf16",
+     "comparison": "flux-3-klein_amd-gfx1151-linux",
+     "purpose": "timing",
+     "format": "bf16",
+     "tier": null
+    }
+   },
+   "env": {},
+   "variant": "bf16",
+   "card": "flux.3-klein",
+   "venv": "bench",
+   "short_n": 1,
+   "tag": "flux-3-klein_amd-gfx1151-linux__c_bf16__k1p3",
+   "family": "flux.3-klein"
+  },
+  {
+   "backend": "blineui",
+   "kind": "image",
+   "width": 1024,
+   "height": 1024,
+   "steps": 16,
+   "guidance": 1.0,
+   "prompts": "image_24",
+   "n": 2,
+   "warmup": 1,
+   "options": {
+    "family": "flux3-klein",
+    "files": {
+     "dit": "flux3-image-klein-int8-convrot.safetensors",
+     "te": "qwen3vl_4b_int8_convrot.safetensors",
+     "vae": "flux2-vae.safetensors"
+    },
+    "sampler": "euler",
+    "scheduler": "simple",
+    "shift": 1.93586,
+    "cache_bust": "sampler",
+    "template": "image_flux3_klein_distilled_t2i.json",
+    "target": {
+     "name": "amd:gfx1151-linux",
+     "vm_id": "amd-gfx1151-linux-1",
+     "lane": null,
+     "account": null,
+     "simulated_budget_gib": null,
+     "concurrent_with": null
+    },
+    "arm": {
+     "stack": "blineui",
+     "block": 1,
+     "order": "ABBA",
+     "aa_of": null,
+     "label": "c_int8",
+     "comparison": "flux-3-klein_amd-gfx1151-linux",
+     "purpose": "timing",
+     "format": "int8",
+     "tier": null
+    }
+   },
+   "env": {},
+   "variant": "int8",
+   "card": "flux.3-klein",
+   "venv": "bench",
+   "short_n": 1,
+   "tag": "flux-3-klein_amd-gfx1151-linux__c_int8__k1p4",
+   "family": "flux.3-klein"
+  },
+  {
+   "backend": "blineui",
+   "kind": "image",
+   "width": 1024,
+   "height": 1024,
+   "steps": 16,
+   "guidance": 1.0,
+   "prompts": "image_24",
+   "n": 2,
+   "warmup": 1,
+   "options": {
+    "family": "flux3-klein",
+    "files": {
+     "dit": "flux3-image-klein-int8-convrot.safetensors",
+     "te": "qwen3vl_4b_int8_convrot.safetensors",
+     "vae": "flux2-vae.safetensors"
+    },
+    "sampler": "euler",
+    "scheduler": "simple",
+    "shift": 1.93586,
+    "cache_bust": "sampler",
+    "template": "image_flux3_klein_distilled_t2i.json",
+    "target": {
+     "name": "amd:gfx1151-linux",
+     "vm_id": "amd-gfx1151-linux-1",
+     "lane": null,
+     "account": null,
+     "simulated_budget_gib": null,
+     "concurrent_with": null
+    },
+    "arm": {
+     "stack": "blineui",
+     "block": 1,
+     "order": "ABBA",
+     "aa_of": "flux-3-klein_amd-gfx1151-linux__c_int8__k1p4",
+     "label": "c_int8",
+     "comparison": "flux-3-klein_amd-gfx1151-linux",
+     "purpose": "timing",
+     "format": "int8",
+     "tier": null
+    }
+   },
+   "env": {},
+   "variant": "int8",
+   "card": "flux.3-klein",
+   "venv": "bench",
+   "short_n": 1,
+   "tag": "flux-3-klein_amd-gfx1151-linux__c_int8__k1p5",
+   "family": "flux.3-klein"
+  },
+  {
+   "backend": "blineui",
+   "kind": "image",
+   "width": 1024,
+   "height": 1024,
+   "steps": 16,
+   "guidance": 1.0,
+   "prompts": "image_24",
+   "n": 2,
+   "warmup": 1,
+   "options": {
+    "family": "flux3-klein",
+    "files": {
+     "dit": "flux3-image-klein-bf16.safetensors",
+     "te": "qwen3vl_4b_bf16.safetensors",
+     "vae": "flux2-vae.safetensors"
+    },
+    "sampler": "euler",
+    "scheduler": "simple",
+    "shift": 1.93586,
+    "cache_bust": "sampler",
+    "template": "image_flux3_klein_distilled_t2i.json",
+    "target": {
+     "name": "amd:gfx1151-linux",
+     "vm_id": "amd-gfx1151-linux-1",
+     "lane": null,
+     "account": null,
+     "simulated_budget_gib": null,
+     "concurrent_with": null
+    },
+    "arm": {
+     "stack": "blineui",
+     "block": 1,
+     "order": "ABBA",
+     "aa_of": "flux-3-klein_amd-gfx1151-linux__c_bf16__k1p3",
+     "label": "c_bf16",
+     "comparison": "flux-3-klein_amd-gfx1151-linux",
+     "purpose": "timing",
+     "format": "bf16",
+     "tier": null
+    }
+   },
+   "env": {},
+   "variant": "bf16",
+   "card": "flux.3-klein",
+   "venv": "bench",
+   "short_n": 1,
+   "tag": "flux-3-klein_amd-gfx1151-linux__c_bf16__k1p6",
+   "family": "flux.3-klein"
+  },
+  {
+   "backend": "studio",
+   "kind": "image",
+   "width": 1024,
+   "height": 1024,
+   "steps": 16,
+   "guidance": 1.0,
+   "prompts": "image_24",
+   "n": 2,
+   "warmup": 1,
+   "options": {
+    "transformer_quant": "auto",
+    "generate": {},
+    "speed_mode": "default",
+    "text_encoder_quant": "auto",
+    "target": {
+     "name": "amd:gfx1151-linux",
+     "vm_id": "amd-gfx1151-linux-1",
+     "lane": null,
+     "account": null,
+     "simulated_budget_gib": null,
+     "concurrent_with": null
+    },
+    "arm": {
+     "stack": "studio",
+     "block": 1,
+     "order": "ABBA",
+     "aa_of": "flux-3-klein_amd-gfx1151-linux__s_int8_auto__k1p2",
+     "label": "s_int8_auto",
+     "comparison": "flux-3-klein_amd-gfx1151-linux",
+     "purpose": "timing",
+     "format": "int8",
+     "tier": "default"
+    }
+   },
+   "env": {},
+   "model": "unsloth/flux-3-image-klein",
+   "variant": "int8",
+   "card": "flux.3-klein",
+   "venv": {
+    "profile": "studio"
+   },
+   "short_n": 1,
+   "tag": "flux-3-klein_amd-gfx1151-linux__s_int8_auto__k1p7",
+   "family": "flux.3-klein"
+  },
+  {
+   "backend": "studio",
+   "kind": "image",
+   "width": 1024,
+   "height": 1024,
+   "steps": 16,
+   "guidance": 1.0,
+   "prompts": "image_24",
+   "n": 2,
+   "warmup": 1,
+   "options": {
+    "transformer_quant": "none",
+    "text_encoder_quant": "none",
+    "generate": {},
+    "speed_mode": "default",
+    "target": {
+     "name": "amd:gfx1151-linux",
+     "vm_id": "amd-gfx1151-linux-1",
+     "lane": null,
+     "account": null,
+     "simulated_budget_gib": null,
+     "concurrent_with": null
+    },
+    "arm": {
+     "stack": "studio",
+     "block": 1,
+     "order": "ABBA",
+     "aa_of": "flux-3-klein_amd-gfx1151-linux__s_bf16_notune__k1p1",
+     "label": "s_bf16_notune",
+     "comparison": "flux-3-klein_amd-gfx1151-linux",
+     "purpose": "timing",
+     "format": "bf16",
+     "tier": "default"
+    }
+   },
+   "env": {
+    "UNSLOTH_DIFFUSION_ROCM_TUNABLEOP": "0"
+   },
+   "model": "unsloth/flux-3-image-klein",
+   "variant": "bf16",
+   "card": "flux.3-klein",
+   "venv": {
+    "profile": "studio"
+   },
+   "short_n": 1,
+   "tag": "flux-3-klein_amd-gfx1151-linux__s_bf16_notune__k1p8",
+   "family": "flux.3-klein"
+  },
+  {
+   "backend": "studio",
+   "kind": "image",
+   "width": 1024,
+   "height": 1024,
+   "steps": 16,
+   "guidance": 1.0,
+   "prompts": "image_24",
+   "n": 2,
+   "warmup": 1,
+   "options": {
+    "transformer_quant": "none",
+    "text_encoder_quant": "none",
+    "generate": {},
+    "speed_mode": "default",
+    "target": {
+     "name": "amd:gfx1151-linux",
+     "vm_id": "amd-gfx1151-linux-1",
+     "lane": null,
+     "account": null,
+     "simulated_budget_gib": null,
+     "concurrent_with": null
+    },
+    "arm": {
+     "stack": "studio",
+     "block": 1,
+     "order": "ABBA",
+     "aa_of": "flux-3-klein_amd-gfx1151-linux__s_bf16__k1p0",
+     "label": "s_bf16",
+     "comparison": "flux-3-klein_amd-gfx1151-linux",
+     "purpose": "timing",
+     "format": "bf16",
+     "tier": "default"
+    }
+   },
+   "env": {},
+   "model": "unsloth/flux-3-image-klein",
+   "variant": "bf16",
+   "card": "flux.3-klein",
+   "venv": {
+    "profile": "studio"
+   },
+   "short_n": 1,
+   "tag": "flux-3-klein_amd-gfx1151-linux__s_bf16__k1p9",
+   "family": "flux.3-klein"
+  },
+  {
+   "backend": "studio",
+   "kind": "image",
+   "width": 1024,
+   "height": 1024,
+   "steps": 16,
+   "guidance": 1.0,
+   "prompts": "image_24",
+   "n": 2,
+   "warmup": 1,
+   "options": {
+    "transformer_quant": "none",
+    "text_encoder_quant": "none",
+    "generate": {},
+    "speed_mode": "default",
+    "target": {
+     "name": "amd:gfx1151-linux",
+     "vm_id": "amd-gfx1151-linux-1",
+     "lane": null,
+     "account": null,
+     "simulated_budget_gib": null,
+     "concurrent_with": null
+    },
+    "arm": {
+     "stack": "studio",
+     "block": 2,
+     "order": "ABBA",
+     "aa_of": null,
+     "label": "s_bf16",
+     "comparison": "flux-3-klein_amd-gfx1151-linux",
+     "purpose": "timing",
+     "format": "bf16",
+     "tier": "default"
+    }
+   },
+   "env": {},
+   "model": "unsloth/flux-3-image-klein",
+   "variant": "bf16",
+   "card": "flux.3-klein",
+   "venv": {
+    "profile": "studio"
+   },
+   "short_n": 1,
+   "tag": "flux-3-klein_amd-gfx1151-linux__s_bf16__k2p0",
+   "family": "flux.3-klein"
+  },
+  {
+   "backend": "studio",
+   "kind": "image",
+   "width": 1024,
+   "height": 1024,
+   "steps": 16,
+   "guidance": 1.0,
+   "prompts": "image_24",
+   "n": 2,
+   "warmup": 1,
+   "options": {
+    "transformer_quant": "none",
+    "text_encoder_quant": "none",
+    "generate": {},
+    "speed_mode": "default",
+    "target": {
+     "name": "amd:gfx1151-linux",
+     "vm_id": "amd-gfx1151-linux-1",
+     "lane": null,
+     "account": null,
+     "simulated_budget_gib": null,
+     "concurrent_with": null
+    },
+    "arm": {
+     "stack": "studio",
+     "block": 2,
+     "order": "ABBA",
+     "aa_of": null,
+     "label": "s_bf16_notune",
+     "comparison": "flux-3-klein_amd-gfx1151-linux",
+     "purpose": "timing",
+     "format": "bf16",
+     "tier": "default"
+    }
+   },
+   "env": {
+    "UNSLOTH_DIFFUSION_ROCM_TUNABLEOP": "0"
+   },
+   "model": "unsloth/flux-3-image-klein",
+   "variant": "bf16",
+   "card": "flux.3-klein",
+   "venv": {
+    "profile": "studio"
+   },
+   "short_n": 1,
+   "tag": "flux-3-klein_amd-gfx1151-linux__s_bf16_notune__k2p1",
+   "family": "flux.3-klein"
+  },
+  {
+   "backend": "studio",
+   "kind": "image",
+   "width": 1024,
+   "height": 1024,
+   "steps": 16,
+   "guidance": 1.0,
+   "prompts": "image_24",
+   "n": 2,
+   "warmup": 1,
+   "options": {
+    "transformer_quant": "auto",
+    "generate": {},
+    "speed_mode": "default",
+    "text_encoder_quant": "auto",
+    "target": {
+     "name": "amd:gfx1151-linux",
+     "vm_id": "amd-gfx1151-linux-1",
+     "lane": null,
+     "account": null,
+     "simulated_budget_gib": null,
+     "concurrent_with": null
+    },
+    "arm": {
+     "stack": "studio",
+     "block": 2,
+     "order": "ABBA",
+     "aa_of": null,
+     "label": "s_int8_auto",
+     "comparison": "flux-3-klein_amd-gfx1151-linux",
+     "purpose": "timing",
+     "format": "int8",
+     "tier": "default"
+    }
+   },
+   "env": {},
+   "model": "unsloth/flux-3-image-klein",
+   "variant": "int8",
+   "card": "flux.3-klein",
+   "venv": {
+    "profile": "studio"
+   },
+   "short_n": 1,
+   "tag": "flux-3-klein_amd-gfx1151-linux__s_int8_auto__k2p2",
+   "family": "flux.3-klein"
+  },
+  {
+   "backend": "blineui",
+   "kind": "image",
+   "width": 1024,
+   "height": 1024,
+   "steps": 16,
+   "guidance": 1.0,
+   "prompts": "image_24",
+   "n": 2,
+   "warmup": 1,
+   "options": {
+    "family": "flux3-klein",
+    "files": {
+     "dit": "flux3-image-klein-bf16.safetensors",
+     "te": "qwen3vl_4b_bf16.safetensors",
+     "vae": "flux2-vae.safetensors"
+    },
+    "sampler": "euler",
+    "scheduler": "simple",
+    "shift": 1.93586,
+    "cache_bust": "sampler",
+    "template": "image_flux3_klein_distilled_t2i.json",
+    "target": {
+     "name": "amd:gfx1151-linux",
+     "vm_id": "amd-gfx1151-linux-1",
+     "lane": null,
+     "account": null,
+     "simulated_budget_gib": null,
+     "concurrent_with": null
+    },
+    "arm": {
+     "stack": "blineui",
+     "block": 2,
+     "order": "ABBA",
+     "aa_of": null,
+     "label": "c_bf16",
+     "comparison": "flux-3-klein_amd-gfx1151-linux",
+     "purpose": "timing",
+     "format": "bf16",
+     "tier": null
+    }
+   },
+   "env": {},
+   "variant": "bf16",
+   "card": "flux.3-klein",
+   "venv": "bench",
+   "short_n": 1,
+   "tag": "flux-3-klein_amd-gfx1151-linux__c_bf16__k2p3",
+   "family": "flux.3-klein"
+  },
+  {
+   "backend": "blineui",
+   "kind": "image",
+   "width": 1024,
+   "height": 1024,
+   "steps": 16,
+   "guidance": 1.0,
+   "prompts": "image_24",
+   "n": 2,
+   "warmup": 1,
+   "options": {
+    "family": "flux3-klein",
+    "files": {
+     "dit": "flux3-image-klein-int8-convrot.safetensors",
+     "te": "qwen3vl_4b_int8_convrot.safetensors",
+     "vae": "flux2-vae.safetensors"
+    },
+    "sampler": "euler",
+    "scheduler": "simple",
+    "shift": 1.93586,
+    "cache_bust": "sampler",
+    "template": "image_flux3_klein_distilled_t2i.json",
+    "target": {
+     "name": "amd:gfx1151-linux",
+     "vm_id": "amd-gfx1151-linux-1",
+     "lane": null,
+     "account": null,
+     "simulated_budget_gib": null,
+     "concurrent_with": null
+    },
+    "arm": {
+     "stack": "blineui",
+     "block": 2,
+     "order": "ABBA",
+     "aa_of": null,
+     "label": "c_int8",
+     "comparison": "flux-3-klein_amd-gfx1151-linux",
+     "purpose": "timing",
+     "format": "int8",
+     "tier": null
+    }
+   },
+   "env": {},
+   "variant": "int8",
+   "card": "flux.3-klein",
+   "venv": "bench",
+   "short_n": 1,
+   "tag": "flux-3-klein_amd-gfx1151-linux__c_int8__k2p4",
+   "family": "flux.3-klein"
+  },
+  {
+   "backend": "blineui",
+   "kind": "image",
+   "width": 1024,
+   "height": 1024,
+   "steps": 16,
+   "guidance": 1.0,
+   "prompts": "image_24",
+   "n": 2,
+   "warmup": 1,
+   "options": {
+    "family": "flux3-klein",
+    "files": {
+     "dit": "flux3-image-klein-int8-convrot.safetensors",
+     "te": "qwen3vl_4b_int8_convrot.safetensors",
+     "vae": "flux2-vae.safetensors"
+    },
+    "sampler": "euler",
+    "scheduler": "simple",
+    "shift": 1.93586,
+    "cache_bust": "sampler",
+    "template": "image_flux3_klein_distilled_t2i.json",
+    "target": {
+     "name": "amd:gfx1151-linux",
+     "vm_id": "amd-gfx1151-linux-1",
+     "lane": null,
+     "account": null,
+     "simulated_budget_gib": null,
+     "concurrent_with": null
+    },
+    "arm": {
+     "stack": "blineui",
+     "block": 2,
+     "order": "ABBA",
+     "aa_of": "flux-3-klein_amd-gfx1151-linux__c_int8__k2p4",
+     "label": "c_int8",
+     "comparison": "flux-3-klein_amd-gfx1151-linux",
+     "purpose": "timing",
+     "format": "int8",
+     "tier": null
+    }
+   },
+   "env": {},
+   "variant": "int8",
+   "card": "flux.3-klein",
+   "venv": "bench",
+   "short_n": 1,
+   "tag": "flux-3-klein_amd-gfx1151-linux__c_int8__k2p5",
+   "family": "flux.3-klein"
+  },
+  {
+   "backend": "blineui",
+   "kind": "image",
+   "width": 1024,
+   "height": 1024,
+   "steps": 16,
+   "guidance": 1.0,
+   "prompts": "image_24",
+   "n": 2,
+   "warmup": 1,
+   "options": {
+    "family": "flux3-klein",
+    "files": {
+     "dit": "flux3-image-klein-bf16.safetensors",
+     "te": "qwen3vl_4b_bf16.safetensors",
+     "vae": "flux2-vae.safetensors"
+    },
+    "sampler": "euler",
+    "scheduler": "simple",
+    "shift": 1.93586,
+    "cache_bust": "sampler",
+    "template": "image_flux3_klein_distilled_t2i.json",
+    "target": {
+     "name": "amd:gfx1151-linux",
+     "vm_id": "amd-gfx1151-linux-1",
+     "lane": null,
+     "account": null,
+     "simulated_budget_gib": null,
+     "concurrent_with": null
+    },
+    "arm": {
+     "stack": "blineui",
+     "block": 2,
+     "order": "ABBA",
+     "aa_of": "flux-3-klein_amd-gfx1151-linux__c_bf16__k2p3",
+     "label": "c_bf16",
+     "comparison": "flux-3-klein_amd-gfx1151-linux",
+     "purpose": "timing",
+     "format": "bf16",
+     "tier": null
+    }
+   },
+   "env": {},
+   "variant": "bf16",
+   "card": "flux.3-klein",
+   "venv": "bench",
+   "short_n": 1,
+   "tag": "flux-3-klein_amd-gfx1151-linux__c_bf16__k2p6",
+   "family": "flux.3-klein"
+  },
+  {
+   "backend": "studio",
+   "kind": "image",
+   "width": 1024,
+   "height": 1024,
+   "steps": 16,
+   "guidance": 1.0,
+   "prompts": "image_24",
+   "n": 2,
+   "warmup": 1,
+   "options": {
+    "transformer_quant": "auto",
+    "generate": {},
+    "speed_mode": "default",
+    "text_encoder_quant": "auto",
+    "target": {
+     "name": "amd:gfx1151-linux",
+     "vm_id": "amd-gfx1151-linux-1",
+     "lane": null,
+     "account": null,
+     "simulated_budget_gib": null,
+     "concurrent_with": null
+    },
+    "arm": {
+     "stack": "studio",
+     "block": 2,
+     "order": "ABBA",
+     "aa_of": "flux-3-klein_amd-gfx1151-linux__s_int8_auto__k2p2",
+     "label": "s_int8_auto",
+     "comparison": "flux-3-klein_amd-gfx1151-linux",
+     "purpose": "timing",
+     "format": "int8",
+     "tier": "default"
+    }
+   },
+   "env": {},
+   "model": "unsloth/flux-3-image-klein",
+   "variant": "int8",
+   "card": "flux.3-klein",
+   "venv": {
+    "profile": "studio"
+   },
+   "short_n": 1,
+   "tag": "flux-3-klein_amd-gfx1151-linux__s_int8_auto__k2p7",
+   "family": "flux.3-klein"
+  },
+  {
+   "backend": "studio",
+   "kind": "image",
+   "width": 1024,
+   "height": 1024,
+   "steps": 16,
+   "guidance": 1.0,
+   "prompts": "image_24",
+   "n": 2,
+   "warmup": 1,
+   "options": {
+    "transformer_quant": "none",
+    "text_encoder_quant": "none",
+    "generate": {},
+    "speed_mode": "default",
+    "target": {
+     "name": "amd:gfx1151-linux",
+     "vm_id": "amd-gfx1151-linux-1",
+     "lane": null,
+     "account": null,
+     "simulated_budget_gib": null,
+     "concurrent_with": null
+    },
+    "arm": {
+     "stack": "studio",
+     "block": 2,
+     "order": "ABBA",
+     "aa_of": "flux-3-klein_amd-gfx1151-linux__s_bf16_notune__k2p1",
+     "label": "s_bf16_notune",
+     "comparison": "flux-3-klein_amd-gfx1151-linux",
+     "purpose": "timing",
+     "format": "bf16",
+     "tier": "default"
+    }
+   },
+   "env": {
+    "UNSLOTH_DIFFUSION_ROCM_TUNABLEOP": "0"
+   },
+   "model": "unsloth/flux-3-image-klein",
+   "variant": "bf16",
+   "card": "flux.3-klein",
+   "venv": {
+    "profile": "studio"
+   },
+   "short_n": 1,
+   "tag": "flux-3-klein_amd-gfx1151-linux__s_bf16_notune__k2p8",
+   "family": "flux.3-klein"
+  },
+  {
+   "backend": "studio",
+   "kind": "image",
+   "width": 1024,
+   "height": 1024,
+   "steps": 16,
+   "guidance": 1.0,
+   "prompts": "image_24",
+   "n": 2,
+   "warmup": 1,
+   "options": {
+    "transformer_quant": "none",
+    "text_encoder_quant": "none",
+    "generate": {},
+    "speed_mode": "default",
+    "target": {
+     "name": "amd:gfx1151-linux",
+     "vm_id": "amd-gfx1151-linux-1",
+     "lane": null,
+     "account": null,
+     "simulated_budget_gib": null,
+     "concurrent_with": null
+    },
+    "arm": {
+     "stack": "studio",
+     "block": 2,
+     "order": "ABBA",
+     "aa_of": "flux-3-klein_amd-gfx1151-linux__s_bf16__k2p0",
+     "label": "s_bf16",
+     "comparison": "flux-3-klein_amd-gfx1151-linux",
+     "purpose": "timing",
+     "format": "bf16",
+     "tier": "default"
+    }
+   },
+   "env": {},
+   "model": "unsloth/flux-3-image-klein",
+   "variant": "bf16",
+   "card": "flux.3-klein",
+   "venv": {
+    "profile": "studio"
+   },
+   "short_n": 1,
+   "tag": "flux-3-klein_amd-gfx1151-linux__s_bf16__k2p9",
+   "family": "flux.3-klein"
+  }
+ ],
+ "plan_vm": {
+  "vm_id": "amd-gfx1151-linux-1",
+  "target": "amd:gfx1151-linux",
+  "purpose": "timing"
+ },
+ "downloads": {
+  "flux3-image-klein-bf16.safetensors": {
+   "repo": "unsloth/flux-3-image-klein",
+   "file": "",
+   "build": "scripts/imgcmp_nov5/build_q5.py --group f3 --roles dit_bf16",
+   "note": "AMD runners carry no token: built from the ungated byte-identical unsloth/flux-3-image-klein mirror (sha256 checked against BFL, ref_headers/f3_official_sha.json), the Nov 8 gfx1151 route",
+   "official_repo": "unsloth/flux-3-image-klein"
+  },
+  "qwen3vl_4b_bf16.safetensors": {
+   "repo": "unsloth/flux-3-image-klein",
+   "file": "",
+   "build": "scripts/imgcmp_nov5/build_q5.py --group f3 --roles te_bf16",
+   "note": "AMD runners carry no token: built from the ungated byte-identical unsloth/flux-3-image-klein mirror (sha256 checked against BFL, ref_headers/f3_official_sha.json), the Nov 8 gfx1151 route",
+   "official_repo": "unsloth/flux-3-image-klein"
+  },
+  "flux2-vae.safetensors": {
+   "repo": "unsloth/flux-3-image-klein",
+   "file": "",
+   "build": "scripts/imgcmp_nov5/build_q5.py --group f3 --roles vae",
+   "note": "AMD runners carry no token: built from the ungated byte-identical unsloth/flux-3-image-klein mirror (sha256 checked against BFL, ref_headers/f3_official_sha.json), the Nov 8 gfx1151 route",
+   "official_repo": "unsloth/flux-3-image-klein"
+  },
+  "flux3-image-klein-int8-convrot.safetensors": {
+   "repo": "unsloth/flux-3-image-klein",
+   "file": "",
+   "build": "scripts/imgcmp_nov5/build_q5.py --group f3 --roles dit_int8",
+   "note": "AMD runners carry no token: built from the ungated byte-identical unsloth/flux-3-image-klein mirror (sha256 checked against BFL, ref_headers/f3_official_sha.json), the Nov 8 gfx1151 route",
+   "official_repo": "unsloth/flux-3-image-klein"
+  },
+  "qwen3vl_4b_int8_convrot.safetensors": {
+   "repo": "unsloth/flux-3-image-klein",
+   "file": "",
+   "build": "scripts/imgcmp_nov5/build_q5.py --group f3 --roles te_int8",
+   "note": "AMD runners carry no token: built from the ungated byte-identical unsloth/flux-3-image-klein mirror (sha256 checked against BFL, ref_headers/f3_official_sha.json), the Nov 8 gfx1151 route",
+   "official_repo": "unsloth/flux-3-image-klein"
+  }
+ },
+ "prefetch": {
+  "unsloth/flux-3-image-klein:*": {
+   "repo": "unsloth/flux-3-image-klein",
+   "file": null
+  }
+ },
+ "comparisons": [
+  {
+   "id": "flux-3-klein_amd-gfx1151-linux",
+   "family": "flux.3-klein",
+   "target": "amd:gfx1151-linux",
+   "budget_gib": null,
+   "purpose": "timing",
+   "arms": [
+    "s_bf16",
+    "s_bf16_notune",
+    "s_int8_auto",
+    "c_bf16",
+    "c_int8"
+   ],
+   "runs": {
+    "s_bf16": [
+     "flux-3-klein_amd-gfx1151-linux__s_bf16__k1p0",
+     "flux-3-klein_amd-gfx1151-linux__s_bf16__k1p9",
+     "flux-3-klein_amd-gfx1151-linux__s_bf16__k2p0",
+     "flux-3-klein_amd-gfx1151-linux__s_bf16__k2p9"
+    ],
+    "s_bf16_notune": [
+     "flux-3-klein_amd-gfx1151-linux__s_bf16_notune__k1p1",
+     "flux-3-klein_amd-gfx1151-linux__s_bf16_notune__k1p8",
+     "flux-3-klein_amd-gfx1151-linux__s_bf16_notune__k2p1",
+     "flux-3-klein_amd-gfx1151-linux__s_bf16_notune__k2p8"
+    ],
+    "s_int8_auto": [
+     "flux-3-klein_amd-gfx1151-linux__s_int8_auto__k1p2",
+     "flux-3-klein_amd-gfx1151-linux__s_int8_auto__k1p7",
+     "flux-3-klein_amd-gfx1151-linux__s_int8_auto__k2p2",
+     "flux-3-klein_amd-gfx1151-linux__s_int8_auto__k2p7"
+    ],
+    "c_bf16": [
+     "flux-3-klein_amd-gfx1151-linux__c_bf16__k1p3",
+     "flux-3-klein_amd-gfx1151-linux__c_bf16__k1p6",
+     "flux-3-klein_amd-gfx1151-linux__c_bf16__k2p3",
+     "flux-3-klein_amd-gfx1151-linux__c_bf16__k2p6"
+    ],
+    "c_int8": [
+     "flux-3-klein_amd-gfx1151-linux__c_int8__k1p4",
+     "flux-3-klein_amd-gfx1151-linux__c_int8__k1p5",
+     "flux-3-klein_amd-gfx1151-linux__c_int8__k2p4",
+     "flux-3-klein_amd-gfx1151-linux__c_int8__k2p5"
+    ]
+   },
+   "order": [
+    "flux-3-klein_amd-gfx1151-linux__s_bf16__k1p0",
+    "flux-3-klein_amd-gfx1151-linux__s_bf16_notune__k1p1",
+    "flux-3-klein_amd-gfx1151-linux__s_int8_auto__k1p2",
+    "flux-3-klein_amd-gfx1151-linux__c_bf16__k1p3",
+    "flux-3-klein_amd-gfx1151-linux__c_int8__k1p4",
+    "flux-3-klein_amd-gfx1151-linux__c_int8__k1p5",
+    "flux-3-klein_amd-gfx1151-linux__c_bf16__k1p6",
+    "flux-3-klein_amd-gfx1151-linux__s_int8_auto__k1p7",
+    "flux-3-klein_amd-gfx1151-linux__s_bf16_notune__k1p8",
+    "flux-3-klein_amd-gfx1151-linux__s_bf16__k1p9",
+    "flux-3-klein_amd-gfx1151-linux__s_bf16__k2p0",
+    "flux-3-klein_amd-gfx1151-linux__s_bf16_notune__k2p1",
+    "flux-3-klein_amd-gfx1151-linux__s_int8_auto__k2p2",
+    "flux-3-klein_amd-gfx1151-linux__c_bf16__k2p3",
+    "flux-3-klein_amd-gfx1151-linux__c_int8__k2p4",
+    "flux-3-klein_amd-gfx1151-linux__c_int8__k2p5",
+    "flux-3-klein_amd-gfx1151-linux__c_bf16__k2p6",
+    "flux-3-klein_amd-gfx1151-linux__s_int8_auto__k2p7",
+    "flux-3-klein_amd-gfx1151-linux__s_bf16_notune__k2p8",
+    "flux-3-klein_amd-gfx1151-linux__s_bf16__k2p9"
+   ],
+   "aa_pairs": [
+    [
+     "flux-3-klein_amd-gfx1151-linux__c_int8__k1p4",
+     "flux-3-klein_amd-gfx1151-linux__c_int8__k1p5"
+    ],
+    [
+     "flux-3-klein_amd-gfx1151-linux__c_bf16__k1p3",
+     "flux-3-klein_amd-gfx1151-linux__c_bf16__k1p6"
+    ],
+    [
+     "flux-3-klein_amd-gfx1151-linux__s_int8_auto__k1p2",
+     "flux-3-klein_amd-gfx1151-linux__s_int8_auto__k1p7"
+    ],
+    [
+     "flux-3-klein_amd-gfx1151-linux__s_bf16_notune__k1p1",
+     "flux-3-klein_amd-gfx1151-linux__s_bf16_notune__k1p8"
+    ],
+    [
+     "flux-3-klein_amd-gfx1151-linux__s_bf16__k1p0",
+     "flux-3-klein_amd-gfx1151-linux__s_bf16__k1p9"
+    ],
+    [
+     "flux-3-klein_amd-gfx1151-linux__c_int8__k2p4",
+     "flux-3-klein_amd-gfx1151-linux__c_int8__k2p5"
+    ],
+    [
+     "flux-3-klein_amd-gfx1151-linux__c_bf16__k2p3",
+     "flux-3-klein_amd-gfx1151-linux__c_bf16__k2p6"
+    ],
+    [
+     "flux-3-klein_amd-gfx1151-linux__s_int8_auto__k2p2",
+     "flux-3-klein_amd-gfx1151-linux__s_int8_auto__k2p7"
+    ],
+    [
+     "flux-3-klein_amd-gfx1151-linux__s_bf16_notune__k2p1",
+     "flux-3-klein_amd-gfx1151-linux__s_bf16_notune__k2p8"
+    ],
+    [
+     "flux-3-klein_amd-gfx1151-linux__s_bf16__k2p0",
+     "flux-3-klein_amd-gfx1151-linux__s_bf16__k2p9"
+    ]
+   ],
+   "valid_if": "same vm_id and lane; SM clocks within 3% between the paired runs",
+   "est_min": 79.6,
+   "prefetch": [
+    "unsloth/flux-3-image-klein:*"
+   ],
+   "parity_order": [
+    "flux-3-klein_amd-gfx1151-linux__s_bf16__parity",
+    "flux-3-klein_amd-gfx1151-linux__s_bf16__parity_negctl",
+    "flux-3-klein_amd-gfx1151-linux__s_bf16_notune__parity",
+    "flux-3-klein_amd-gfx1151-linux__c_bf16__parity",
+    "flux-3-klein_amd-gfx1151-linux__s_int8_auto__parity",
+    "flux-3-klein_amd-gfx1151-linux__c_int8__parity"
+   ],
+   "parity_pairs": [
+    {
+     "format": "bf16",
+     "a": "flux-3-klein_amd-gfx1151-linux__s_bf16__parity",
+     "b": "flux-3-klein_amd-gfx1151-linux__c_bf16__parity",
+     "quality": false,
+     "waive": []
+    },
+    {
+     "format": "bf16",
+     "a": "flux-3-klein_amd-gfx1151-linux__s_bf16__parity_negctl",
+     "b": "flux-3-klein_amd-gfx1151-linux__c_bf16__parity",
+     "quality": false,
+     "waive": [],
+     "expect": "VOID",
+     "negative_control": "steps 16 -> 15"
+    },
+    {
+     "format": "bf16",
+     "a": "flux-3-klein_amd-gfx1151-linux__s_bf16_notune__parity",
+     "b": "flux-3-klein_amd-gfx1151-linux__c_bf16__parity",
+     "quality": false,
+     "waive": []
+    },
+    {
+     "format": "int8",
+     "a": "flux-3-klein_amd-gfx1151-linux__s_int8_auto__parity",
+     "b": "flux-3-klein_amd-gfx1151-linux__c_int8__parity",
+     "quality": false,
+     "waive": []
+    }
+   ],
+   "vm_id": "amd-gfx1151-linux-1",
+   "lane": 0
+  }
+ ],
+ "revisions": {
+  "unsloth_sha": "8b7cde79ebf5a901b2fd936bbee214fb8c7562c7",
+  "bline_ref": "v0.46.2"
+ }
+}
