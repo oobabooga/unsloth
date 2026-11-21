@@ -1,0 +1,25 @@
+diff --git a/studio/backend/core/training/diffusion_dit_trainer.py b/studio/backend/core/training/diffusion_dit_trainer.py
+index bf1a2fca32..cbf84e9dcf 100644
+--- a/studio/backend/core/training/diffusion_dit_trainer.py
++++ b/studio/backend/core/training/diffusion_dit_trainer.py
+@@ -4531,7 +4531,6 @@ def _dequant_cache_wanted(
+         (base_is_bnb or (int8_base and int8_dequant_cache_enabled()))
+         and device == "cuda"
+         and not fp16_amp
+-        and not torch_is_rocm()
+         and dequant_cache_enabled()
+     )
+ 
+diff --git a/studio/backend/core/training/diffusion_gc_budget.py b/studio/backend/core/training/diffusion_gc_budget.py
+index 0338a9065d..c4af191057 100644
+--- a/studio/backend/core/training/diffusion_gc_budget.py
++++ b/studio/backend/core/training/diffusion_gc_budget.py
+@@ -606,7 +606,7 @@ def is_out_of_memory(exc: BaseException) -> bool:
+ def enable_budgeted_checkpointing(model: Any, device: str) -> Optional[BudgetedCheckpoint]:
+     """Install the budgeted checkpoint on a diffusers model; None when the mode, device or model does not allow it
+     (the caller then checkpoints every block as before)."""
+-    if gc_budget_mode() != "auto" or device != "cuda" or _is_rocm():
++    if gc_budget_mode() != "auto" or device != "cuda":
+         return None
+     enable = getattr(model, "enable_gradient_checkpointing", None)
+     if not callable(enable):
