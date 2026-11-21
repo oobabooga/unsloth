@@ -79,7 +79,7 @@ import {
   useDeviceInventorySources,
 } from "@/features/hub/inventory";
 import { modelIdsMatch } from "@/features/hub/lib/model-identity";
-import { ChatHeaderMenu } from "./components/chat-header-menu";
+import { ChatHeaderMenu, ChatTitleMenu } from "./components/chat-header-menu";
 import { DeleteChatFilesSwitch } from "./components/delete-chat-files-switch";
 import { chatLocalModelOptions } from "./local-model-options";
 import {
@@ -204,6 +204,7 @@ import { cloudCompactionTrigger } from "./utils/auto-compaction";
 import { contextUsageRows } from "./lib/context-usage-bar-state";
 import { ModelLoadInlineStatus } from "./components/model-load-status";
 import { ProjectSwitcher } from "./components/project-switcher";
+import { CastChip, CharacterStage, ChatViewMenu } from "@/features/characters";
 import { EditProjectDialog } from "./components/edit-project-dialog";
 import { ProjectFolderChip } from "./components/project-folder-chip";
 import {
@@ -957,11 +958,13 @@ const SingleContent = memo(function SingleContent({
         browserFullView && chatDock === "minimized" && "hidden",
       )}
     >
-      {/* A floating chat has no welcome screen, so its composer shows in a new chat too. */}
-      <Thread
-        hideWelcome={Boolean(threadId) || browserFullView}
-        targetThreadId={threadId}
-      />
+      <CharacterStage threadId={threadId}>
+        {/* A floating chat has no welcome screen, so its composer shows in a new chat too. */}
+        <Thread
+          hideWelcome={Boolean(threadId) || browserFullView}
+          targetThreadId={threadId}
+        />
+      </CharacterStage>
     </div>
   );
 
@@ -1660,7 +1663,7 @@ function GeneralCompareHeader({
   return (
     <div
       className={cn(
-        "pointer-events-none relative z-40 flex h-[calc(48px*var(--ui-space-scale,1))] shrink-0 items-start gap-2 bg-background pt-[var(--studio-chat-header-padding-top,11px)]",
+        "pointer-events-none relative z-40 flex h-[calc(48px*var(--ui-space-scale,1))] shrink-0 items-start gap-2 bg-background pt-[var(--studio-chat-header-padding-top,11px)] compare-pane-header",
         side === "left"
           ? pinned
             ? "pl-12 pr-3 md:pl-2"
@@ -3711,6 +3714,14 @@ export function ChatPage({
   const baseAttachmentTargetKey =
     keptBaseViewRef.current?.attachmentTargetKey ?? nativeAttachmentTargetKey;
   const baseBackgrounded = view.mode === "compare";
+  // Sidebar rows, links and Back reach compare without enterCompare; the hidden chat is not the open one.
+  const comparePairId = view.mode === "compare" ? view.pairId : null;
+  useLayoutEffect(() => {
+    if (!active || comparePairId === null) return;
+    const store = useChatRuntimeStore.getState();
+    store.setActiveThreadId(null);
+    store.setContextUsage(null);
+  }, [active, comparePairId]);
 
   // Keyed by project, not a boolean: the hoisted provider is not remounted on project change.
   const projectLandingId =
@@ -5017,6 +5028,9 @@ export function ChatPage({
                 />
               </Button>
             )}
+            {view.mode === "single" && !currentProjectId && !incognito && (
+              <ChatTitleMenu threadId={activeThreadId} />
+            )}
             {view.mode === "single" && (
               <ChatModelNotice
                 active={active}
@@ -5045,12 +5059,26 @@ export function ChatPage({
                   onOpenChange={setProjectPickerOpen}
                 />
                 {currentProject && activeThreadId ? (
-                  <span className="min-w-0 truncate">
-                    {currentChatTitle ?? "New chat"}
-                  </span>
+                  <ChatTitleMenu
+                    threadId={incognito ? null : activeThreadId}
+                    fallback={
+                      <span className="min-w-0 truncate">
+                        {currentChatTitle ?? "New chat"}
+                      </span>
+                    }
+                  />
                 ) : null}
               </nav>
             )}
+            {view.mode === "single" ? (
+              <CastChip
+                threadId={activeThreadId}
+                onOpen={() => {
+                  useResearchRunStore.getState().closePanel();
+                  setSettingsOpen(true);
+                }}
+              />
+            ) : null}
             {pendingNativeModelIntent && view.mode !== "compare" ? (
               <NativeModelChip
                 intent={pendingNativeModelIntent}
@@ -5133,6 +5161,7 @@ export function ChatPage({
                 onDiscard={toggleIncognito}
               />
             ) : null}
+            {view.mode === "single" ? <ChatViewMenu threadId={activeThreadId} /> : null}
             {view.mode === "single" && (
               <ChatHeaderMenu temporary={incognito} onToggleTemporary={toggleIncognito} />
             )}

@@ -21,6 +21,7 @@ import stat
 import threading
 import time
 from contextlib import contextmanager
+from contextvars import ContextVar
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -892,7 +893,8 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
             allow_model_load INTEGER NOT NULL DEFAULT 0,
             archive_successful INTEGER NOT NULL DEFAULT 0,
             project_id TEXT,
-            web_search INTEGER NOT NULL DEFAULT 0
+            web_search INTEGER NOT NULL DEFAULT 0,
+            thread_id TEXT
         )
         """
     )
@@ -919,6 +921,8 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE scheduled_tasks ADD COLUMN project_id TEXT")
     if "web_search" not in scheduled_task_cols:
         conn.execute("ALTER TABLE scheduled_tasks ADD COLUMN web_search INTEGER NOT NULL DEFAULT 0")
+    if "thread_id" not in scheduled_task_cols:
+        conn.execute("ALTER TABLE scheduled_tasks ADD COLUMN thread_id TEXT")
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_scheduled_tasks_next_run ON scheduled_tasks(next_run_at)"
     )
@@ -1262,6 +1266,7 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
         END
         """
     )
+    _ensure_character_schema(conn)
     inventory_state = conn.execute(
         """
         SELECT inventory_version, dirty
@@ -1278,6 +1283,89 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
         _rebuild_chat_attachment_inventory(conn)
         _mark_chat_attachment_inventory_clean(conn)
     conn.commit()
+
+
+def _ensure_character_schema(conn: sqlite3.Connection) -> None:
+    """Characters, personas, and which characters take part in which chat (storage/characters_db.py)."""
+    # card_json keeps the imported card as it came, so an export round-trips fields Studio does not edit.
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS characters (
+            id TEXT NOT NULL PRIMARY KEY,
+            name TEXT NOT NULL,
+            description TEXT NOT NULL DEFAULT '',
+            personality TEXT NOT NULL DEFAULT '',
+            scenario TEXT NOT NULL DEFAULT '',
+            first_mes TEXT NOT NULL DEFAULT '',
+            alternate_greetings_json TEXT NOT NULL DEFAULT '[]',
+            mes_example TEXT NOT NULL DEFAULT '',
+            system_prompt TEXT NOT NULL DEFAULT '',
+            post_history_instructions TEXT NOT NULL DEFAULT '',
+            creator_notes TEXT NOT NULL DEFAULT '',
+            creator TEXT NOT NULL DEFAULT '',
+            character_version TEXT NOT NULL DEFAULT '',
+            tags_json TEXT NOT NULL DEFAULT '[]',
+            talkativeness REAL NOT NULL DEFAULT 0.5,
+            favorite INTEGER NOT NULL DEFAULT 0,
+            depth_prompt_json TEXT,
+            character_book_json TEXT,
+            extensions_json TEXT NOT NULL DEFAULT '{}',
+            card_json TEXT,
+            avatar_type TEXT,
+            avatar_rev INTEGER NOT NULL DEFAULT 0,
+            created_at INTEGER NOT NULL,
+            updated_at INTEGER NOT NULL,
+            last_chat_at INTEGER
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS personas (
+            id TEXT NOT NULL PRIMARY KEY,
+            name TEXT NOT NULL,
+            description TEXT NOT NULL DEFAULT '',
+            avatar_type TEXT,
+            avatar_rev INTEGER NOT NULL DEFAULT 0,
+            is_default INTEGER NOT NULL DEFAULT 0,
+            created_at INTEGER NOT NULL,
+            updated_at INTEGER NOT NULL
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS chat_cast (
+            thread_id TEXT NOT NULL REFERENCES chat_threads(id) ON DELETE CASCADE,
+            character_id TEXT NOT NULL REFERENCES characters(id) ON DELETE CASCADE,
+            position INTEGER NOT NULL DEFAULT 0,
+            muted INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY (thread_id, character_id)
+        )
+        """
+    )
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_chat_cast_character ON chat_cast(character_id)")
+    # One row per character chat; it outlives its cast, so a chat whose characters were deleted stays one.
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS chat_scene (
+            thread_id TEXT NOT NULL PRIMARY KEY REFERENCES chat_threads(id) ON DELETE CASCADE,
+            persona_id TEXT REFERENCES personas(id) ON DELETE SET NULL,
+            settings_json TEXT NOT NULL DEFAULT '{}',
+            updated_at INTEGER NOT NULL
+        )
+        """
+    )
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_chat_scene_persona ON chat_scene(persona_id)")
+    # Which bundled starter characters an account has received, so a deleted one stays deleted.
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS character_starters (
+            starter_id TEXT NOT NULL PRIMARY KEY,
+            seeded_at INTEGER NOT NULL
+        )
+        """
+    )
 
 
 def _prompt_entry_from_row(row: sqlite3.Row) -> dict:
@@ -1498,6 +1586,27 @@ def get_connection(
             conn.close()
             raise
     return conn
+
+
+def now_ms() -> int:
+    return int(time.time() * 1000)
+
+
+@contextmanager
+def connection(begin: Optional[str] = None) -> Iterator[sqlite3.Connection]:
+    """One connection: commits what the block wrote, rolls back on any exception."""
+    conn = get_connection()
+    try:
+        if begin:
+            conn.execute(begin)
+        yield conn
+        if conn.in_transaction:
+            conn.commit()
+    except BaseException:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
 
 
 # Held open so the last-writer close does not checkpoint the WAL several times a second (#9934).
@@ -2287,6 +2396,7 @@ def upsert_chat_thread(
     conn = get_connection(_CONTENDED_BUSY_TIMEOUT_SECONDS)
     try:
         conn.execute("BEGIN IMMEDIATE")
+        _probe_chat_revisions(conn, thread["id"], end = False)
         _raise_if_chat_thread_deleted(conn, thread["id"])
         if external_import_session is not None:
             conn.execute(
@@ -2356,6 +2466,7 @@ def upsert_chat_thread(
                 thread.get("scheduledTaskId"),
             ),
         )
+        _probe_chat_revisions(conn, thread["id"], end = True)
         conn.commit()
         return get_chat_thread(thread["id"]) or thread
     except Exception:
@@ -2451,6 +2562,7 @@ def update_chat_thread(
     try:
         # Same transaction as the guarded write, or a 409 leaves the settings change committed.
         conn.execute("BEGIN IMMEDIATE")
+        _probe_chat_revisions(conn, id, end = False)
         # Guards ride in the WHERE clause, so check and write are one statement.
         where = ["id = ?"]
         guard: list = [id]
@@ -2477,6 +2589,7 @@ def update_chat_thread(
             if _write_chat_thread_settings_in_conn(conn, id, **settings_write) is None:
                 conn.rollback()
                 return None
+        _probe_chat_revisions(conn, id, end = True)
         conn.commit()
         row = conn.execute("SELECT * FROM chat_threads WHERE id = ?", (id,)).fetchone()
         if row is None:
@@ -2640,6 +2753,51 @@ def _ensure_chat_history_revision_triggers(conn: sqlite3.Connection) -> None:
         END
         """
     )
+
+
+_chat_revision_probe: ContextVar[Optional[dict]] = ContextVar("chat_revision_probe", default = None)
+
+
+@contextmanager
+def chat_revision_probe(thread_id: str) -> Iterator[dict]:
+    """Records the thread's and the history's revision around each write transaction for it in this context."""
+    probe = {"thread_id": thread_id, "spans": []}
+    token = _chat_revision_probe.set(probe)
+    try:
+        yield probe
+    finally:
+        _chat_revision_probe.reset(token)
+
+
+def _probe_chat_revisions(conn: sqlite3.Connection, thread_id: str, end: bool) -> None:
+    # Read inside the write transaction, so no other writer can land between the two reads.
+    probe = _chat_revision_probe.get()
+    if probe is None or probe["thread_id"] != thread_id:
+        return
+    found = {
+        row[0]: int(row[1])
+        for row in conn.execute(
+            "SELECT scope, revision FROM chat_history_revisions WHERE scope IN (?, ?)",
+            (_CHAT_HISTORY_REVISION_ALL, thread_id),
+        ).fetchall()
+    }
+    pair = (found.get(thread_id, 0), found.get(_CHAT_HISTORY_REVISION_ALL, 0))
+    if end:
+        if probe["spans"] and probe["spans"][-1][1] is None:
+            probe["spans"][-1][1] = pair
+    else:
+        probe["spans"].append([pair, None])
+
+
+def chat_revision_span(probe: dict) -> Optional[tuple[tuple[int, int], tuple[int, int]]]:
+    """(before, after) (thread, history) revisions, or None if the writes were not back to back."""
+    spans = probe["spans"]
+    if not spans or any(after is None for _, after in spans):
+        return None
+    for (_, previous_after), (before, _) in zip(spans, spans[1:]):
+        if before != previous_after:
+            return None
+    return spans[0][0], spans[-1][1]
 
 
 def get_chat_history_revisions(thread_ids: list[str]) -> tuple[int, dict[str, int]]:
@@ -3725,13 +3883,14 @@ def _stored_chat_message_values(
 def _bump_chat_thread_updated_at(
     conn: sqlite3.Connection, thread_id: str, message_created_at: int
 ) -> None:
+    # A no-op UPDATE still fires the revision triggers, making other devices re-read the chat.
     conn.execute(
         """
         UPDATE chat_threads
         SET updated_at = MAX(COALESCE(updated_at, created_at), ?)
-        WHERE id = ?
+        WHERE id = ? AND updated_at IS NOT MAX(COALESCE(updated_at, created_at), ?)
         """,
-        (message_created_at, thread_id),
+        (message_created_at, thread_id, message_created_at),
     )
 
 
@@ -4458,6 +4617,7 @@ def upsert_chat_message(
     conn = get_connection()
     try:
         conn.execute("BEGIN IMMEDIATE")
+        _probe_chat_revisions(conn, message["threadId"], end = False)
         if expected_research_run_id is not None:
             if expected_research_attempt is None:
                 raise ValueError("expected_research_attempt is required with a research run")
@@ -4549,6 +4709,7 @@ def upsert_chat_message(
             int(reconciled["createdAt"]),
         )
         _mark_chat_attachment_inventory_clean(conn)
+        _probe_chat_revisions(conn, message["threadId"], end = True)
         conn.commit()
         return reconciled
     except Exception:
@@ -4577,6 +4738,7 @@ def sync_chat_messages(
     conn = get_connection()
     try:
         conn.execute("BEGIN IMMEDIATE")
+        _probe_chat_revisions(conn, thread_id, end = False)
         _ensure_chat_attachment_inventory_current(conn)
         # Dropping a message of a tombstoned run is a content decision, not a delete: its run row is gone, so nothing else holds it back from the prune.
         tombstoned_ids = {
@@ -4733,6 +4895,7 @@ def sync_chat_messages(
         _mark_chat_attachment_inventory_clean(conn)
         if external_import_mark is not None:
             _record_external_import_mark(conn, external_import_mark)
+        _probe_chat_revisions(conn, thread_id, end = True)
         conn.commit()
         return list_chat_messages(thread_id)
     except (ChatMessageConflictError, ChatMessageProtectedError):
@@ -5064,6 +5227,18 @@ def fork_chat_thread(
             VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             """,
             fork_messages,
+        )
+        # A character chat's fork keeps its cast and scene, or its hidden turns would reach the
+        # model as plain text with no cards.
+        conn.execute(
+            "INSERT INTO chat_cast (thread_id, character_id, position, muted)"
+            " SELECT ?, character_id, position, muted FROM chat_cast WHERE thread_id = ?",
+            (new_thread_id, source_thread_id),
+        )
+        conn.execute(
+            "INSERT INTO chat_scene (thread_id, persona_id, settings_json, updated_at)"
+            " SELECT ?, persona_id, settings_json, ? FROM chat_scene WHERE thread_id = ?",
+            (new_thread_id, int(created_at), source_thread_id),
         )
         for row in ancestry:
             _replace_chat_attachment_inventory(
@@ -6165,8 +6340,7 @@ def _merge_settings_updates(current: dict[str, Any], updates: dict[str, Any]) ->
         if isinstance(held, dict) and any(held.values()):
             merged["presetEditedKeys"] = {key: False for key in PRESET_EDITED_KEYS}
     elif "activePresetSource" in updates and "presetEditedKeys" not in updates:
-        # Current clients send the map with every source change, so this `modified` comes from an
-        # older client or a legacy import, where it kept every key.
+        # Current clients send the map each time; a legacy modified flag keeps every key.
         merged["presetEditedKeys"] = {key: True for key in PRESET_EDITED_KEYS}
     return merged
 

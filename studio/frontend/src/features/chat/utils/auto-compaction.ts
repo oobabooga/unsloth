@@ -3,7 +3,7 @@
 
 /**
  * Local GGUF, MLX, NPU and managed engine auto-compaction is on or off only; the server chooses how it
- * compacts (UNSLOTH_CONTEXT_POLICY, default "checkpoint").
+ * compacts (UNSLOTH_CONTEXT_POLICY, default "checkpoint"), except that character chats ask for rolling.
  */
 
 export const DEFAULT_AUTO_COMPACT_ENABLED = true;
@@ -16,8 +16,11 @@ export function ggufCompactionRequestFields(options: {
   autoCompactEnabled: boolean;
   // /compact: asked for by the user, so it applies with auto-compaction off too
   compactNow?: boolean;
+  // Character chats: rolling, since a checkpoint would turn old roleplay lines into standing instructions.
+  rolling?: boolean;
 }): {
   context_overflow?: "error" | "truncate_oldest";
+  context_policy?: "rolling";
   compact_context?: true;
 } {
   if (
@@ -35,6 +38,7 @@ export function ggufCompactionRequestFields(options: {
     // explicit error avoids the UNSLOTH_CONTEXT_OVERFLOW fallback, which may compact
     return { context_overflow: "error" };
   }
+  if (options.rolling) return { context_overflow: "truncate_oldest", context_policy: "rolling" };
   // omit context_policy so the server applies UNSLOTH_CONTEXT_POLICY
   return { context_overflow: "truncate_oldest" };
 }
@@ -62,6 +66,17 @@ export function normalizeAutoCompactTokens(value: unknown): number | undefined {
     return undefined;
   }
   return value;
+}
+
+/** Unset is "summary"; "rolling" and "checkpoint" drop whole turns into the archive, no summary call. */
+export type ProviderCompactionMode = "summary" | "rolling" | "checkpoint";
+
+export function normalizeCompactionMode(
+  value: unknown,
+): ProviderCompactionMode | undefined {
+  return value === "summary" || value === "rolling" || value === "checkpoint"
+    ? value
+    : undefined;
 }
 
 /** Blank clears the setting; anything else must be a whole number of tokens in range. */
@@ -132,6 +147,7 @@ export function apiCompactionRequestFields(options: {
   contextLength: number | null | undefined;
   /** The connection's "Auto-compact after", which replaces the 75% default. */
   autoCompactTokens?: number | null;
+  compactionMode?: ProviderCompactionMode | null;
   // /compact: asked for by the user, so it applies with auto-compaction off too
   compactNow?: boolean;
 }): {
@@ -140,9 +156,14 @@ export function apiCompactionRequestFields(options: {
   compaction_uncapped?: true;
   context_window?: number;
   compact_context?: true;
+  compaction_mode?: "rolling" | "checkpoint";
 } {
   const { autoCompactEnabled, contextLength, compactNow } = options;
-  if (!autoCompactEnabled && !compactNow) return {};
+  const mode = options.compactionMode;
+  const evict =
+    mode === "rolling" || mode === "checkpoint" ? { compaction_mode: mode } : {};
+  // Still sent with auto-compact off: the backend replays a /compact epoch only for "checkpoint".
+  if (!autoCompactEnabled && !compactNow) return evict;
   const requested = requestedCompactionThreshold(
     contextLength,
     options.autoCompactTokens,
@@ -154,5 +175,6 @@ export function apiCompactionRequestFields(options: {
     ...(requested?.uncapped ? { compaction_uncapped: true as const } : {}),
     ...(contextLength && contextLength > 0 ? { context_window: contextLength } : {}),
     ...(compactNow ? { compact_context: true as const } : {}),
+    ...evict,
   };
 }

@@ -45,7 +45,7 @@ import type { IconSvgElement } from "@hugeicons/react";
 import { HugeiconsIcon } from "@hugeicons/react";
 import { memo, useDeferredValue, useMemo } from "react";
 import { selectActiveJob, useDownloadManagerStore } from "../download-manager";
-import { useCopyFeedback } from "../hooks/use-copy-feedback";
+import { useCopyFeedback } from "@/hooks/use-copy-feedback";
 import { useDatasetSize } from "../hooks/use-dataset-size";
 import {
   type HubModelRunSelection,
@@ -725,7 +725,7 @@ export const ModelInspector = memo(function ModelInspector({
               modelId={model.id}
               displayName={model.title}
               repoId={model.hubRepoId}
-              sourceLabel={model.sourceLabel}
+              sourceLabel={model.owner === model.sourceLabel ? "" : model.sourceLabel}
               source={model.localSource ?? "custom"}
               path={model.path ?? model.displayId}
               isGguf={model.isGguf}

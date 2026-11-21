@@ -2,6 +2,18 @@
 import { MemoryToolUI } from "./tool-ui-memory";
 // Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
 
+import {
+  CharacterReplyFrame,
+  CharacterSpeakerBar,
+  PersonaMessageFrame,
+  groupRoundPending,
+  useCharacterComposerPlaceholder,
+  useCharacterUserParts,
+  useHiddenRoleplayTurn,
+  useInCharacterChat,
+  useInCharacterReply,
+} from "@/features/characters";
+import { addressName } from "@/features/profile";
 import { AiSpeechIcon, BookmarkIcon, FileSearchIcon, TrashIcon } from "@/lib/hugeicons-derived";
 import { createPortal } from "react-dom";
 import {
@@ -14,10 +26,15 @@ import {
   type QueuedPrompt,
 } from "@/features/chat/utils/queued-text-attachments";
 import { getAuthSessionEpoch } from "@/features/auth";
-import { useMarkChatWelcome } from "@/features/chat-background";
+import {
+  useChatWelcomeShown,
+  useMarkChatWelcome,
+} from "@/features/chat-background";
 
 import {
   ComposerAttachments,
+  SENT_ALIGN_CLASSES,
+  type SentMessageAlign,
   UserMessageAttachments,
 } from "@/components/assistant-ui/attachment";
 import {
@@ -84,6 +101,7 @@ import {
   threadMessageKind,
 } from "@/components/assistant-ui/thread-message-slot";
 import { ComposerModelPicker } from "@/components/assistant-ui/composer-model-picker/composer-model-picker";
+import { ModelPickerAnnouncement } from "@/components/assistant-ui/model-picker-announcement";
 import { withToolConfirmation } from "@/components/assistant-ui/tool-confirmation-controls";
 import { ToolFallback } from "@/components/assistant-ui/tool-fallback";
 import { ToolGroup } from "@/components/assistant-ui/tool-group";
@@ -241,7 +259,6 @@ import {
   useLibraryChatHandoffStore,
 } from "@/features/library/chat-handoff-store";
 import { resumesThought } from "@/features/model-picker";
-import { CompactOnReturnChip } from "./compact-on-return-chip";
 import { isNpuModelId } from "@/features/npu";
 import { cancelResearchRun } from "@/features/chat/api/research-api";
 import {
@@ -488,6 +505,7 @@ import {
   MoreHorizontalIcon,
   PlusSignIcon,
   Cancel01Icon,
+  WinkingIcon,
 } from "@hugeicons/core-free-icons";
 import { FolderAddIcon, FolderAttachmentIcon } from "@/lib/folder-icons";
 import { Copy01Icon } from "@/lib/copy-icon";
@@ -935,6 +953,17 @@ function pumpPromptQueues() {
   }
 }
 
+/** Waits for the target's running reply to finish, then dispatches (see handlePromptQueueRunState). */
+function parkUntilTargetIdle(run: PromptQueueRun): void {
+  run.waitingForTargetIdle = true;
+  run.prevStoreRunning = true;
+  promptQueueActiveRunIds.delete(run.id);
+  syncPromptQueueUI();
+  ensurePromptQueueSubscription();
+  handlePromptQueueRunState(run, useChatRuntimeStore.getState().runningByThreadId);
+  schedulePromptQueueTargetStatePoll(run);
+}
+
 async function dispatchQueuedPrompt(
   run: PromptQueueRun,
   item: PromptQueueItem,
@@ -948,31 +977,33 @@ async function dispatchQueuedPrompt(
     scheduleQueuedPromptDispatch(run, item, PROMPT_QUEUE_DISPATCH_RETRY_MS);
     return;
   }
+  // A character chat's group round is about to start its next speaker; the queue waits for it.
+  if (groupRoundPending(item.target.getDocumentThreadId())) {
+    scheduleQueuedPromptDispatch(run, item, PROMPT_QUEUE_DISPATCH_RETRY_MS);
+    return;
+  }
   if (
     isPromptQueueTargetRunning(
       item.target,
       useChatRuntimeStore.getState().runningByThreadId,
     )
   ) {
-    run.waitingForTargetIdle = true;
-    run.prevStoreRunning = true;
-    promptQueueActiveRunIds.delete(run.id);
-    syncPromptQueueUI();
-    ensurePromptQueueSubscription();
-    handlePromptQueueRunState(
-      run,
-      useChatRuntimeStore.getState().runningByThreadId,
-    );
-    schedulePromptQueueTargetStatePoll(run);
+    parkUntilTargetIdle(run);
     return;
   }
   const hasIndexingDocuments = await targetHasIndexingDocuments(item);
   if (!isActivePromptQueueItem(run, item, generation)) {
     return;
   }
-  // recheck loading after the document probe.
+  // A run can start during the document probe: wait for it like above.
+  if (isPromptQueueTargetRunning(item.target, useChatRuntimeStore.getState().runningByThreadId)) {
+    parkUntilTargetIdle(run);
+    return;
+  }
+  // recheck loading after the document probe; a group's next speaker can also be about to start.
   if (
     hasIndexingDocuments ||
+    groupRoundPending(item.target.getDocumentThreadId()) ||
     (item.target.usesLocalModel && useChatRuntimeStore.getState().modelLoading)
   ) {
     promptQueueActiveRunIds.delete(run.id);
@@ -1884,6 +1915,8 @@ const PromptQueueContext = createContext<PromptQueueCallbacks>({
 // Gap between last message and floating composer, added to the bottom spacer height.
 const COMPOSER_SCROLL_GAP_PX = 24;
 const FOOTER_GAP_BELOW_SPACER_PX = 10;
+const THREAD_COMPOSER_CLIP_VAR = "--thread-composer-clip";
+const THREAD_COMPOSER_FADE_VAR = "--thread-composer-fade";
 // After a run start, composer shrinks apply immediately: the run-start pin owns the bottom.
 const RUN_SHRINK_WINDOW_MS = 1000;
 
@@ -1891,8 +1924,16 @@ const RUN_SHRINK_WINDOW_MS = 1000;
 const ThreadMessage: FC = () => {
   const role = useAuiState(({ message }) => message.role);
   const isEditing = useAuiState(({ message }) => message.composer.isEditing);
+  // A character chat's opening and turn markers reach only the model; their rows keep the dividers.
+  const hiddenTurn = useHiddenRoleplayTurn();
   let body: ReactNode = null;
-  switch (threadMessageKind(role, isEditing)) {
+  switch (hiddenTurn ?? threadMessageKind(role, isEditing)) {
+    case "opening":
+      // A row's height (shrink-0), so the greeting clears the header fade.
+      body = <div aria-hidden={true} className="h-[calc(1.75rem*var(--ui-space-scale,1))] shrink-0" />;
+      break;
+    case "turn":
+      break;
     case "edit":
       body = <EditComposer />;
       break;
@@ -1920,12 +1961,53 @@ const PendingCompactionRule: FC = () => {
   const pending = useCompactRequestStore((s) =>
     threadId === null ? false : s.requested[threadId] === true,
   );
-  const endsWithReply = useAuiState(
-    ({ message }) => message.isLast && message.role === "assistant",
+  // Any role: a reply can fail. Hidden mid-run, when the request is already taken.
+  const anchored = useAuiState(
+    ({ thread, message }) => message.isLast && !thread.isRunning,
   );
   const cloud = useChatRuntimeStore((s) => isExternalModelId(s.params.checkpoint));
-  if (!pending || !endsWithReply) return null;
-  return <CompactionDivider pending={true} cloud={cloud} className="mt-6" />;
+  if (!pending || !anchored || threadId === null) return null;
+  return (
+    <CompactionDivider
+      pending={true}
+      cloud={cloud}
+      className="mt-6"
+      onCancel={() => useCompactRequestStore.getState().clear(threadId)}
+    />
+  );
+};
+
+/** Confirms /compact and the chat menu: scrolls the queued rule out from under the scroll button and announces it. */
+const PendingCompactionStatus: FC<{ threadId: string | null }> = ({ threadId }) => {
+  const scrollToBottom = useScrollThreadToBottom();
+  const requested = useCompactRequestStore((s) =>
+    threadId === null ? false : s.requested[threadId] === true,
+  );
+  // Mirrors PendingCompactionRule's visibility.
+  const idle = useAuiState(({ thread }) => !thread.isRunning && thread.messages.length > 0);
+  const cloud = useChatRuntimeStore((s) => isExternalModelId(s.params.checkpoint));
+  const aui = useAui();
+  useEffect(() => {
+    if (threadId === null) return;
+    return useCompactRequestStore.subscribe((state, previous) => {
+      if (
+        state.requested[threadId] &&
+        !previous.requested[threadId] &&
+        !aui.thread().getState().isRunning
+      ) {
+        scrollToBottom();
+      }
+    });
+  }, [aui, scrollToBottom, threadId]);
+  return (
+    <span role="status" className="sr-only">
+      {requested && idle
+        ? cloud
+          ? "Your next message will be sent with a summary of the older messages."
+          : "Your next message will start a fresh context."
+        : ""}
+    </span>
+  );
 };
 
 // The selector returns the persisted record, which keeps its identity between renders, so a
@@ -2139,6 +2221,8 @@ export const Thread: FC<{
   );
   const activeThreadId = useChatRuntimeStore((s) => s.activeThreadId);
   const threadId = targetThreadId ?? activeThreadId ?? null;
+  // Turn ticks would count a character chat's hidden turns, and roleplay reads as one scene.
+  const inCharacterChat = useInCharacterChat();
   const aui = useAui();
   useThreadForkCounts();
   useTrackForkBoundaryAnchor(threadId);
@@ -2262,7 +2346,11 @@ export const Thread: FC<{
     }
     if (prev != null && composerHeight > prev) {
       // Detach as if the user scrolled up so nothing re-pins; not mid-run, where growth is tool rows.
-      if (!aui.thread().getState().isRunning) {
+      // An empty composer only grows as its row floor eases (new chat vs conversation), which must
+      // not strand a conversation opening under it a few pixels above its end.
+      const draft = aui.composer().getState();
+      const writing = draft.text.length > 0 || draft.attachments.length > 0;
+      if (writing && !aui.thread().getState().isRunning) {
         autoScrollContext.detachFromBottom();
       }
     }
@@ -2370,7 +2458,7 @@ export const Thread: FC<{
             </AuiIf>
           )}
 
-          <TurnNavigator viewportRef={viewportElRef} />
+          {inCharacterChat ? null : <TurnNavigator viewportRef={viewportElRef} />}
 
           {/* Drop-in for ThreadPrimitive.Messages that mounts only the rows near the reader, with a
           spacer for the rows on either side, so a thread costs what is on screen and not its
@@ -2384,6 +2472,7 @@ export const Thread: FC<{
           />
           <ForkChatShortcut />
           <ContextReportMount />
+          <PendingCompactionStatus threadId={threadId} />
 
           {/* Bottom slack so the last message has room above the sticky
           scroll-to-bottom button (and floating composer in single mode),
@@ -2392,6 +2481,8 @@ export const Thread: FC<{
             <div
               ref={spacerRef}
               className={cn(
+                // Hooked only in character chats (novel view), so ordinary chats keep main's markup.
+                inCharacterChat && "aui-thread-bottom-spacer",
                 "shrink-0",
                 hideComposer
                   ? "h-16"
@@ -2647,15 +2738,40 @@ const ThreadComposerDock: FC<{
     return column ? watchComposerClearance(column, uiSpaceScale) : undefined;
   }, [uiSpaceScale]);
 
+  const threadIsEmpty = useAuiState(({ thread }) => thread.isEmpty);
   const dockInnerRef = useRef<HTMLDivElement | null>(null);
   useLayoutEffect(() => {
     const dock = dockRef.current;
     const inner = dockInnerRef.current;
     const viewport = childWithClass(dock?.parentElement, "aui-thread-viewport");
-    if (!dock || !inner || !viewport) return;
+    const root = viewport?.parentElement;
+    if (!dock || !inner || !viewport || !root) return;
     const resizeObserver = new ResizeObserver(() => apply());
     let observedFooter: Element | null = null;
+    const syncComposerClip = () => {
+      const surface = threadIsEmpty
+        ? null
+        : dock.querySelector<HTMLElement>(".unsloth-composer-surface");
+      if (!surface) {
+        root.style.removeProperty(THREAD_COMPOSER_CLIP_VAR);
+        root.style.removeProperty(THREAD_COMPOSER_FADE_VAR);
+        return;
+      }
+      const clip = Math.max(
+        0,
+        Math.round(
+          viewport.getBoundingClientRect().bottom -
+            surface.getBoundingClientRect().top,
+        ),
+      );
+      root.style.setProperty(THREAD_COMPOSER_CLIP_VAR, `${clip}px`);
+      root.style.setProperty(
+        THREAD_COMPOSER_FADE_VAR,
+        "calc(10px * var(--ui-space-scale, 1))",
+      );
+    };
     const apply = () => {
+      syncComposerClip();
       // May fire before the gutter's observer, which would leave the composer a scrollbar off-centre.
       syncThreadGutter(viewport);
       // The footer is the real column box: WebKit's both-edges gutter reserves 2x the scrollbar on the right, clientWidth 1x.
@@ -2687,8 +2803,10 @@ const ThreadComposerDock: FC<{
     return () => {
       resizeObserver.disconnect();
       viewport.removeEventListener(THREAD_GUTTER_CHANGE_EVENT, apply);
+      root.style.removeProperty(THREAD_COMPOSER_CLIP_VAR);
+      root.style.removeProperty(THREAD_COMPOSER_FADE_VAR);
     };
-  }, []);
+  }, [threadIsEmpty]);
 
   return (
     <div
@@ -2835,7 +2953,7 @@ const ThreadWelcome: FC<{
   const t = useT();
 
   useEffect(() => {
-    const raw = nickname.trim() || (displayName.trim().split(/\s+/)[0] ?? "");
+    const raw = addressName({ nickname, displayName }, "");
     const name = raw.length > 20 ? `${raw.slice(0, 20)}…` : raw;
     setWelcome(buildWelcome(new Date().getHours(), name));
   }, [displayName, nickname]);
@@ -2914,6 +3032,9 @@ const ThreadWelcome: FC<{
         {composerAtBottom ? (
           <div className="aui-thread-welcome-message flex w-full flex-col justify-center">
             {greetingRow}
+            {!hideComposer && !incognito && (
+              <ModelPickerAnnouncement className="mt-[calc(28px*var(--ui-space-scale,1))]" />
+            )}
           </div>
         ) : (
           <>
@@ -2925,8 +3046,12 @@ const ThreadWelcome: FC<{
               {/* Padding here, not on the spacer, where it would count toward the spacer's share. */}
               <div className="flex flex-col pb-[calc(22px*var(--ui-space-scale,1))]">{greetingRow}</div>
             </div>
-            <div className="aui-thread-welcome-message flex w-full flex-col">
+            <div className="aui-thread-welcome-message relative flex w-full flex-col">
               {!hideComposer && <ComposerAnimated threadId={threadId} />}
+              {/* Out of flow, so the composer stays centred by its own box. */}
+              {!hideComposer && !incognito && (
+                <ModelPickerAnnouncement className="absolute inset-x-0 top-full mt-[calc(28px*var(--ui-space-scale,1))]" />
+              )}
             </div>
             <div
               aria-hidden="true"
@@ -3027,6 +3152,7 @@ const Composer: FC<{
   const pageDragging = useContext(PageDragContext);
   const nativeDragging = useContext(NativeAttachmentDragContext);
   const { overlay, closeOverlay } = useGeneratedImageOverlay();
+  const characterPlaceholder = useCharacterComposerPlaceholder();
   const setImageToolsEnabled = useChatRuntimeStore(
     (s) => s.setImageToolsEnabled,
   );
@@ -3279,15 +3405,19 @@ const Composer: FC<{
   const editorRef = useRef<HTMLDivElement>(null);
   const inputId = useId();
   const uiSpaceScale = useUiSpaceScale();
+  const threadEmpty = useAuiState(({ thread }) => thread.isEmpty);
+  // Empty saved chats and the floating chat have no welcome.
+  const welcomeShown = useChatWelcomeShown();
+  const newChatPage = threadEmpty && welcomeShown;
   const minEditorHeight = Math.round(
-    (16 + 24 * COMPOSER_MIN_ROWS) * uiSpaceScale,
+    (16 + 24 * (threadEmpty ? COMPOSER_MIN_ROWS : 1) - (newChatPage ? 8 : 0)) *
+      uiSpaceScale,
   );
   const maxRows = useComposerMaxRows(24 * uiSpaceScale);
   const [editorHeight, setEditorHeight] = useState(40);
   const [isWritingExpanded, setIsWritingExpanded] = useState(false);
   const detachFromBottom = useDetachThreadFromBottom();
   const scrollThreadToBottom = useScrollThreadToBottom();
-  const threadEmpty = useAuiState(({ thread }) => thread.isEmpty);
   const toggleWritingExpanded = () => {
     setIsWritingExpanded((expanded) => !expanded);
     inputRef.current?.focus({ preventScroll: true });
@@ -6201,6 +6331,7 @@ const Composer: FC<{
             <div
               ref={editorRef}
               className="unsloth-composer-editor"
+              data-new-chat={newChatPage || undefined}
               style={
                 {
                   "--composer-editor-height": `${composerText.length === 0 ? minEditorHeight : Math.max(minEditorHeight, editorHeight)}px`,
@@ -6211,7 +6342,9 @@ const Composer: FC<{
                 id={inputId}
                 submitMode="none"
                 placeholder={
-                  overlay ? "Type your edits for your image" : "Ask anything"
+                  overlay
+                    ? "Type your edits for your image"
+                    : (characterPlaceholder ?? "Ask anything")
                 }
                 ref={composerSurfaceRef}
                 data-type-to-activate="composer"
@@ -6354,6 +6487,7 @@ const Composer: FC<{
       onSubmit={handleSubmit}
     >
       <PromptQueueStack queueThreadIds={promptQueueThreadIds} />
+      <CharacterSpeakerBar />
       {/* Chat with files card. Stays mounted while dictating to keep indexing state. */}
       <div className={isDictating ? "hidden" : "contents"}>
         {documentsBar}
@@ -6904,6 +7038,12 @@ function usePickComposerAttachment(): () => void {
   }, [aui, audioAttachmentsEnabled]);
 }
 
+const LazyCharacterChatPicker = lazy(() =>
+  import("@/features/characters/chat/start-picker").then((module) => ({
+    default: module.CharacterChatPicker,
+  })),
+);
+
 const LazyLibraryAttachmentPicker = lazy(() =>
   import("@/components/assistant-ui/library-attachment-picker").then((module) => ({
     default: module.LibraryAttachmentPicker,
@@ -7006,6 +7146,7 @@ const ComposerToolsMenu: FC<{
   const [newProjectOpen, setNewProjectOpen] = useState(false);
   const [skillsOn, setSkillsOn] = useSkillsSwitch();
   const [promptStorageOpen, setPromptStorageOpen] = useState(false);
+  const [characterPickerOpen, setCharacterPickerOpen] = useState(false);
   const [libraryPickerOpen, setLibraryPickerOpen] = useState(false);
   const libraryPickerRequested = useRef(false);
   const activeThreadId = useChatRuntimeStore((s) => s.activeThreadId);
@@ -7303,6 +7444,12 @@ const ComposerToolsMenu: FC<{
         </DropdownMenuSubContent>
       </DropdownMenuSub>
     ),
+    characters: (
+      <DropdownMenuItem onSelect={() => setCharacterPickerOpen(true)}>
+        <HugeiconsIcon icon={WinkingIcon} strokeWidth={2} />
+        {t("characters.plusMenu")}
+      </DropdownMenuItem>
+    ),
   };
   const { pinned: pinnedPlusItems, overflow: overflowPlusItems } =
     splitPlusMenuItems(plusOrder, plusPins);
@@ -7313,6 +7460,11 @@ const ComposerToolsMenu: FC<{
     {libraryPickerOpen ? (
       <Suspense fallback={null}>
         <LazyLibraryAttachmentPicker onClose={() => setLibraryPickerOpen(false)} />
+      </Suspense>
+    ) : null}
+    {characterPickerOpen ? (
+      <Suspense fallback={null}>
+        <LazyCharacterChatPicker onClose={() => setCharacterPickerOpen(false)} />
       </Suspense>
     ) : null}
     <PromptStorageDialog
@@ -7686,7 +7838,6 @@ const ComposerRightControls: FC<{
           !thread.isRunning && !isQueueRunning && !isResearchActive
         }
       >
-        <CompactOnReturnChip />
         <ComposerPrimitive.Send asChild={true}>
           <TooltipIconButton
             tooltip={
@@ -8449,6 +8600,7 @@ const AssistantMessage: FC = () => {
       onFocus={focusReveal.onFocus}
       onBlur={focusReveal.onBlur}
     >
+      <CharacterReplyFrame>
       <WindowedMessageBody enabled={!isEditing && messageContent !== null && !researchRunId}>
       <div className="aui-assistant-message-content wrap-break-word min-w-0 text-[#0f1114] dark:text-foreground leading-relaxed">
         {isEditing ? (
@@ -8478,9 +8630,7 @@ const AssistantMessage: FC = () => {
           </div>
         ) : (
           <>
-            <div className="pointer-events-none relative h-0 min-w-0">
-              <MessageResponseModelBadge className="absolute -top-6 left-0 max-w-[min(22rem,100%)]" />
-            </div>
+            <FloatingResponseModelBadge />
             {researchRunId ? (
               <ResearchMessage />
             ) : (
@@ -8514,6 +8664,7 @@ const AssistantMessage: FC = () => {
         <AssistantActionBar />
       </div>
       </WindowedMessageBody>
+      </CharacterReplyFrame>
 
       {/* Trailing stop so Shift+Tab enters the action bar; the root's onFocus mounts it. */}
       <span
@@ -9126,7 +9277,15 @@ const AssistantActionBar: FC = () => {
   );
 };
 
-const UserMessageAudio: FC = () => {
+// A character reply shows the model in its name line instead.
+const FloatingResponseModelBadge: FC = () =>
+  useInCharacterReply() ? null : (
+    <div className="pointer-events-none relative h-0 min-w-0">
+      <MessageResponseModelBadge className="absolute -top-6 left-0 max-w-[min(22rem,100%)]" />
+    </div>
+  );
+
+const UserMessageAudio: FC<{ align?: SentMessageAlign }> = ({ align = "end" }) => {
   const audioName = useAuiState(({ message }) =>
     sentAudioNames.get(message.id),
   );
@@ -9134,7 +9293,7 @@ const UserMessageAudio: FC = () => {
     return null;
   }
   return (
-    <div className="col-start-2 flex justify-end">
+    <div className={cn("col-start-2 flex", SENT_ALIGN_CLASSES[align].justify)}>
       <div className="flex items-center gap-2 rounded-full border border-[color-mix(in_oklab,var(--foreground)_calc(20%*var(--contrast-edge-gain,1)),transparent)] bg-muted px-3 py-1.5 text-xs">
         <HugeiconsIcon icon={AiSpeechIcon} className="size-3.5 text-muted-foreground" />
         <span className="max-w-48 truncate">{audioName}</span>
@@ -9186,6 +9345,14 @@ const ScheduledTaskSource: FC = () => {
 /** Prompts already shown: the thread window remounts rows, and a remount must not replay the arrival. */
 const shownPrompts = new Set<string>();
 
+const UserMessageMedia: FC<{ align: SentMessageAlign }> = ({ align }) => (
+  <>
+    <ScheduledTaskSource />
+    <UserMessageAttachments align={align} />
+    <UserMessageAudio align={align} />
+  </>
+);
+
 const UserMessage: FC = () => {
   const focusReveal = useActionBarFocusReveal();
   const id = useAuiState(({ message }) => message.id);
@@ -9202,35 +9369,38 @@ const UserMessage: FC = () => {
   const hasContent = useAuiState(({ message }) =>
     message.content.some((part) => part.type !== "text" || part.text.trim() !== ""),
   );
+  const characterParts = useCharacterUserParts();
   return (
     <MessagePrimitive.Root
       className={cn(
         "aui-user-message-root mx-auto flex w-full max-w-(--thread-content-max-width) flex-col items-end gap-y-2 pt-6 pb-4 text-ui-15p5 [font-weight:410] tracking-[0.01em] dark:tracking-[0.02em]",
         arriving && "fade-in slide-in-from-bottom-1 animate-in duration-150",
+        characterParts && "relative block min-w-0 pt-0.5",
       )}
       data-role="user"
       tabIndex={0}
       {...focusReveal}
     >
-      <WindowedMessageBody>
-      <ScheduledTaskSource />
-      <UserMessageAttachments />
-      <UserMessageAudio />
-
-      <div className="aui-user-message-content-wrapper flex w-full min-w-0 flex-col items-end">
-        {hasContent ? (
-          <div
-            dir="auto"
-            className="aui-user-message-content wrap-break-word [&_p]:whitespace-pre-wrap! w-fit max-w-[80%] rounded-xl bg-[#f5f5f5] px-4 py-2.5 text-[#0f1114] dark:text-foreground dark:bg-card">
-            <MessagePrimitive.Parts />
+      {characterParts ? (
+        <CharacterUserMessageBody parts={characterParts} hasContent={hasContent} />
+      ) : (
+        <WindowedMessageBody>
+          <UserMessageMedia align="end" />
+          <div className="aui-user-message-content-wrapper flex w-full min-w-0 flex-col items-end">
+            {hasContent ? (
+              <div
+                dir="auto"
+                className="aui-user-message-content wrap-break-word [&_p]:whitespace-pre-wrap! w-fit max-w-[80%] rounded-xl bg-[#f5f5f5] px-4 py-2.5 text-[#0f1114] dark:text-foreground dark:bg-card">
+                <MessagePrimitive.Parts />
+              </div>
+            ) : null}
+            <UserMessageFooter>
+              <UserActionBar />
+              <BranchPicker className="aui-user-branch-picker ml-[calc(6px*var(--ui-space-scale,1))] shrink-0" />
+            </UserMessageFooter>
           </div>
-        ) : null}
-        <UserMessageFooter>
-          <UserActionBar />
-          <BranchPicker className="aui-user-branch-picker ml-[calc(6px*var(--ui-space-scale,1))] shrink-0" />
-        </UserMessageFooter>
-      </div>
-      </WindowedMessageBody>
+        </WindowedMessageBody>
+      )}
       {/* Reverse traversal reaches a trailing stop before the root. Focusing it
           mounts the autohidden controls, so the next Shift+Tab enters its controls
           instead of skipping the action bar and leaving the message. */}
@@ -9243,11 +9413,40 @@ const UserMessage: FC = () => {
   );
 };
 
-const UserActionBar: FC = () => {
+/** A character chat lays the user's message out like a reply: under the persona, on the left, no bubble. */
+const CharacterUserMessageBody: FC<{
+  parts: NonNullable<ReturnType<typeof useCharacterUserParts>>;
+  hasContent: boolean;
+}> = ({ parts, hasContent }) => (
+  <PersonaMessageFrame>
+    <WindowedMessageBody>
+      <div className="mb-2 flex flex-col items-start gap-2 empty:hidden">
+        <UserMessageMedia align="start" />
+      </div>
+      <div className="aui-user-message-content-wrapper flex w-full min-w-0 flex-col items-start">
+        {hasContent ? (
+          <div
+            dir="auto"
+            className="aui-user-message-content wrap-break-word [&_p]:whitespace-pre-wrap! min-w-0 leading-relaxed text-[#0f1114] dark:text-foreground"
+          >
+            <MessagePrimitive.Parts components={parts} />
+          </div>
+        ) : null}
+        <div className="aui-user-message-footer mt-1.5 -ml-[var(--icon-btn-inset)] flex min-h-8 min-w-0 flex-wrap items-center gap-y-1">
+          <BranchPicker className="mr-0.5 h-8" />
+          {/* The time is already in the name line. */}
+          <UserActionBar showTime={false} />
+        </div>
+      </div>
+    </WindowedMessageBody>
+  </PersonaMessageFrame>
+);
+
+const UserActionBar: FC<{ showTime?: boolean }> = ({ showTime }) => {
   const ownsResearchMessage = useOwnsResearchMessage();
   const researchActive = useThreadResearchActive();
   return (
-    <UserMessageActionBar>
+    <UserMessageActionBar showTime={showTime}>
       <CopyButton />
       {!ownsResearchMessage && !researchActive && (
         <ActionBarPrimitive.Edit asChild={true}>
@@ -9318,6 +9517,7 @@ const EditComposer: FC = () => {
   const researchActive = useThreadResearchActive();
   // send() drops an empty composer, e.g. a paste-only message whose chip was removed.
   const editEmpty = useAuiState(({ composer }) => composer.isEmpty);
+  const inCharacterChat = useInCharacterChat();
 
   useAuiEvent("thread.runEnd", () => {
     if (!resendAfterCancelRef.current) {
@@ -9339,8 +9539,14 @@ const EditComposer: FC = () => {
   }, [aui, isComposingRef]);
 
   return (
-    // Top gap and type match UserMessage, so the text stays near the prompt's line.
-    <MessagePrimitive.Root className="aui-edit-composer-wrapper mx-auto flex w-full max-w-(--thread-content-max-width) flex-col pt-6 pb-4 text-ui-15p5 [font-weight:410] tracking-[0.01em] dark:tracking-[0.02em]">
+    // Type matches UserMessage; a character chat keeps the persona frame while editing.
+    <MessagePrimitive.Root
+      className={cn(
+        "aui-edit-composer-wrapper mx-auto flex w-full max-w-(--thread-content-max-width) flex-col pt-6 pb-4 text-ui-15p5 [font-weight:410] tracking-[0.01em] dark:tracking-[0.02em]",
+        inCharacterChat && "pt-0.5",
+      )}
+    >
+      <PersonaMessageFrame>
       <ComposerPrimitive.Root
         className="aui-edit-composer-root flex w-full flex-col rounded-xl bg-muted"
         onSubmit={(event) => {
@@ -9376,6 +9582,7 @@ const EditComposer: FC = () => {
           </Button>
         </div>
       </ComposerPrimitive.Root>
+      </PersonaMessageFrame>
     </MessagePrimitive.Root>
   );
 };

@@ -17,6 +17,7 @@ uniform knot grid at load, so 20B parameters are left to quantize."""
 
 from __future__ import annotations
 
+import contextlib
 import functools
 import gc
 import hashlib
@@ -146,6 +147,12 @@ PINNED_STREAM_ENV = "UNSLOTH_H3_IMAGE_PINNED_STREAM"
 REF_CACHE_ENV = "UNSLOTH_H3_IMAGE_REF_CACHE"
 # "0": keep the allocator blocks the load's staging and lever installs freed reserved on the card
 TRIM_AFTER_LOAD_ENV = "UNSLOTH_H3_IMAGE_TRIM_AFTER_LOAD"
+# Stream tier layout: "auto" (priced), "1" park once-per-phase pieces on the host, "0" keep them on the card.
+PARK_ENV = "UNSLOTH_H3_IMAGE_PARK"
+# Overrides the measured host-to-device GiB/s.
+H2D_ENV = "UNSLOTH_H3_IMAGE_H2D_GIBS"
+# "0": old stream pricing (activation_gb + 1.5 GB margin, no per-render fit)
+MEASURED_WORKING_SET_ENV = "UNSLOTH_H3_IMAGE_MEASURED_WORKING_SET"
 # Posteriors kept per pipeline (a 2720x1536 reference is about 3 MB of mean / log-variance on the device)
 REF_CACHE_ENTRIES = 8
 
@@ -1455,10 +1462,25 @@ class H3ImagePlan:
     reasons: list = field(default_factory = list)
     # host GB held once placed (host DiT blocks + encoder + 4 GB); None without a host budget
     host_need_gb: Optional[float] = None
+    parked: bool = False
+    vae_parked: bool = False
+    h2d_gib_s: Optional[float] = None
+    # stream tier measured pricing (None = old pricing); see ``render_resident_blocks``
+    working_gb: Optional[float] = None
+    slack_gb: Optional[float] = None
+    block_gb: Optional[float] = None
+    layout: Optional[str] = None
+    canvas: Optional[tuple] = None
 
     def as_dict(self) -> dict:
         return {
             "placement": self.placement,
+            "parked": self.parked,
+            "vae_parked": self.vae_parked,
+            "layout": self.layout,
+            "working_gb": None if self.working_gb is None else round(self.working_gb, 2),
+            "slack_gb": None if self.slack_gb is None else round(self.slack_gb, 2),
+            "h2d_gib_s": None if self.h2d_gib_s is None else round(self.h2d_gib_s, 2),
             "dit_gb": round(self.dit_gb, 2),
             "te_gb": round(self.te_gb, 2),
             "vae_gb": round(self.vae_gb, 2),
@@ -1492,6 +1514,56 @@ def activation_gb(
     return 1.5 + 0.35 * mp * (1 + references)
 
 
+def measured_working_set_enabled() -> bool:
+    return not _env_off(MEASURED_WORKING_SET_ENV)
+
+
+# Measured on A100-40: whole-render peak reserved less kept weights at 2048x2048, per layout, rounded up.
+STREAM_WORKING_GB = {"today": 1.9, "parked": 1.2, "parked+vae": 1.0}
+# Per extra megapixel of DiT rows: +3.37 GB at 4096x4096, +3.74 GB for a 3-reference edit (12.6 MP each).
+STREAM_WORKING_GB_PER_MP = 0.30
+# Covers allocator rounding, cuBLAS/CUTLASS/Triton workspaces and card spread.
+STREAM_RESERVE_GB = 0.75
+STREAM_RESERVE_FRACTION = 0.03
+
+
+def stream_working_gb(
+    layout: str,
+    width: int,
+    height: int,
+    references: int = 0,
+    vram_gb: Optional[float] = None,
+) -> float:
+    """Priced stream-tier working set (GB) for ``layout`` at a canvas and reference count, with the reserve."""
+    mp = max(width * height, H3_IMAGE_MIN_GENERATION_AREA) / 1e6 * (1 + max(0, int(references)))
+    grow = STREAM_WORKING_GB_PER_MP * max(0.0, mp - H3_IMAGE_MIN_GENERATION_AREA / 1e6)
+    reserve = max(STREAM_RESERVE_GB, STREAM_RESERVE_FRACTION * float(vram_gb or 0.0))
+    return STREAM_WORKING_GB[layout] + grow + reserve
+
+
+def render_resident_blocks(
+    plan: "H3ImagePlan",
+    width: int,
+    height: int,
+    references: int = 0,
+) -> Optional[int]:
+    """Resident DiT blocks this render fits under ``plan``; None without measured stream pricing."""
+    if (
+        plan.placement != PLACE_STREAM
+        or plan.working_gb is None
+        or plan.layout is None
+        or plan.dit_resident_blocks is None
+        or not plan.block_gb
+    ):
+        return None
+    need = stream_working_gb(plan.layout, width, height, references, plan.vram_gb)
+    short = need - plan.working_gb - max(0.0, float(plan.slack_gb or 0.0))
+    resident = int(plan.dit_resident_blocks)
+    if short <= 1e-9:
+        return resident
+    return max(0, resident - int(math.ceil(short / plan.block_gb - 1e-9)))
+
+
 def dit_gb_for(scheme: Optional[str], table: bool = True) -> float:
     dense_adaln_gb = 0.0 if table else H3_IMAGE_DIT_BF16_GB - H3_IMAGE_DIT_TABLE_BF16_GB
     if scheme in QUANT_SCHEMES:
@@ -1508,6 +1580,94 @@ def te_gb_for(scheme: Optional[str]) -> float:
 # 0.8B), the encoder's token embedding + vision tower (1.56 + ~1.2 GB).
 DIT_TOP_GB = 2.0
 TE_TOP_GB = 3.0
+# Parkable once-per-phase pieces (measured: refiner + context embedder 1.49 GiB, vision tower 1.11 GiB).
+DIT_REFINER_GB = 1.6
+TE_VISION_GB = 1.2
+# Least parked first; a parked VAE decodes without tile graphs (they record the weights' addresses).
+LAYOUT_TODAY = "today"
+LAYOUT_PARKED = "parked"
+LAYOUT_PARKED_VAE = "parked+vae"
+# Multiply-adds of one DiT block per token (attention 154M + feed-forward 231M).
+BLOCK_PARAMS = 385e6
+# Measured / priced block time at the int8 GEMM rate (A100: 7.8 ms priced, 11.6 ms measured at 2048x2048).
+INT8_BLOCK_EFFICIENCY = 0.67
+# Extra decode seconds per 4 MP without tile graphs (A100: 0.47 against 0.33 s).
+UNGRAPHED_DECODE_S = 0.15
+# Minimum priced per-render saving for a more parked layout to win.
+PARK_MIN_SAVING = 0.10
+
+
+def park_setting() -> Optional[bool]:
+    raw = (os.environ.get(PARK_ENV) or "auto").strip().lower()
+    if raw in ("1", "on", "true", "yes"):
+        return True
+    if raw in ("0", "off", "false", "no"):
+        return False
+    return None
+
+
+def stream_render_seconds(
+    *,
+    resident: int,
+    num_blocks: int,
+    block_gb: float,
+    steps: int,
+    h2d_gib_s: float,
+    block_tops: float,
+    width: int,
+    height: int,
+    uploaded_gb: float = 0.0,
+    extra_s: float = 0.0,
+) -> float:
+    """Priced seconds of one stream-tier render; a streamed block costs max(compute, copy) (one-ahead prefetch).
+    A100 check: 30 + 20 streamed price 0.98 s/step against 0.953 measured."""
+    tokens = max(1, int(width) * int(height) // (H3_IMAGE_VAE_SCALE * 2) ** 2)
+    compute = 2.0 * BLOCK_PARAMS * tokens / (max(float(block_tops), 1e-6) * 1e12)
+    bandwidth = max(float(h2d_gib_s), 1e-6) * 2**30
+    copy = float(block_gb) * 1e9 / bandwidth
+    streamed = max(0, int(num_blocks) - int(resident))
+    step = (int(num_blocks) - streamed) * compute + streamed * max(compute, copy)
+    return max(1, int(steps)) * step + float(uploaded_gb) * 1e9 / bandwidth + float(extra_s)
+
+
+def _choose_layout(
+    candidates: list, *, park: Optional[bool], priced: Optional[dict]
+) -> tuple[Optional[tuple], str]:
+    """``candidates``: (layout, spare GB, resident blocks, GB uploaded per render, extra s), least parked first."""
+    fitting = [c for c in candidates if c[1] >= 0]
+    if park is True:
+        fitting = fitting[-1:]
+        return (fitting[0], "parked layout forced") if fitting else (None, "")
+    if park is False:
+        fitting = [c for c in fitting if c[0] == LAYOUT_TODAY]
+        return (fitting[0], "parked layouts off") if fitting else (None, "")
+    if not fitting:
+        return None, ""
+    best = fitting[0]
+    if best[0] != LAYOUT_TODAY:
+        why = (
+            "the encoder's embedding + vision tower and the token refiner"
+            + (" and VAE" if best[0] == LAYOUT_PARKED_VAE else "")
+            + " do not fit beside the streamed blocks all session: they wait in system memory and come in for "
+            "their phase"
+        )
+    else:
+        why = "encoder, token refiner and VAE stay on the device"
+    if priced is None:
+        return best, why + " (link unmeasured)"
+    cost = {
+        c[0]: stream_render_seconds(resident = c[2], uploaded_gb = c[3], extra_s = c[4], **priced)
+        for c in fitting
+    }
+    for c in fitting[1:]:
+        if c[2] > best[2] and cost[c[0]] < cost[best[0]] * (1.0 - PARK_MIN_SAVING):
+            best = c
+            why = f"{c[0]} layout priced faster"
+    numbers = ", ".join(f"{c[0]} {c[2]} resident {cost[c[0]]:.2f} s" for c in fitting)
+    return best, (
+        f"{why} ({priced['h2d_gib_s']:.1f} GiB/s host-to-device, {priced['block_tops']:.0f} effective TOPS per "
+        f"render: {numbers})"
+    )
 
 
 def plan_placement(
@@ -1524,6 +1684,10 @@ def plan_placement(
     te_layers: int = 50,
     forced: Optional[str] = None,
     inflight: int = 1,
+    h2d_gib_s: Optional[float] = None,
+    block_tops: Optional[float] = None,
+    steps: int = H3_IMAGE_STEPS,
+    park: Optional[bool] = None,
 ) -> H3ImagePlan:
     """Pure: VRAM and host budgets (GB, None = unknown/CPU) -> placement, best first:
 
@@ -1534,7 +1698,15 @@ def plan_placement(
     - stream: DiT blocks stream past the ones that fit, the encoder streams every layer (L4 24 GB).
 
     Host: the encoder is kept only when it fits beside the DiT, else it loads per prompt and is freed after.
-    ``inflight``: streamed members on the device at once (2 with the prefetch streamer: one runs, one copies)."""
+    ``inflight``: streamed members on the device at once (2 with the prefetch streamer: one runs, one copies).
+
+    Stream tier layouts: today's keeps the encoder's embedding + vision tower, the token refiner and the VAE on the
+    card for the whole session; the parked ones keep the first two (then the VAE too) on the host and bring each in
+    only for its phase (encode, once-per-render refine, decode), so the phases take turns on one room and more DiT
+    blocks stay. The least parked layout that fits is taken (an 8 GB card parks everything), and a more parked one
+    where the card's measured link (``h2d_gib_s``) and block rate (``block_tops``) price it ``PARK_MIN_SAVING``
+    faster (a slow link); ``park`` forces all or none. A card where no layout fits is refused here with what it
+    would need."""
     reasons = []
     act = activation_gb(width, height, references)
     margin = 1.5
@@ -1581,20 +1753,79 @@ def plan_placement(
         plan.te_resident_layers = max(0, min(te_layers, int(spare / layer_gb)))
         reasons.append(f"{plan.te_resident_layers}/{te_layers} encoder layers stay on the device")
     elif choice == PLACE_STREAM:
-        spare = vram_gb - act - margin - vae_gb - DIT_TOP_GB - TE_TOP_GB - block_gb
+        measured = measured_working_set_enabled()
+
+        def _working(layout: str) -> float:
+            if not measured:
+                return act + margin
+            return stream_working_gb(layout, width, height, references, vram_gb)
+
+        spare = vram_gb - _working(LAYOUT_TODAY) - vae_gb - DIT_TOP_GB - TE_TOP_GB - block_gb
         spare -= (inflight - 1) * max(block_gb, layer_gb)
-        plan.dit_resident_blocks = max(0, min(num_blocks, int(spare / block_gb)))
+        # Parked: each phase brings its pieces in, so the peak is the largest phase.
+        step_top = DIT_TOP_GB - DIT_REFINER_GB
+        phases = [inflight * block_gb, inflight * layer_gb + TE_VISION_GB, DIT_REFINER_GB]
+        parked_spare = vram_gb - _working(LAYOUT_PARKED) - step_top - vae_gb - max(phases)
+        vae_spare = vram_gb - _working(LAYOUT_PARKED_VAE) - step_top - max(phases + [vae_gb])
+
+        def _kept(room: float) -> int:
+            return max(0, min(num_blocks, int(room / block_gb)))
+
+        ungraphed = (
+            UNGRAPHED_DECODE_S * max(width * height, H3_IMAGE_MIN_GENERATION_AREA) / (2048 * 2048)
+        )
+        candidates = [
+            (LAYOUT_TODAY, spare, _kept(spare), 0.0, 0.0),
+            (LAYOUT_PARKED, parked_spare, _kept(parked_spare), DIT_REFINER_GB, 0.0),
+            (LAYOUT_PARKED_VAE, vae_spare, _kept(vae_spare), DIT_REFINER_GB + vae_gb, ungraphed),
+        ]
+        priced = None
+        if h2d_gib_s and block_tops:
+            priced = dict(
+                num_blocks = num_blocks,
+                block_gb = block_gb,
+                steps = steps,
+                h2d_gib_s = h2d_gib_s,
+                block_tops = block_tops,
+                width = width,
+                height = height,
+            )
+        chosen, why = _choose_layout(candidates, park = park, priced = priced)
+        if chosen is None:
+            need = _working(LAYOUT_PARKED_VAE) + step_top + max(phases + [vae_gb])
+            raise RuntimeError(
+                f"MiniMax-H3-Image needs about {need:.1f} GB of free GPU memory at {width}x{height} even with "
+                f"every DiT block and encoder layer streamed and the text encoder, token refiner and VAE waiting "
+                f"in system memory, and {vram_gb:.1f} GB is free. Free GPU memory (close other GPU applications) "
+                f"or use a GPU with more memory."
+            )
+        layout, room, kept_blocks, _up, _extra = chosen
+        parked = layout != LAYOUT_TODAY
+        plan.layout = layout
+        plan.block_gb = block_gb
+        plan.canvas = (int(width), int(height), int(references))
+        if measured:
+            plan.working_gb = _working(layout)
+            plan.slack_gb = max(0.0, room - kept_blocks * block_gb)
+        plan.vae_parked = layout == LAYOUT_PARKED_VAE
+        plan.parked = parked
+        plan.h2d_gib_s = h2d_gib_s
+        plan.dit_resident_blocks = kept_blocks
         # The resident blocks hold their room through the encode, so every encoder layer streams.
         plan.te_resident_layers = 0
         reasons.append(
             f"{plan.dit_resident_blocks}/{num_blocks} DiT blocks stay on the device; encoder streams"
         )
+        reasons.append(why)
     if host_gb is not None:
         dit_host = {
             PLACE_RESIDENT: 0.0,
             PLACE_DIT_RESIDENT: 0.0,
             PLACE_SEQUENTIAL: dit_gb + vae_gb,
-            PLACE_STREAM: block_gb * (num_blocks - int(plan.dit_resident_blocks or 0)),
+            PLACE_STREAM: block_gb * (num_blocks - int(plan.dit_resident_blocks or 0))
+            # the encoder's parked pieces are already in te_gb
+            + (DIT_REFINER_GB if plan.parked else 0.0)
+            + (vae_gb if plan.vae_parked else 0.0),
         }[choice]
         need = dit_host + te_gb + 4.0
         plan.host_need_gb = need
@@ -1692,6 +1923,199 @@ class ModuleListStreamer:
         self.handles = []
 
 
+PARKED_ATTR = "_unsloth_h3_parked"
+
+
+class HostParked:
+    """``module``'s tensors live on the host and on ``device`` only between nested ``enter()``/``leave()``; a tensor
+    the phase replaced or recast (the VAE canvas's fp32 overflow fallback) becomes the new host copy."""
+
+    def __init__(
+        self,
+        module: Any,
+        device: Any,
+        *,
+        pin: bool = True,
+    ) -> None:
+        import torch
+
+        self.device = torch.device(device)
+        self.module = module
+        self.pin = pin
+        self.depth = 0
+        self.handles: list = []
+        self._host: list = []
+        self._placed: dict = {}
+        for owner, kind, name, tensor in self._tensors():
+            self._host.append((owner, kind, name, self._to_host(tensor)))
+        self._put(lambda t: t)
+
+    @property
+    def bytes(self) -> int:
+        return sum(host.numel() * host.element_size() for *_k, host in self._host)
+
+    def _tensors(self) -> list:
+        return [
+            (owner, kind, name, tensor)
+            for owner in self.module.modules()
+            for kind, table in (("p", owner._parameters), ("b", owner._buffers))
+            for name, tensor in list(table.items())
+            if tensor is not None
+        ]
+
+    def _to_host(self, tensor: Any) -> Any:
+        host = tensor.detach()
+        if host.device.type != "cpu":
+            host = host.to("cpu")
+        if self.pin:
+            try:
+                host = host.pin_memory()
+            except Exception:  # noqa: BLE001 - a tensor subclass or a refused pin: pageable
+                pass
+        return host
+
+    @staticmethod
+    def _print(tensor: Any) -> tuple:
+        try:
+            ptr = tensor.data_ptr()
+        except Exception:  # noqa: BLE001 - a tensor subclass: its identity and dtype only
+            ptr = None
+        return (id(tensor), ptr, tensor.dtype)
+
+    def _put(self, place: Callable) -> None:
+        import torch
+        self._placed = {}
+        for owner, kind, name, host in self._host:
+            value = place(host)
+            if kind == "p":
+                value = torch.nn.Parameter(value, requires_grad = False)
+                owner._parameters[name] = value
+            else:
+                owner._buffers[name] = value
+            self._placed[(id(owner), kind, name)] = (self._print(value), host)
+
+    def _keep_changes(self) -> None:
+        kept = []
+        for owner, kind, name, tensor in self._tensors():
+            placed = self._placed.get((id(owner), kind, name))
+            if placed is not None and placed[0] == self._print(tensor):
+                kept.append((owner, kind, name, placed[1]))
+            else:
+                kept.append((owner, kind, name, self._to_host(tensor)))
+        self._host = kept
+
+    def enter(self) -> None:
+        if self.depth == 0:
+            try:
+                self._put(lambda t: t.to(self.device, non_blocking = True))
+            except BaseException:
+                # an upload that fails part way (out of memory) puts every tensor back on the host and does not
+                # count as an entry, so the caller's retry uploads the whole module again
+                self._put(lambda t: t)
+                raise
+        self.depth += 1
+
+    def leave(self) -> None:
+        if self.depth == 0:
+            return
+        self.depth -= 1
+        if self.depth == 0:
+            self._keep_changes()
+            self._put(lambda t: t)
+
+    def on_forward(self, module: Any) -> "HostParked":
+        self.handles.append(module.register_forward_pre_hook(lambda _m, _a: self.enter()))
+        self.handles.append(
+            module.register_forward_hook(lambda _m, _a, _o: self.leave(), always_call = True)
+        )
+        return self
+
+    def remove(self) -> None:
+        for handle in self.handles:
+            handle.remove()
+        self.handles = []
+        if self.depth:
+            self._keep_changes()
+        self.depth = 0
+        self._put(lambda t: t)
+
+
+def park_on_host(
+    module: Any,
+    device: Any,
+    *,
+    pin: bool = True,
+    per_forward: bool = False,
+) -> HostParked:
+    """Idempotent; ``per_forward`` brings ``module`` in around each forward."""
+    parked = module.__dict__.get(PARKED_ATTR)
+    if parked is None:
+        parked = HostParked(module, device, pin = pin)
+        if per_forward:
+            parked.on_forward(module)
+        module.__dict__[PARKED_ATTR] = parked
+    return parked
+
+
+def unpark(module: Any) -> bool:
+    parked = module.__dict__.pop(PARKED_ATTR, None) if module is not None else None
+    if parked is None:
+        return False
+    parked.remove()
+    return True
+
+
+def lookup_on_host(embedding: Any, device: Any) -> None:
+    """Host-side embedding lookup; rows go to ``device`` (bit-identical)."""
+    import torch
+
+    if embedding.__dict__.get(PARKED_ATTR) is not None:
+        return
+    embedding.to("cpu")
+    dev = torch.device(device)
+    handles = [
+        embedding.register_forward_pre_hook(
+            lambda _m, args: tuple(a.to("cpu") if torch.is_tensor(a) else a for a in args)
+        ),
+        embedding.register_forward_hook(lambda _m, _a, out: out.to(dev, non_blocking = True)),
+    ]
+
+    class _Lookup:
+        bytes = 0
+
+        def remove(self) -> None:
+            for handle in handles:
+                handle.remove()
+
+    embedding.__dict__[PARKED_ATTR] = _Lookup()
+
+
+def park_session_pieces(pipe: Any, device: Any, plan: H3ImagePlan) -> float:
+    """Park the refiner + context embedder (per forward) and a parked VAE (via ``_enter``); returns GB parked."""
+    if not plan.parked or plan.placement != PLACE_STREAM:
+        return 0.0
+    from .host_pinning import host_pinning_allowed
+
+    pin = host_pinning_allowed(device)
+    parked = 0
+    transformer = getattr(pipe, "transformer", None)
+    if transformer is not None:
+        for name in ("context_embedder", "token_refiner"):
+            child = getattr(transformer, name, None)
+            if child is not None:
+                parked += park_on_host(child, device, pin = pin, per_forward = True).bytes
+    vae = getattr(pipe, "vae", None)
+    if vae is not None and plan.vae_parked:
+        from .diffusion_vae_canvas import release_graphs
+
+        # tile graphs record the weights' addresses, which change per upload
+        release_graphs(vae)
+        vae.__dict__["_unsloth_canvas_graphs"] = False
+        parked += park_on_host(vae, device, pin = pin).bytes
+    _empty_cache()
+    return parked / 1e9
+
+
 def torch_no_grad(fn: Callable) -> Callable:
     @functools.wraps(fn)
     def wrapper(*args: Any, **kwargs: Any) -> Any:
@@ -1770,6 +2194,60 @@ class MiniMaxH3ImagePipeline(_pipeline_base()):
         plan = self._unsloth_h3_plan
         return plan.placement if plan is not None else PLACE_RESIDENT
 
+    def _fit_render(self, width: int, height: int, references: int) -> Optional[dict]:
+        """Demote resident DiT blocks before a render bigger than planned (one-way). None = nothing to do."""
+        plan = self._unsloth_h3_plan
+        if plan is None or not measured_working_set_enabled():
+            return None
+        keep = render_resident_blocks(plan, width, height, references)
+        if keep is None:
+            return None
+        resident = int(plan.dit_resident_blocks or 0)
+        if keep >= resident:
+            return {"resident": resident}
+        self.__dict__.pop("_unsloth_h3_demotion_refusal", None)
+        done = demote_dit_blocks(
+            self,
+            keep,
+            f"{width}x{height} with {references} reference(s) needs more working set than planned",
+        )
+        refusal = self.__dict__.pop("_unsloth_h3_demotion_refusal", None)
+        if refusal is not None:
+            raise RuntimeError(
+                f"MiniMax-H3-Image: a {width}x{height} render with {references} reference picture(s) needs "
+                f"{resident - keep} DiT blocks moved off the GPU, and system memory cannot take them: {refusal}. "
+                f"Render at a smaller size or with fewer references, or free system memory and load the model "
+                f"again."
+            )
+        return {"resident": int(plan.dit_resident_blocks or 0), "demoted": bool(done)}
+
+    def _oom_demotable(self) -> bool:
+        plan = self._unsloth_h3_plan
+        return bool(
+            plan is not None
+            and plan.placement == PLACE_STREAM
+            and measured_working_set_enabled()
+            and int(plan.dit_resident_blocks or 0) > 0
+        )
+
+    def _oom_demote(self, what: str) -> bool:
+        """After a stream-tier OOM: stream 4+ more DiT blocks; False when nothing could be given back."""
+        plan = self._unsloth_h3_plan
+        if not self._oom_demotable():
+            return False
+        gc.collect()
+        _empty_cache()
+        resident = int(plan.dit_resident_blocks or 0)
+        step = max(4, int(math.ceil(STREAM_RESERVE_GB / max(float(plan.block_gb or 0.4), 1e-3))))
+        logger.warning(
+            "diffusion.minimax_h3_image: render ran out of GPU memory with %d resident DiT blocks (%s): "
+            "streaming %d more and rendering again",
+            resident,
+            what,
+            min(step, resident),
+        )
+        return demote_dit_blocks(self, max(0, resident - step), "out of memory")
+
     def _enter(self, name: str) -> Any:
         """Put component ``name`` where its phase runs; returns it."""
         module = getattr(self, name, None)
@@ -1780,6 +2258,9 @@ class MiniMaxH3ImagePipeline(_pipeline_base()):
             return None
         if self._placement() == PLACE_SEQUENTIAL:
             module.to(self._device())
+        parked = module.__dict__.get(PARKED_ATTR) if name == "vae" else None
+        if parked is not None:
+            parked.enter()
         return module
 
     def _leave(self, name: str) -> None:
@@ -1790,6 +2271,9 @@ class MiniMaxH3ImagePipeline(_pipeline_base()):
         if placement == PLACE_SEQUENTIAL:
             module.to("cpu")
             _empty_cache()
+        parked = module.__dict__.get(PARKED_ATTR) if name == "vae" else None
+        if parked is not None:
+            parked.leave()
         if name == "text_encoder" and self._unsloth_h3_te_loader is not None:
             self.text_encoder = None
             for streamer in list(self._unsloth_h3_streamers):
@@ -1815,6 +2299,10 @@ class MiniMaxH3ImagePipeline(_pipeline_base()):
         for name in ("transformer", "text_encoder", "vae"):
             module = getattr(self, name, None)
             if module is not None:
+                for sub in module.modules():
+                    parked = sub.__dict__.pop(PARKED_ATTR, None)
+                    if parked is not None:
+                        parked.remove()
                 if name == "vae":
                     # the VAE canvas's tile graphs keep their private pools while anything references the VAE
                     from .diffusion_vae_canvas import release_graphs
@@ -2091,7 +2579,7 @@ class MiniMaxH3ImagePipeline(_pipeline_base()):
         self._interrupt = False
         images = []
         for index, (text, gen) in enumerate(zip(jobs, generators)):
-            pixels = self._render_one(
+            args = (
                 text,
                 vae_refs,
                 vision_refs,
@@ -2104,8 +2592,19 @@ class MiniMaxH3ImagePipeline(_pipeline_base()):
                 callback_on_step_end,
                 callback_on_step_end_tensor_inputs or ["latents"],
                 output_type,
-                batch_index = index if shared else 0,
             )
+            oom = None
+            try:
+                pixels = self._render_one(*args, batch_index = index if shared else 0)
+            except torch.OutOfMemoryError as exc:
+                # retry outside this handler: its traceback holds the failed render's tensors
+                if not self._oom_demotable():
+                    raise
+                oom = str(exc).splitlines()[0][:160] if str(exc) else type(exc).__name__
+            if oom is not None:
+                if not self._oom_demote(oom):
+                    raise torch.OutOfMemoryError(oom)
+                pixels = self._render_one(*args, batch_index = index if shared else 0)
             if pixels is None:
                 break
             images.extend(pixels)
@@ -2147,6 +2646,7 @@ class MiniMaxH3ImagePipeline(_pipeline_base()):
         else:
             canvas_h, canvas_w = canvas_size(height, width, min_generation_area)
         stats["canvas"] = (canvas_w, canvas_h)
+        stats["fit"] = self._fit_render(canvas_w, canvas_h, len(vae_refs))
         hits = self._prompt_cache_hits()
         embeds, text_tags = self.encode_prompt(prompt, vision_refs)
         stats["encode_s"] = time.perf_counter() - t0
@@ -2607,9 +3107,7 @@ def quantize_block_(block: Any, scheme: str, *, device: Any) -> int:
     return len(names)
 
 
-# cuBLASLt int8 GEMMs (torch._int_mm) refuse some row counts with CUBLAS_STATUS_NOT_SUPPORTED, and torchao then
-# silently falls back to a much slower fp32 matmul. A packed sequence rarely lands on a supported count; multiples
-# of 32 always ran and also suit the fp8 row-wise GEMM.
+# cuBLASLt refuses some int8 row counts and torchao silently falls back to fp32, so pad rows to 32.
 ROW_MULTIPLE = 32
 
 
@@ -2670,6 +3168,26 @@ def wrap_row_multiple(module: Any, names: Sequence[str]) -> int:
     return wrapped
 
 
+def restore_row_pads(transformer: Any) -> int:
+    """Re-wrap per-row int8 Linears the fused GEMM install unwrapped in the row pad; returns the count."""
+    count = 0
+    for block in getattr(transformer, "transformer_blocks", None) or ():
+        names = []
+        for fqn in tuple(QUANT_LINEAR_SUFFIXES) + ("attn.to_qkv",):
+            parent_name, _, leaf = fqn.rpartition(".")
+            try:
+                parent = block.get_submodule(parent_name) if parent_name else block
+            except AttributeError:
+                continue
+            child = parent._modules.get(leaf)
+            if child is None or type(child).__name__ == "H3ImageRowPad":
+                continue
+            names.append(fqn)
+        if names:
+            count += wrap_row_multiple(block, names)
+    return count
+
+
 def _auto_scheme_by_fit(
     vram_gb: Optional[float],
     width: int,
@@ -2678,8 +3196,7 @@ def _auto_scheme_by_fit(
     te_gb: Optional[float],
     inflight: int,
 ) -> tuple[Optional[str], str]:
-    """Auto by fit: bf16 when the table-form bf16 DiT stays on the card (beside the encoder with ``te_gb``), else
-    int8."""
+    """Auto picks bf16 DiT only if it fits beside the encoder (te_gb), else int8."""
     need = H3_IMAGE_DIT_TABLE_BF16_GB + activation_gb(width, height) + 1.5
     if vram_gb is not None and vram_gb >= need:
         if te_gb is None:
@@ -2763,6 +3280,74 @@ def resolve_dit_scheme(
         return None, f"auto: no int8 or fp8 rung on compute capability {cap[0]}.{cap[1]}, bf16"
     label = "int8 ConvRot" if order[0] == "int8" else order[0]
     return order[0], f"auto: {label} (auto order int8, fp8, bf16)"
+
+
+_INT8_RATE_PROBES: dict = {}
+
+
+def _int8_gemm_tops(device: Any) -> Optional[float]:
+    """int8 GEMM TOPS at a DiT block's shape, cached per device; None without ``torch._int_mm``."""
+    import torch
+
+    dev = torch.device(device)
+    key = (dev.type, dev.index if dev.index is not None else torch.cuda.current_device())
+    if key in _INT8_RATE_PROBES:
+        return _INT8_RATE_PROBES[key]
+    result = None
+    try:
+        with torch.cuda.device(dev):
+            a = torch.randint(-127, 127, (4096, 5376), dtype = torch.int8, device = dev)
+            b = torch.randint(-127, 127, (5376, 5376), dtype = torch.int8, device = dev).t()
+            torch._int_mm(a, b)
+            torch.cuda.synchronize(dev)
+            start, end = torch.cuda.Event(enable_timing = True), torch.cuda.Event(enable_timing = True)
+            best = float("inf")
+            for _ in range(3):
+                start.record()
+                for _ in range(5):
+                    torch._int_mm(a, b)
+                end.record()
+                end.synchronize()
+                best = min(best, start.elapsed_time(end) / 5)
+            del a, b
+            torch.cuda.empty_cache()
+        if 0 < best < float("inf"):
+            result = 2.0 * 4096 * 5376 * 5376 / (best / 1000.0) / 1e12
+    except Exception:  # noqa: BLE001 - no int8 GEMM here: priced from the bf16 rate
+        result = None
+    _INT8_RATE_PROBES[key] = result
+    return result
+
+
+def link_measurements(
+    device: Any, scheme: Optional[str] = None
+) -> tuple[Optional[float], Optional[float]]:
+    """(host-to-device GiB/s, effective block TOPS), cached; (None, None) when unmeasurable: least parked layout."""
+    import torch
+
+    dev = torch.device(device)
+    h2d = tops = None
+    if dev.type == "cuda" and torch.cuda.is_available():
+        try:
+            from .diffusion_memory import _offload_cost_measurements
+
+            with torch.cuda.device(dev):
+                measured = _offload_cost_measurements()
+            if measured is not None:
+                h2d, tops = float(measured[0]), float(measured[1])
+            if scheme == "int8":
+                tops = _int8_gemm_tops(dev) or tops
+            if tops is not None:
+                tops *= INT8_BLOCK_EFFICIENCY
+        except Exception:  # noqa: BLE001 - unpriced
+            h2d = tops = None
+    raw = (os.environ.get(H2D_ENV) or "").strip()
+    if raw:
+        try:
+            h2d = float(raw)
+        except ValueError:
+            pass
+    return h2d, tops
 
 
 def device_budgets(device: Any) -> tuple[Optional[float], Optional[float]]:
@@ -3174,9 +3759,8 @@ def _int8_epilogue(module: Any) -> bool:
 
 
 def stream_runs_rescaled(transformer: Any, scale: float = FP16_STREAM_SCALE) -> int:
-    """fp16 runs only (sm75): the stream enters and is written at 1/scale (folded into the writers' float32 epilogue)
-    and every norm reading it is scale invariant (eps / scale^2), so the result is exact up to rounding. Returns the
-    writers rescaled; 0 on a layout it does not know."""
+    """fp16 only (sm75): stream runs at 1/scale, folded into the writers fp32 epilogue; norms are
+    scale invariant (eps / scale^2), so exact up to rounding; returns 0 on an unknown layout"""
     inv = 1.0 / float(scale)
     blocks = list(getattr(transformer, "transformer_blocks", None) or ())
     norm_out = getattr(getattr(transformer, "norm_out", None), "norm", None)
@@ -3823,8 +4407,10 @@ def make_list_streamer(
     reserve_bytes: int = 0,
     max_pin_bytes: Optional[int] = None,
     replaces_counted: bool = False,
+    later_host_bytes: int = 0,
 ) -> Any:
-    """A streamer for ``members[resident:]``: the pinned prefetch one where it fits, else ``ModuleListStreamer``."""
+    """A streamer for ``members[resident:]``: the pinned prefetch one where it fits, else ``ModuleListStreamer``.
+    ``later_host_bytes``: host memory the load still takes after this streamer (a split encoder pin leaves it)."""
     streamer = None
     if pinned and pinned_stream_enabled():
         from .diffusion_offload_prefetch import stream_module_list
@@ -3839,10 +4425,170 @@ def make_list_streamer(
             replaces_counted = replaces_counted,
             release_after_forward = role == "text_encoder",
         )
+    if streamer is None and pinned and role == "text_encoder" and te_partial_pin_enabled():
+        streamer = _split_text_encoder_streamer(
+            owner,
+            members,
+            device,
+            resident,
+            reserve_bytes = reserve_bytes + max(0, int(later_host_bytes)),
+            max_pin_bytes = max_pin_bytes,
+            replaces_counted = replaces_counted,
+        )
     if streamer is None:
         streamer = ModuleListStreamer(members, device, resident)
     streamer._unsloth_role = role
     return streamer
+
+
+TE_PARTIAL_PIN_ENV = "UNSLOTH_H3_IMAGE_TE_PARTIAL_PIN"
+# kept free of the pin budget for the arena's last slab and allocator rounding
+TE_PARTIAL_PIN_SLACK_BYTES = 1 << 30
+
+
+# Host memory a parked stream-tier render takes past the load; 2 GiB dipped under the reserve on Colab L4, 3 GiB holds.
+TE_PARTIAL_PIN_RENDER_BYTES = 3 << 30
+
+
+def te_later_host_bytes(plan: "H3ImagePlan") -> int:
+    """Host bytes still taken after the encoder is placed (parked refiner / VAE, render working memory)."""
+    if not plan.parked or plan.placement != PLACE_STREAM:
+        return 0
+    parked = DIT_REFINER_GB + (float(plan.vae_gb) if plan.vae_parked else 0.0)
+    return int(parked * 1e9) + TE_PARTIAL_PIN_RENDER_BYTES
+
+
+def dit_restream_pin_bytes(transformer: Any, plan: "H3ImagePlan", early_streamer: Any) -> int:
+    """Pins of a DiT streamer placed after the encoder, else 0; the replaced one's pins stay held, so none are netted."""
+    if plan.placement != PLACE_STREAM:
+        return 0
+    resident = int(plan.dit_resident_blocks or 0)
+    if (
+        early_streamer is not None
+        and getattr(early_streamer, "_unsloth_resident", None) == resident
+    ):
+        return 0
+    from .diffusion_memory import _storage_nbytes
+
+    blocks = list(transformer.transformer_blocks)[max(0, resident) :]
+    return int(
+        sum(
+            sum(_storage_nbytes(t))
+            for b in blocks
+            for t in list(b.parameters()) + list(b.buffers())
+        )
+    )
+
+
+def te_partial_pin_enabled() -> bool:
+    return pinned_stream_enabled() and not _env_off(TE_PARTIAL_PIN_ENV)
+
+
+class SplitListStreamer:
+    """Pinned prefetch streamer for the leading layers, pageable ``ModuleListStreamer`` for the rest, seen as one."""
+
+    def __init__(self, pinned: Any, pageable: Any) -> None:
+        self.parts = [pinned, pageable]
+        self.pinned_bytes = int(getattr(pinned, "pinned_bytes", 0) or 0)
+        self.replaced_bytes = int(getattr(pinned, "replaced_bytes", 0) or 0)
+        self.streamed = int(getattr(pageable, "streamed", 0) or 0)
+        self._host = pageable._host
+
+    def stats(self) -> dict:
+        read = getattr(self.parts[0], "stats", None)
+        out = dict(read()) if callable(read) else {}
+        out["pageable"] = self.streamed
+        return out
+
+    def remove(self) -> None:
+        for part in self.parts:
+            part.remove()
+            host = getattr(part, "_host", None)
+            if isinstance(host, dict) and host is not self._host:
+                host.clear()
+
+
+def partial_pin_count(
+    sizes: Sequence[int],
+    budget_bytes: Optional[int],
+    *,
+    reserve_bytes: int = 0,
+    max_pin_bytes: Optional[int] = None,
+    replaced: bool = False,
+    slack_bytes: Optional[int] = None,
+) -> int:
+    """Leading members that fit the host pin budget and plan pin room, less ``slack_bytes``."""
+    if budget_bytes is None:
+        return 0
+    if slack_bytes is None:
+        slack_bytes = TE_PARTIAL_PIN_SLACK_BYTES
+    room = int(budget_bytes) - int(reserve_bytes) - int(slack_bytes)
+    if max_pin_bytes is not None and not replaced:
+        room = min(room, int(max_pin_bytes) - int(slack_bytes))
+    count = total = 0
+    for size in sizes:
+        if total + int(size) > room:
+            break
+        total += int(size)
+        count += 1
+    return count
+
+
+def _split_text_encoder_streamer(
+    owner: Any,
+    members: Any,
+    device: Any,
+    resident: int,
+    *,
+    reserve_bytes: int = 0,
+    max_pin_bytes: Optional[int] = None,
+    replaces_counted: bool = False,
+) -> Optional[SplitListStreamer]:
+    """Pin the leading encoder layers the budget holds, stream the rest; None when none or all fit."""
+    from .diffusion_memory import _pin_budget_mib, _storage_nbytes
+    from .diffusion_offload_prefetch import pin_replaces_host_enabled, stream_module_list
+
+    members = list(members)
+    resident = max(0, min(len(members), int(resident)))
+    streamed = members[resident:]
+    sizes = [
+        sum(sum(_storage_nbytes(t)) for t in list(m.parameters()) + list(m.buffers()))
+        for m in streamed
+    ]
+    budget = _pin_budget_mib()
+    count = partial_pin_count(
+        sizes,
+        None if budget is None else int(budget) << 20,
+        reserve_bytes = reserve_bytes,
+        max_pin_bytes = max_pin_bytes,
+        replaced = bool(replaces_counted and pin_replaces_host_enabled()),
+    )
+    if count <= 0 or count >= len(streamed):
+        return None
+    pinned = stream_module_list(
+        owner,
+        members[: resident + count],
+        device,
+        resident,
+        logger = logger,
+        reserve_bytes = reserve_bytes,
+        max_pin_bytes = max_pin_bytes,
+        replaces_counted = replaces_counted,
+        release_after_forward = True,
+    )
+    if pinned is None:
+        return None
+    pageable = ModuleListStreamer(streamed[count:], device, 0)
+    logger.info(
+        "diffusion.minimax_h3_image: text encoder streams %d of %d layers with pinned copies (%.1f GB, the host pin "
+        "budget) and %d pageable (%.1f GB)",
+        count,
+        len(streamed),
+        sum(sizes[:count]) / 1e9,
+        len(streamed) - count,
+        sum(sizes[count:]) / 1e9,
+    )
+    return SplitListStreamer(pinned, pageable)
 
 
 def stream_list(
@@ -3857,6 +4603,7 @@ def stream_list(
     reserve_bytes: int = 0,
     max_pin_bytes: Optional[int] = None,
     replaces_counted: bool = False,
+    later_host_bytes: int = 0,
 ) -> Any:
     """``make_list_streamer``, registered on the pipe by role."""
     streamer = make_list_streamer(
@@ -3869,6 +4616,7 @@ def stream_list(
         reserve_bytes = reserve_bytes,
         max_pin_bytes = max_pin_bytes,
         replaces_counted = replaces_counted,
+        later_host_bytes = later_host_bytes,
     )
     pipe._unsloth_h3_streamers.append(streamer)
     return streamer
@@ -3898,6 +4646,154 @@ def _place_streamed_dit(
     )
     streamer._unsloth_resident = resident
     return streamer
+
+
+def _host_available_gb() -> Optional[float]:
+    try:
+        import psutil
+        return psutil.virtual_memory().available / 1e9
+    except Exception:  # noqa: BLE001 - psutil missing: the plan's own budget still applies
+        return None
+
+
+def demotion_host_refusal(
+    plan: "H3ImagePlan",
+    count: int,
+    encoder_loaded: bool = True,
+) -> Optional[str]:
+    """Why ``count`` more DiT blocks cannot move to system memory (load's host plan, then free RAM), or None."""
+    extra = max(0, int(count)) * float(plan.block_gb or 0.0)
+    if extra <= 0:
+        return None
+    if plan.host_gb is not None and plan.host_need_gb is not None:
+        dit_host = float(plan.host_need_gb) - float(plan.te_gb) - 4.0
+        # as ``plan_placement`` budgets: kept encoder + 4 GB, per-prompt encoder + 1 GB load peak
+        need = dit_host + extra + float(plan.te_gb) + (4.0 if plan.te_kept_on_host else 1.0)
+        if need > float(plan.host_gb):
+            return (
+                f"{extra:.1f} GB more of DiT blocks in system memory would need {need:.1f} GB beside the "
+                f"{plan.te_gb:.1f} GB text encoder, over the {plan.host_gb:.1f} GB this load planned with"
+            )
+    available = _host_available_gb()
+    if available is not None:
+        want = extra + (0.0 if encoder_loaded else float(plan.te_gb)) + 1.0
+        if want > available:
+            return (
+                f"{extra:.1f} GB more of DiT blocks in system memory"
+                + (
+                    ""
+                    if encoder_loaded
+                    else f" plus the {plan.te_gb:.1f} GB text encoder it loads per prompt"
+                )
+                + f" would need {want:.1f} GB, and {available:.1f} GB is free"
+            )
+    return None
+
+
+def demote_dit_blocks(
+    pipe: Any,
+    keep: int,
+    why: str = "",
+) -> bool:
+    """Stream ``blocks[keep:]``, reusing existing pins; True when the residency changed."""
+    plan = getattr(pipe, "_unsloth_h3_plan", None)
+    streamers = getattr(pipe, "_unsloth_h3_streamers", None)
+    if plan is None or plan.placement != PLACE_STREAM or streamers is None:
+        return False
+    old = next((s for s in streamers if getattr(s, "_unsloth_role", None) == "transformer"), None)
+    if old is None:
+        return False
+    resident = int(getattr(old, "_unsloth_resident", plan.dit_resident_blocks or 0) or 0)
+    keep = max(0, min(int(keep), resident))
+    if keep >= resident:
+        return False
+    refusal = demotion_host_refusal(
+        plan, resident - keep, encoder_loaded = getattr(pipe, "text_encoder", None) is not None
+    )
+    if refusal is not None:
+        logger.warning(
+            "diffusion.minimax_h3_image: %s, but %s: keeping %d resident", why, refusal, resident
+        )
+        pipe.__dict__["_unsloth_h3_demotion_refusal"] = refusal
+        return False
+    transformer = pipe.transformer
+    device = pipe._device()
+    blocks = transformer.transformer_blocks
+    from .diffusion_offload_prefetch import PrefetchedListStreamer, stream_module_list
+    from .diffusion_minimax_h3_image_speed import speed_levers
+
+    gemm = any(str(name).startswith("h3_int8_gemm") for name in speed_levers(pipe) or ())
+    pageable = isinstance(old, ModuleListStreamer)
+    if pageable and int(getattr(old, "streamed", 0) or 0) > 0:
+        old.remove()
+        new = ModuleListStreamer(blocks, device, keep)
+    else:
+        others = [s for s in streamers if s is not old]
+        reuse = old.detach() if isinstance(old, PrefetchedListStreamer) else None
+        arenas = list(getattr(old, "arenas", ())) if reuse is not None else []
+
+        def _pinned(count: int) -> Any:
+            return stream_module_list(
+                transformer,
+                blocks,
+                device,
+                count,
+                logger = logger,
+                max_pin_bytes = pin_room_bytes(plan, others),
+                replaces_counted = pins_replace_counted(plan),
+                reuse = reuse,
+                reuse_arenas = arenas,
+            )
+
+        new = _pinned(keep)
+        if new is None and reuse is not None:
+            keep = resident
+            new = _pinned(resident)
+            if new is None:
+                # last resort: pageable swaps parameters, so torchao's stock path needs the row pads back
+                # (else cuBLASLt refuses packed row counts and torchao falls back to fp32 matmul)
+                padded = restore_row_pads(transformer) if gemm else 0
+                logger.warning(
+                    "diffusion.minimax_h3_image: the pinned DiT streamer could not be rebuilt: %d resident "
+                    "blocks, the rest stream from pageable memory (%d int8 Linears padded again)",
+                    resident,
+                    padded,
+                )
+                new = ModuleListStreamer(blocks, device, resident)
+        if new is None:
+            if gemm:
+                for block in list(blocks)[:resident]:
+                    block.to(device)
+                logger.warning(
+                    "diffusion.minimax_h3_image: %s, but the blocks cannot be pinned and the int8 GEMM needs "
+                    "pinned streaming: keeping %d resident",
+                    why,
+                    resident,
+                )
+                return False
+            new = ModuleListStreamer(blocks, device, keep)
+    new._unsloth_role = "transformer"
+    new._unsloth_resident = keep
+    streamers[streamers.index(old)] = new
+    if keep >= resident:
+        return False
+    gc.collect()
+    _empty_cache()
+    before = plan.dit_resident_blocks
+    plan.dit_resident_blocks = keep
+    if plan.block_gb:
+        if plan.working_gb is not None:
+            plan.working_gb += (
+                max(0.0, float(plan.slack_gb or 0.0)) + (resident - keep) * plan.block_gb
+            )
+        plan.slack_gb = 0.0
+        if plan.host_need_gb is not None:
+            plan.host_need_gb += (resident - keep) * plan.block_gb
+    plan.reasons = list(plan.reasons) + [
+        f"{why}: {before} -> {keep}/{len(blocks)} DiT blocks stay on the device"
+    ]
+    logger.info("diffusion.minimax_h3_image: %s", plan.reasons[-1])
+    return True
 
 
 # "0": native attention; "1": probe-gated SageAttention, no timing race; unset: kept only where it times faster
@@ -3930,22 +4826,45 @@ def _attention_processors(module: Any) -> list:
     ]
 
 
+def explicit_attention_pick(requested: Any) -> Optional[str]:
+    """The load's explicit attention alias ("sage", "native", "cudnn", ...), or None when Studio picks (unset, "auto",
+    "unsloth_int8", which is the INT8 attention control's On, or an unknown name)."""
+    from .diffusion_attention import ATTN_AUTO, normalize_attention_backend
+
+    try:
+        alias = normalize_attention_backend(requested)
+    except ValueError:
+        return None
+    return None if alias in (ATTN_AUTO, "unsloth_int8") else alias
+
+
 def install_checkpoint_attention(
     pipe: Any,
     device: Any,
     *,
     scheme: Optional[str] = None,
     logger: Any = None,
+    int8_policy: Any = None,
+    attention_backend: Optional[str] = None,
 ) -> Optional[str]:
     """Route the DiT blocks to the declared backend (SageAttention must pass its probe here first); the token refiner
-    keeps its own. Returns the engaged backend, or None with every processor unchanged."""
+    keeps its own. Returns the engaged backend, or None with every processor unchanged. ``attention_backend``: the
+    load's pick; an explicit "sage" pins SageAttention on the blocks (no race against native, and INT8 only when its
+    control is On), any other explicit pick keeps the checkpoint's SageAttention off."""
     import torch
 
     log = logger if logger is not None else _LOG
     transformer = getattr(pipe, "transformer", None)
     if transformer is None or getattr(pipe, ATTENTION_SAVED_ATTR, None):
         return None
-    want = checkpoint_attention_wanted(transformer, scheme)
+    pick = explicit_attention_pick(attention_backend)
+    want = (
+        checkpoint_attention_wanted(transformer, scheme)
+        if pick is None
+        else "sage"
+        if pick == "sage"
+        else None
+    )
     dev = torch.device(device)
     if want is None or dev.type != "cuda":
         return None
@@ -3963,7 +4882,16 @@ def install_checkpoint_attention(
     dtype = _module_dtype(transformer, skip_fp32 = True)
     target = types.SimpleNamespace(device = dev.type, dtype = dtype, torch_device = str(dev))
     try:
-        engaged = apply_attention_backend(pipe, want, logger = log, target = target)
+        engaged = apply_attention_backend(
+            pipe,
+            want,
+            logger = log,
+            target = target,
+            # an explicit pick is never raced over by the dispatch route
+            **({"requested": attention_backend} if pick is not None else {}),
+            # only a load's own policy: a direct call keeps the env switch, as before
+            **({"int8_policy": int8_policy} if int8_policy is not None else {}),
+        )
     except Exception as exc:  # noqa: BLE001 - native attention stays
         engaged = None
         log.warning("diffusion.minimax_h3_image: INT8 attention unavailable (%s)", exc)
@@ -3973,7 +4901,8 @@ def install_checkpoint_attention(
     if not sage_on:
         restore()
         setattr(transformer, ATTENTION_BACKEND_ATTR, tag)
-    forced = (os.environ.get(INT8_ATTENTION_ENV) or "").strip().lower() in (
+    # the env switch, or the user's own SageAttention pick, pins it: no race against native
+    forced = pick == "sage" or (os.environ.get(INT8_ATTENTION_ENV) or "").strip().lower() in (
         "1",
         "on",
         "true",
@@ -3990,9 +4919,10 @@ def install_checkpoint_attention(
         (None if not forced else True) if sage_on else False,
         forced,
         log,
+        **({"policy": int8_policy} if int8_policy is not None else {}),
     )
     if race is None and sage_on and not forced and not kernel_blocks:
-        race = race_checkpoint_attention(transformer, saved, dtype)
+        race = race_checkpoint_attention(transformer, saved, dtype, device = dev)
     sage_kept = sage_on and (forced or race is None or race["keep"])
     if kernel_blocks:
         from .diffusion_int8_attention import BACKEND as INT8_KERNEL
@@ -4051,16 +4981,45 @@ def _paired_ratio(times: list, first: int, second: int) -> float:
     return _median([a / b for a, b in zip(times[first], times[second]) if b > 0] or [float("inf")])
 
 
+@contextlib.contextmanager
+def _weights_on(module: Any, device: Any) -> Any:
+    """Swap ``module``'s host tensors for ``device`` copies, restoring the same host tensors after (streamers hold them)."""
+    import torch
+
+    device = torch.device(device)
+    if device.type == "cuda" and device.index is None:
+        device = torch.device("cuda", torch.cuda.current_device())
+    swapped: list = []
+    try:
+        for owner in module.modules():
+            for kind, table in (("p", owner._parameters), ("b", owner._buffers)):
+                for name, tensor in list(table.items()):
+                    # The full device, index included: a tensor on another card is staged too.
+                    if tensor is None or tensor.device == device:
+                        continue
+                    moved = tensor.to(device)
+                    swapped.append((table, name, tensor))
+                    table[name] = (
+                        torch.nn.Parameter(moved, requires_grad = False) if kind == "p" else moved
+                    )
+        yield module
+    finally:
+        for table, name, tensor in reversed(swapped):
+            table[name] = tensor
+
+
 def race_checkpoint_attention(
     transformer: Any,
     saved: dict,
     dtype: Any,
     *,
     kernel: bool = False,
+    device: Any = None,
 ) -> Optional[dict]:
     """Time one resident DiT block's attention module with the engaged INT8 backend against the backend it had
     (which keeps Studio's strided layout and fused q/k norm + RoPE); ``keep`` when INT8 is more than 2% faster.
-    None when no block's attention is on the card (nothing to time: the caller keeps the INT8 route).
+    A fully streamed DiT stages the first block's attention on CUDA ``device`` for the race, so it decides as a resident
+    layout would (else images differ by layout). None when nothing could be timed (the caller keeps the INT8 route).
 
     ``kernel`` adds Studio's INT8 attention kernel on the backend the block had: ``kernel`` maps each image row
     count of ``_KERNEL_RACE_IMAGES`` to the [native, engaged, kernel] medians in ms and ``paired`` to the per-round
@@ -4069,12 +5028,24 @@ def race_checkpoint_attention(
 
     attn = None
     norm = None
+    streamed = None
     for block in getattr(transformer, "transformer_blocks", ()) or ():
         module = getattr(block, "attn", None)
         params = list(module.parameters()) if module is not None else []
-        if module in saved and params and all(p.is_cuda for p in params):
+        if module not in saved or not params:
+            continue
+        if all(p.is_cuda for p in params):
             attn, norm = module, getattr(block, "norm1", None)
             break
+        if streamed is None:
+            streamed = (module, getattr(block, "norm1", None))
+    stage = None
+    if attn is None and streamed is not None and device is not None:
+        stage = torch.device(device)
+        if stage.type != "cuda":
+            stage = None
+        else:
+            attn, norm = streamed
     rope = getattr(transformer, "rope", None)
     if attn is None or norm is None or rope is None:
         return None
@@ -4083,7 +5054,7 @@ def race_checkpoint_attention(
     native = saved[attn]
     kernel = kernel and hasattr(type(proc), "_unsloth_int8")
     routed = (getattr(proc, "_unsloth_int8", False), getattr(proc, "_unsloth_int8_min_tokens", 0))
-    device = next(attn.parameters()).device
+    device = stage if stage is not None else next(attn.parameters()).device
     width = int(norm.normalized_shape[0])
     text = _RACE_ROWS[1]
 
@@ -4127,13 +5098,20 @@ def race_checkpoint_attention(
 
     variants = ((native, False), (engaged, False)) + (((native, True),) if kernel else ())
     try:
-        with torch.no_grad(), torch.cuda.device(device):
+        with (
+            torch.no_grad(),
+            torch.cuda.device(device),
+            _weights_on(attn, device) if stage is not None else contextlib.nullcontext(),
+        ):
             rows = {
                 image: timed(image, variants)
                 for image in (_KERNEL_RACE_IMAGES if kernel else _RACE_ROWS[:1])
             }
     except torch.OutOfMemoryError:
-        raise
+        if stage is None:
+            raise
+        # no room for a streamed block's attention beside the load: untimed, as before
+        return None
     except Exception:  # noqa: BLE001 - untimed: the caller keeps the INT8 route it already engaged
         return None
     finally:
@@ -4145,6 +5123,7 @@ def race_checkpoint_attention(
         "keep": _paired_ratio(large, 1, 0) < 0.98,
         "ms": [_median(t) for t in large[:2]],
         "native": str(native),
+        "staged": stage is not None,
     }
     if kernel:
         found["kernel"] = {n: [_median(t) for t in times] for n, times in rows.items()}
@@ -4164,6 +5143,7 @@ def _race_int8_kernel(
     sage: Optional[bool],
     forced: bool,
     log: Any,
+    policy: Any = None,
 ) -> tuple:
     """Route the DiT blocks to Studio's INT8 attention kernel when it matches fp32 attention on this card and is more
     than 2% faster than what they would run (SageAttention or their native backend) on a resident block.
@@ -4175,7 +5155,7 @@ def _race_int8_kernel(
 
     from . import diffusion_int8_attention as int8_attention
 
-    setting = int8_attention.mode()
+    setting = int8_attention.mode(policy)
     if (
         not block_modules
         or setting == "off"
@@ -4188,7 +5168,13 @@ def _race_int8_kernel(
     race = None
     try:
         ready = int8_attention.install_int8_attention(
-            transformer, device = dev, dtype = dtype, modules = block_modules, force = True, logger = log
+            transformer,
+            device = dev,
+            dtype = dtype,
+            modules = block_modules,
+            force = True,
+            logger = log,
+            policy = policy,
         )
         record["checked_s"] = round(time.perf_counter() - started, 3)
         # which INT8 implementation passed the card check: the CUDA kernel, or Triton where it cannot load
@@ -4212,6 +5198,7 @@ def _race_int8_kernel(
                 if sage is not False
                 else int8_attention._sdpa_incumbent(saved.get(block_modules[0])),
                 logger = log,
+                policy = policy,
             )
             record.update(blocks = routed, timed = "attention")
             return routed, None
@@ -4322,20 +5309,34 @@ def _place_text_encoder(
     per_prompt: bool = False,
     reserve_bytes: int = 0,
     pinned_already: Sequence[Any] = (),
+    dit_pin_bytes: int = 0,
 ) -> Any:
     """``per_prompt`` (low-host tier, encoder reloaded each prompt) streams pageable: pinning would copy 27 GB per
-    prompt. ``pinned_already``: streamers whose pins count against the host room first."""
+    prompt. ``pinned_already``: streamers whose pins count against the host room first. ``dit_pin_bytes``: pins a DiT
+    streamer placed after the encoder still takes (``dit_restream_pin_bytes``); a split encoder pin leaves them."""
     if encoder is None:
         return None
     if plan.placement == PLACE_RESIDENT:
         encoder.to(device)
     elif plan.placement in (PLACE_STREAM, PLACE_DIT_RESIDENT):
         layers = encoder.model.language_model.layers
+        parked = plan.parked and plan.placement == PLACE_STREAM
+        if parked:
+            from .host_pinning import host_pinning_allowed
+            pin = not per_prompt and host_pinning_allowed(device)
         for name, child in encoder.model.named_children():
-            if name != "language_model":
+            if name == "language_model":
+                continue
+            if parked and name == "visual":
+                park_on_host(child, device, pin = pin, per_forward = True)
+            else:
                 child.to(device)
         for name, child in encoder.model.language_model.named_children():
-            if name != "layers":
+            if name == "layers":
+                continue
+            if parked and name == "embed_tokens":
+                lookup_on_host(child, device)
+            else:
                 child.to(device)
         stream_list(
             pipe,
@@ -4348,6 +5349,7 @@ def _place_text_encoder(
             reserve_bytes = reserve_bytes,
             max_pin_bytes = pin_room_bytes(plan, pinned_already),
             replaces_counted = pins_replace_counted(plan),
+            later_host_bytes = te_later_host_bytes(plan) + max(0, int(dit_pin_bytes)),
         )
     return encoder
 
@@ -4369,8 +5371,14 @@ def load_minimax_h3_image_pipeline(
     plan_width: int = 2048,
     plan_height: int = 2048,
     loras: Sequence[tuple] = (),
+    int8_policy: Any = None,
+    attention_backend: Optional[str] = None,
 ) -> Any:
     """A ready ``MiniMaxH3ImagePipeline`` for ``repo_id`` (Hub id or local folder) placed for ``device``.
+
+    ``int8_policy``: the load's ``diffusion_int8_attention.Int8Policy`` (or ``int8_attention`` request) for Studio's
+    INT8 attention kernel; None reads the env switch. ``attention_backend``: the load's attention pick (see
+    ``install_checkpoint_attention``).
 
     ``loras``: ``[(path, weight), ...]`` merged into the dense DiT weights at load, before quantization, so every
     placement and speed lever runs them unchanged; a load with LoRAs therefore streams the release DiT (the hosted
@@ -4420,6 +5428,7 @@ def load_minimax_h3_image_pipeline(
         inflight = inflight,
     )
     table = adaln_table_enabled()
+    h2d, block_tops = link_measurements(device, scheme) if device.type == "cuda" else (None, None)
     plan_args = {
         "vram_gb": vram if device.type == "cuda" else None,
         "host_gb": host,
@@ -4428,6 +5437,9 @@ def load_minimax_h3_image_pipeline(
         "height": plan_height,
         "forced": (os.environ.get(PLACEMENT_ENV) or "").strip().lower() or None,
         "inflight": inflight,
+        "h2d_gib_s": h2d,
+        "block_tops": block_tops,
+        "park": park_setting(),
     }
     plan = plan_placement(
         te_gb = te_gb_for(te_scheme) if text_encoder is None else _module_gb(text_encoder),
@@ -4608,7 +5620,14 @@ def load_minimax_h3_image_pipeline(
 
         pipe._unsloth_h3_te_loader = _te_loader
     else:
-        _place_text_encoder(pipe, text_encoder, plan, device, pinned_already = [early_streamer])
+        _place_text_encoder(
+            pipe,
+            text_encoder,
+            plan,
+            device,
+            pinned_already = [early_streamer],
+            dit_pin_bytes = dit_restream_pin_bytes(transformer, plan, early_streamer),
+        )
     if plan.placement != PLACE_SEQUENTIAL:
         vae.to(device)
     if plan.placement in (PLACE_RESIDENT, PLACE_DIT_RESIDENT):
@@ -4629,11 +5648,32 @@ def load_minimax_h3_image_pipeline(
         early_streamer.remove()
     from .diffusion_minimax_h3_image_speed import install_h3_image_speed
 
-    speed_levers = install_h3_image_speed(pipe, plan, device, logger)
+    speed_levers = install_h3_image_speed(
+        pipe,
+        plan,
+        device,
+        logger,
+        int8_policy = int8_policy,
+        **({"attention_backend": attention_backend} if attention_backend else {}),
+    )
     speed_levers = tuple(speed_levers) + install_h3_image_vae_canvas(vae, device, logger)
-    int8_attention = install_checkpoint_attention(pipe, device, scheme = scheme, logger = logger)
+    int8_attention = install_checkpoint_attention(
+        pipe,
+        device,
+        scheme = scheme,
+        logger = logger,
+        int8_policy = int8_policy,
+        **({"attention_backend": attention_backend} if attention_backend else {}),
+    )
     if int8_attention:
         speed_levers = tuple(speed_levers) + (f"checkpoint_attention={int8_attention}",)
+    parked_gb = park_session_pieces(pipe, device, plan)
+    if parked_gb:
+        logger.info(
+            "diffusion.minimax_h3_image: parked layout: token refiner and VAE (%.2f GB) wait in system memory "
+            "and come in for their phase; the encoder's embedding looks up on the host",
+            parked_gb,
+        )
     if device.type == "cuda" and (
         os.environ.get(TRIM_AFTER_LOAD_ENV) or "1"
     ).strip().lower() not in (
