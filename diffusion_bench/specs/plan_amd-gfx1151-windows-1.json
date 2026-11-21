@@ -1,0 +1,208 @@
+{
+ "name": "amdw:amd-gfx1151-windows-1",
+ "description": "plan.py VM amd-gfx1151-windows-1 (amd:gfx1151-windows)",
+ "defaults": {},
+ "cells": [
+  {
+   "backend": "studio",
+   "kind": "image",
+   "width": 512,
+   "height": 512,
+   "steps": 1,
+   "guidance": 0.0,
+   "prompts": "image_24",
+   "n": 1,
+   "warmup": 0,
+   "options": {
+    "generate": {},
+    "speed_mode": "default",
+    "target": {
+     "name": "amd:gfx1151-windows",
+     "vm_id": "amd-gfx1151-windows-1",
+     "lane": null,
+     "account": null,
+     "simulated_budget_gib": null,
+     "concurrent_with": null
+    },
+    "arm": {
+     "stack": "studio",
+     "block": 0,
+     "order": "trial",
+     "aa_of": null,
+     "label": "s_fp16",
+     "comparison": "sdxl-turbo_amd-gfx1151-windows",
+     "purpose": "trial",
+     "format": "fp16",
+     "tier": "default"
+    }
+   },
+   "env": {},
+   "model": "stabilityai/sdxl-turbo",
+   "variant": "fp16",
+   "card": "sdxl-turbo",
+   "venv": {
+    "profile": "studio"
+   },
+   "short_n": 0,
+   "tag": "trial__amd-gfx1151-windows-1",
+   "family": "sdxl-turbo"
+  },
+  {
+   "backend": "studio",
+   "kind": "image",
+   "width": 512,
+   "height": 512,
+   "steps": 1,
+   "guidance": 0.0,
+   "prompts": "image_24",
+   "n": 1,
+   "warmup": 1,
+   "options": {
+    "generate": {},
+    "speed_mode": "default",
+    "target": {
+     "name": "amd:gfx1151-windows",
+     "vm_id": "amd-gfx1151-windows-1",
+     "lane": null,
+     "account": null,
+     "simulated_budget_gib": null,
+     "concurrent_with": null
+    },
+    "arm": {
+     "stack": "studio",
+     "block": 1,
+     "order": "ABBA",
+     "aa_of": null,
+     "label": "s_fp16",
+     "comparison": "sdxl-turbo_amd-gfx1151-windows",
+     "purpose": "parity",
+     "format": "fp16",
+     "tier": "default"
+    },
+    "parity_probe": true
+   },
+   "env": {},
+   "model": "stabilityai/sdxl-turbo",
+   "variant": "fp16",
+   "card": "sdxl-turbo",
+   "venv": {
+    "profile": "studio"
+   },
+   "short_n": 1,
+   "tag": "sdxl-turbo_amd-gfx1151-windows__s_fp16__k1p0",
+   "family": "sdxl-turbo"
+  },
+  {
+   "backend": "blineui",
+   "kind": "image",
+   "width": 512,
+   "height": 512,
+   "steps": 1,
+   "guidance": 1.0,
+   "prompts": "image_24",
+   "n": 1,
+   "warmup": 1,
+   "options": {
+    "family": "sdxl-turbo",
+    "files": {
+     "checkpoint": "sd_xl_turbo_1.0_fp16.safetensors"
+    },
+    "sampler": "euler_ancestral",
+    "cache_bust": "sampler",
+    "template": "sdxlturbo_example.json",
+    "target": {
+     "name": "amd:gfx1151-windows",
+     "vm_id": "amd-gfx1151-windows-1",
+     "lane": null,
+     "account": null,
+     "simulated_budget_gib": null,
+     "concurrent_with": null
+    },
+    "arm": {
+     "stack": "blineui",
+     "block": 1,
+     "order": "ABBA",
+     "aa_of": null,
+     "label": "c_fp16",
+     "comparison": "sdxl-turbo_amd-gfx1151-windows",
+     "purpose": "parity",
+     "format": "fp16",
+     "tier": null
+    },
+    "parity_probe": true
+   },
+   "env": {},
+   "variant": "fp16",
+   "card": "sdxl-turbo",
+   "venv": "bench",
+   "short_n": 1,
+   "tag": "sdxl-turbo_amd-gfx1151-windows__c_fp16__k1p1",
+   "family": "sdxl-turbo"
+  }
+ ],
+ "plan_vm": {
+  "vm_id": "amd-gfx1151-windows-1",
+  "target": "amd:gfx1151-windows",
+  "purpose": "parity"
+ },
+ "downloads": {
+  "sd_xl_turbo_1.0_fp16.safetensors": {
+   "repo": "stabilityai/sdxl-turbo",
+   "file": "sd_xl_turbo_1.0_fp16.safetensors",
+   "official_repo": "stabilityai/sdxl-turbo"
+  }
+ },
+ "prefetch": {
+  "stabilityai/sdxl-turbo:*": {
+   "repo": "stabilityai/sdxl-turbo",
+   "file": null
+  }
+ },
+ "comparisons": [
+  {
+   "id": "sdxl-turbo_amd-gfx1151-windows",
+   "family": "sdxl-turbo",
+   "target": "amd:gfx1151-windows",
+   "budget_gib": null,
+   "purpose": "parity",
+   "arms": [
+    "s_fp16",
+    "c_fp16"
+   ],
+   "runs": {
+    "s_fp16": [
+     "sdxl-turbo_amd-gfx1151-windows__s_fp16__k1p0"
+    ],
+    "c_fp16": [
+     "sdxl-turbo_amd-gfx1151-windows__c_fp16__k1p1"
+    ]
+   },
+   "order": [
+    "sdxl-turbo_amd-gfx1151-windows__s_fp16__k1p0",
+    "sdxl-turbo_amd-gfx1151-windows__c_fp16__k1p1"
+   ],
+   "aa_pairs": [],
+   "valid_if": "same vm_id and lane; SM clocks within 3% between the paired runs",
+   "est_min": 6.9,
+   "prefetch": [
+    "stabilityai/sdxl-turbo:*"
+   ],
+   "parity_pairs": [
+    {
+     "format": "fp16",
+     "a": "sdxl-turbo_amd-gfx1151-windows__s_fp16__k1p0",
+     "b": "sdxl-turbo_amd-gfx1151-windows__c_fp16__k1p1",
+     "quality": false,
+     "waive": []
+    }
+   ],
+   "vm_id": "amd-gfx1151-windows-1",
+   "lane": 0
+  }
+ ],
+ "revisions": {
+  "unsloth_sha": "8b7cde79ebf5a901b2fd936bbee214fb8c7562c7",
+  "zoo_sha": "9b3fccb098a01b12b7c3336fcde5b76f43a4cce2",
+  "bline_ref": "v0.46.2"
+ }
+}
