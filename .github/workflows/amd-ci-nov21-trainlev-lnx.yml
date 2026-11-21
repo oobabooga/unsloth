@@ -122,6 +122,26 @@ jobs:
           # A finding keeps the job green; a NON-result (VOID / INCONCLUSIVE) does not.
           python3 "$GITHUB_WORKSPACE/amd_ci/lib/announce.py" "$AMD_CI_WORK/out/gpu"
 
+      - name: A/A (base vs base, loss noise floor)
+        if: always()
+        run: |
+          set +e
+          python3 - <<'PY'
+          import json, os
+          w = os.environ["AMD_CI_WORK"] + "/out/"
+          s = json.load(open(w + "states.json"))
+          s["commits"]["head"] = s["commits"]["base"]
+          s["paths"]["head"] = s["paths"]["base"]
+          json.dump(s, open(w + "states_aa.json", "w"), indent = 1)
+          PY
+          "$AMD_CI_PY" amd_ci/lib/differential.py \
+            --states "$AMD_CI_WORK/out/states_aa.json" \
+            --probe amd_ci/probes/diffusion_lora_train_probe.py \
+            --criteria amd_ci/criteria/diffusion_lora_train.py \
+            --out-dir "$AMD_CI_WORK/out/gpu_aa" \
+            --python "$AMD_CI_PY" -- -- --suite flux3 --control-state none --precisions bf16,nf4 --steps 20 --no-lora-render --budget-min 220
+          true
+
       - uses: actions/upload-artifact@v4
         if: always()
         with:
