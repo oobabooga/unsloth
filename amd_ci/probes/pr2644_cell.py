@@ -104,8 +104,11 @@ def main():
     off = G.NonReentrantActivationOffloader()
     y = torch.randn(4096, 4096, device = dev, dtype = dtype, requires_grad = True)
     packed = off.pack(y)
-    obs["nonreentrant_pack_device_is_none"] = packed[0] is None
-    obs["nonreentrant_packed_on"] = str(getattr(packed[1], "device", None))
+    # Kept: the head's keep branch returns (None, x.detach()). Offloaded: (device, cpu tensor) or an
+    # _OffloadedActivation handle (streamed D2H copy).
+    obs["nonreentrant_packed_type"] = type(packed).__name__
+    obs["nonreentrant_pack_device_is_none"] = isinstance(packed, tuple) and packed[0] is None
+    obs["nonreentrant_packed_on"] = str(getattr(packed[1], "device", None)) if isinstance(packed, tuple) else type(packed).__name__
     torch.cuda.synchronize()
     obs["nonreentrant_stats"] = {k: v for k, v in off.stats.items() if v}
     json.dump(obs, open(a.out, "w"), indent = 2, default = str)
