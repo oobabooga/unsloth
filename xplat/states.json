@@ -1,0 +1,10 @@
+{
+ "change": "unslothai/llama.cpp#386 repin 242a5d8f9 -> 7db4a7064 (CUDA: quantized K/V for the banded relative-bias attention)",
+ "upstream": "https://github.com/ggml-org/llama.cpp",
+ "tag": "b12606",
+ "tag_tree": "642c043445ae255a3f57248a2c58da9d0b7ac344",
+ "base_tree": "0a7b21aaa56f06240296b837859ff4a6bf1fa3bc",
+ "head_tree": "79eb8746aa1ffeabbe228788a6343e5f37a7bddd",
+ "base_sim_commit": "7bb3a959414e363f879079e002ebac5c2f36bf85",
+ "head_sim_commit": "f66f0df8231ef71b9ca5a6dd0dfcd7c7d1960841"
+}
