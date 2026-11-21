@@ -91,7 +91,7 @@ jobs:
             --probe amd_ci/probes/train5_probe.py \
             --criteria amd_ci/criteria/train5_rocm.py \
             --out-dir "$AMD_CI_WORK/out/gpu" \
-            --python "$AMD_CI_PY" -- --unit s5ms --state-repo zoo --transformers 5.23.0 --trl 1.18.0 --cells env,s5m_um,s5m_um_r2,s5m_um_r3,s5m_um_k0 --companion-repo https://github.com/unslothai/unsloth --companion-base ee62cb7857ded11ecfe68a11f123a03f803ff55e --companion-head ee62cb7857ded11ecfe68a11f123a03f803ff55e --venv "$AMD_CI_WORK/tvenv" --tests tests/test_gc_unified_memory_keep_on_device.py tests/test_cuda_unified_total_memory.py tests/test_gc_retained_graph_slots.py --repeat none --test-timeout 1800 --no-rerun-timed-out --cell-timeout 2400 --both-files amd_ci/patches/s5m_d5_both.json --head-files amd_ci/patches/s5m_d5_head.json
+            --python "$AMD_CI_PY" -- --unit s5ms --state-repo zoo --transformers 5.23.0 --trl 1.18.0 --cells env,s5m_um,s5m_um_r2,s5m_um_r3,s5m_um_k0,s5m_um_lc --companion-repo https://github.com/unslothai/unsloth --companion-base ee62cb7857ded11ecfe68a11f123a03f803ff55e --companion-head ee62cb7857ded11ecfe68a11f123a03f803ff55e --venv "$AMD_CI_WORK/tvenv" --tests tests/test_gc_unified_memory_keep_on_device.py tests/test_cuda_unified_total_memory.py tests/test_gc_retained_graph_slots.py --repeat none --test-timeout 1800 --no-rerun-timed-out --cell-timeout 2400 --both-files amd_ci/patches/s5m_d5_both.json --head-files amd_ci/patches/s5m_d5_head.json
           cat "$AMD_CI_WORK/out/gpu/VERDICT.md" >> "$GITHUB_STEP_SUMMARY"
           # A finding keeps the job green; a NON-result (VOID / INCONCLUSIVE) does not.
           python3 "$GITHUB_WORKSPACE/amd_ci/lib/announce.py" "$AMD_CI_WORK/out/gpu"
