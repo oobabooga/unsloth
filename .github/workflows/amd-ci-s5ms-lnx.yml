@@ -1,4 +1,4 @@
-name: "AMD CI: validate PR 1"
+name: "AMD CI: validate PR 2638"
 
 # Generated from amd_ci/templates/workflow.yml. Edit the PROBE and CRITERIA env
 # values, and the tests/args, rather than the plumbing.
@@ -30,12 +30,12 @@ permissions:
   contents: read
 
 env:
-  PR: "1"
+  PR: "2638"
   UPSTREAM: "https://github.com/unslothai/unsloth-zoo"
   # Set to "1" for a PR already merged: compares the merge commit to its parent.
   AMD1_BASE_OVERRIDE: "9b3fccb098a01b12b7c3336fcde5b76f43a4cce2"
   AMD1_HEAD_OVERRIDE: "9b3fccb098a01b12b7c3336fcde5b76f43a4cce2"
-  MERGED: "0"
+  MERGED: "1"
   # Set by scaffold.py --patch: base = PATCH_BASE, head = PATCH_BASE plus this diff (relative to the checkout).
   PATCH_BASE: ""
   PATCH_FILE: ""
@@ -44,7 +44,7 @@ env:
 jobs:
 
   gpu:
-    name: "PR 1 GPU check (shared GPU)"
+    name: "PR 2638 GPU check (shared GPU)"
     runs-on: [self-hosted, Linux, strix-halo, devlab-dispatch]
     timeout-minutes: 180
     # --shared-gpu: no concurrency group, so a co-tenant may share the card.
@@ -57,7 +57,7 @@ jobs:
 
       - name: Preamble
         run: |
-          source amd_ci/lib/preamble.sh "pr1-gpu"
+          source amd_ci/lib/preamble.sh "pr2638-gpu"
 
       - name: Hardware gate
         run: |
@@ -99,7 +99,7 @@ jobs:
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: pr1-gpu
+          name: pr2638-gpu
           path: ${{ env.AMD_CI_WORK }}/out
           retention-days: 7
           if-no-files-found: warn
