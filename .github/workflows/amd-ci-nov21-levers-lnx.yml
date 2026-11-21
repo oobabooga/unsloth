@@ -1,0 +1,112 @@
+name: "AMD CI: AMD levers probe on gfx1151 (Linux + Windows, nov21)"
+
+# Generated from amd_ci/templates/workflow_windows.yml by scaffold.py --windows.
+#
+# The Windows half of the devlab-dispatch pool: four GMKtec NucBox EVO-X2 Strix
+# Halo boxes running Windows 11 Pro, with an AMD Radeon 8060S visible to Windows.
+# They match in seconds and never queue. Everything below is measured on them:
+#
+#   shell: powershell     the ONLY correct value. `pwsh` is not installed (there
+#                         is no PowerShell 7, only 5.1 Desktop) and neither is
+#                         `bash`. Either one fails before the step's first line.
+#                         Set as a job default so no step can drift off it.
+#   no docker             not installed on any of the four. Containerised work
+#                         stays on the Linux runners; there is no Windows target
+#                         for it on this pool.
+#   RUNNER_OS             has been observed EMPTY on these jobs, and correct on
+#                         others. Echo it before branching on it; a bash-style
+#                         ${RUNNER_OS:-?} in a PowerShell block is always "".
+#   machine names         the X2-LA01-* prefix is SHARED with the Linux pool, so
+#                         the name does not tell you which OS answered.
+#   no shared state       jobs land on DIFFERENT machines and share no image
+#                         cache and no disk. Anything fetched in one job must be
+#                         fetched again in the next.
+#
+# The linux-control job exists to be diagnostic, not useful. A label that matches
+# no runner does not fail a job, it queues it forever, and that looks exactly like
+# a busy pool from the run list. This job differs from the Windows one ONLY in the
+# OS label, so if it starts and the Windows job does not, the selector is wrong.
+# Keep it, or reproduce it by pushing the same workflow twice.
+
+on:
+  push:
+    branches: [amd-ci-nov21-levers-lnx]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  PR: "18760"
+  BASE_SHA: "8b7cde79ebf5a901b2fd936bbee214fb8c7562c7"
+  UPSTREAM: "https://github.com/unslothai/unsloth"
+  # Set to "1" for a PR already merged: compares the merge commit to its parent.
+  MERGED: "1"
+  # Set by scaffold.py --patch: base = PATCH_BASE, head = PATCH_BASE plus this diff (relative to the checkout).
+  PATCH_BASE: ""
+  PATCH_FILE: ""
+  PATCH_SHA256: ""
+
+jobs:
+
+  linux:
+    name: "AMD levers probe (gfx1151 Linux, exclusive GPU)"
+    runs-on: [self-hosted, Linux, strix-halo, devlab-dispatch]
+    timeout-minutes: 300
+    concurrency:
+      group: amd-ci-gfx1151-gpu
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+        with: { persist-credentials: false }
+
+      - name: Preamble
+        run: |
+          source amd_ci/lib/preamble.sh "nov21-levers-linux"
+
+      - name: Studio at BASE_SHA (install.sh --local) and real gate
+        timeout-minutes: 60
+        run: |
+          set -euo pipefail
+          git clone -q --filter=blob:none "$UPSTREAM" "$AMD_CI_WORK/repo"
+          git -C "$AMD_CI_WORK/repo" checkout -q --detach "$BASE_SHA"
+          cd "$AMD_CI_WORK/repo"
+          export UNSLOTH_STUDIO_HOME="$AMD_CI_WORK/studio"
+          export UV_EXTRA_INDEX_URL="https://pypi.org/simple"
+          set +e
+          bash install.sh --local 2>&1 | tail -15
+          rc=${PIPESTATUS[0]}
+          set -e
+          [ "$rc" -eq 0 ] || exit "$rc"
+          V=""
+          for c in "$UNSLOTH_STUDIO_HOME"/unsloth_studio "$UNSLOTH_STUDIO_HOME"/.venv_t5_*; do
+            [ -x "$c/bin/python" ] && { V="$c"; break; }
+          done
+          [ -n "$V" ] || { echo "FATAL: no Studio venv"; exit 1; }
+          echo "AMD_CI_PY=$V/bin/python" >> "$GITHUB_ENV"
+          "$V/bin/python" "$GITHUB_WORKSPACE/amd_ci/lib/gate.py" --require rocm gpu --expect-arch gfx1151 --min-gpus 1 \
+            --out "$AMD_CI_WORK/out/host.json"
+
+      - name: AMD levers probe (V1 CK SDPA, V6 BLAS, V3 QK-RoPE, V2 MIOpen find-db)
+        timeout-minutes: 240
+        run: |
+          set +e
+          mkdir -p "$AMD_CI_WORK/out/levers"
+          export HF_HOME="$AMD_CI_WORK/hf_home" HF_HUB_DISABLE_TELEMETRY=1
+          unset HF_TOKEN
+          "$AMD_CI_PY" -m pip install -q --no-deps lpips > "$AMD_CI_WORK/out/levers/lpips.log" 2>&1
+          "$AMD_CI_PY" "$GITHUB_WORKSPACE/amd_ci/probes/levers_probe.py" --checkout "$AMD_CI_WORK/repo" \
+            --out "$AMD_CI_WORK/out/levers/obs.json" --work "$AMD_CI_WORK/levers_work" \
+            > "$AMD_CI_WORK/out/levers/probe.log" 2>&1
+          echo "probe rc=$?"
+          tail -5 "$AMD_CI_WORK/out/levers/probe.log"
+          exit 0
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: nov21-levers-linux
+          path: ${{ env.AMD_CI_WORK }}/out
+          retention-days: 7
+          if-no-files-found: warn
+
