@@ -37,7 +37,6 @@ permissions:
   contents: read
 
 env:
-  BASELINE_REPO: ${{ vars.BASELINE_REPO }}
   PR: "18760"
   UPSTREAM: "https://github.com/unslothai/unsloth"
   # Set to "1" for a PR already merged: compares the merge commit to its parent.
