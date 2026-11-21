@@ -184,6 +184,14 @@ jobs:
             ForEach-Object { Write-Output "stopping $($_.ProcessId) $($_.Name)"; Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
           exit 0
 
+      - name: Cell verdicts (stdout, survives a failed upload)
+        if: always()
+        run: |
+          $ErrorActionPreference = "Continue"
+          Get-ChildItem -Path "$env:AMD_CI_WORK\out\windows" -Filter "obs_*.json" -ErrorAction SilentlyContinue | ForEach-Object {
+            & $env:AMD_CI_PY -c "import json, sys; d = json.load(open(sys.argv[1], encoding='utf-8')); [print(sys.argv[1][-14:], k, c.get('verdict'), (c.get('error') or '')[:400]) for k, c in (d.get('cells') or {}).items()]" $_.FullName }
+          exit 0
+
       - name: Copy cell logs and records into out
         if: always()
         run: |
@@ -198,6 +206,15 @@ jobs:
         if: always()
         with:
           name: pr18760-windows
-          path: ${{ env.AMD_CI_WORK }}/out
+          path: |
+            ${{ env.AMD_CI_WORK }}/out
+            !${{ env.AMD_CI_WORK }}/out/**/hf_home/**
+            !${{ env.AMD_CI_WORK }}/out/**/*.safetensors
+            !${{ env.AMD_CI_WORK }}/out/**/*.gguf
+            !${{ env.AMD_CI_WORK }}/out/**/*.bin
+            !${{ env.AMD_CI_WORK }}/out/**/*.pt
+            !${{ env.AMD_CI_WORK }}/out/**/*.pth
+            !${{ env.AMD_CI_WORK }}/out/**/*.ckpt
+            !${{ env.AMD_CI_WORK }}/out/**/venv*/**
           retention-days: 7
           if-no-files-found: warn
