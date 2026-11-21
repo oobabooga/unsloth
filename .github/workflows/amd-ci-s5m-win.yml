@@ -167,7 +167,7 @@ jobs:
             --probe "$env:GITHUB_WORKSPACE/amd_ci/probes/train5_probe.py" `
             --criteria "$env:GITHUB_WORKSPACE/amd_ci/criteria/train5_rocm.py" `
             --out-dir "$env:AMD_CI_WORK\out\windows" `
-            --python "$env:AMD_CI_PY" -- --unit s5m --state-repo zoo --transformers 5.23.0 --trl 1.18.0 --cells env,s5m_um,s5m_um_r2,s5m_um_r3,s5m_um_k0 --companion-repo https://github.com/unslothai/unsloth --companion-base ee62cb7857ded11ecfe68a11f123a03f803ff55e --companion-head ee62cb7857ded11ecfe68a11f123a03f803ff55e --use-current --tests tests/test_gc_unified_memory_keep_on_device.py tests/test_cuda_unified_total_memory.py tests/test_gc_retained_graph_slots.py --repeat none --test-timeout 1800 --no-rerun-timed-out --cell-timeout 2400 --both-files amd_ci/patches/s5m_d5_both.json --head-files amd_ci/patches/s5m_d5_head.json
+            --python "$env:AMD_CI_PY" -- --unit s5m --state-repo zoo --transformers 5.23.0 --trl 1.18.0 --cells env,s5m_um,s5m_um_r2,s5m_um_r3,s5m_um_k0,s5m_um_lc --companion-repo https://github.com/unslothai/unsloth --companion-base ee62cb7857ded11ecfe68a11f123a03f803ff55e --companion-head ee62cb7857ded11ecfe68a11f123a03f803ff55e --use-current --tests tests/test_gc_unified_memory_keep_on_device.py tests/test_cuda_unified_total_memory.py tests/test_gc_retained_graph_slots.py --repeat none --test-timeout 1800 --no-rerun-timed-out --cell-timeout 2400 --both-files amd_ci/patches/s5m_d5_both.json --head-files amd_ci/patches/s5m_d5_head.json
           Get-Content "$env:AMD_CI_WORK\out\windows\VERDICT.md" |
             Add-Content -Path $env:GITHUB_STEP_SUMMARY
           # A finding keeps the job green; a NON-result (VOID / INCONCLUSIVE) does not.

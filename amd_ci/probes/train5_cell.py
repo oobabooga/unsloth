@@ -42,6 +42,8 @@ MODELS = {
     "s5m_um_r2": "same as s5m_um, second run",
     "s5m_um_r3": "same as s5m_um, third run",
     "s5m_um_k0": "same as s5m_um with UNSLOTH_GC_KEEP_ON_DEVICE=0 (kill switch)",
+    "s5m_um_lc": "same as s5m_um, 10 steps, with a ballast that leaves device free memory at the keep headroom + 256 MiB",
+    "s5m_carve": "no model: VRAM carve-out vs GTT vs host RAM, and where 1 GiB hipMalloc chunks land (sysfs / MemAvailable)",
     "nwe_sft": "jobs/sft.py --tiny (trl-internal-testing/tiny-Qwen3ForCausalLM LoRA SFT, 10 steps, unsloth #18625)",
     "nwe_sft_r2": "same as nwe_sft, second run",
     "ppd_sft": "jobs/sft.py --tiny (tiny Qwen3 2 layers, LoRA on layer 1 only, GC 'unsloth', 10 steps, unsloth #18745)",
@@ -4518,6 +4520,87 @@ def _s5m_rss():
         return None
 
 
+def _s5m_sysfs_cards():
+    cards = {}
+    for d in sorted(glob.glob("/sys/class/drm/card*/device")):
+        rec = {}
+        for k in ("mem_info_vram_total", "mem_info_vram_used", "mem_info_vis_vram_total", "mem_info_gtt_total",
+                  "mem_info_gtt_used"):
+            try:
+                rec[k] = int(open(f"{d}/{k}", encoding = "utf-8").read().strip())
+            except Exception:  # noqa: BLE001
+                pass
+        if rec:
+            try:
+                rec["uevent"] = open(f"{d}/uevent", encoding = "utf-8").read()[:400]
+            except Exception:  # noqa: BLE001
+                pass
+            cards[d] = rec
+    return cards
+
+
+def _s5m_host():
+    out = {}
+    try:
+        import psutil
+        vm = psutil.virtual_memory()
+        out.update(psutil_total = vm.total, psutil_available = vm.available, psutil_used = vm.used)
+    except Exception as e:  # noqa: BLE001
+        out["psutil_error"] = repr(e)[:200]
+    if sys.platform.startswith("linux"):
+        try:
+            m = {}
+            for line in open("/proc/meminfo", encoding = "utf-8"):
+                k, v = line.split(":", 1)
+                m[k] = int(v.split()[0]) * 1024
+            out.update(MemTotal = m.get("MemTotal"), MemAvailable = m.get("MemAvailable"))
+        except Exception:  # noqa: BLE001
+            pass
+    return out
+
+
+def cell_s5m_carve():
+    """Carve-out census: torch total_memory / mem_get_info, amdgpu sysfs VRAM / GTT totals, host RAM; then 1 GiB
+    chunks until min(VRAM carve-out + 6 GiB, free - 6 GiB, 40 GiB): after each, VRAM / GTT used and host available,
+    i.e. whether device allocations come from the carve-out or from the host pool (GTT / shared memory)."""
+    import torch
+    versions()
+    props = torch.cuda.get_device_properties(0)
+    res["props"] = {k: getattr(props, k, None) for k in ("name", "gcnArchName", "total_memory", "is_integrated",
+                                                          "pci_bus_id", "pci_device_id", "pci_domain_id")}
+    res["props"] = {k: (v if isinstance(v, (int, float, str, type(None))) else str(v)) for k, v in res["props"].items()}
+    free, total = torch.cuda.mem_get_info(0)
+    res["mem_get_info"] = {"free": free, "total": total}
+    res["sysfs"] = _s5m_sysfs_cards()
+    res["host_before"] = _s5m_host()
+    vram_total = max([c.get("mem_info_vram_total", 0) for c in res["sysfs"].values()] or [0])
+    cap = min((vram_total + 6 * 2**30) if vram_total else 24 * 2**30, free - 6 * 2**30, 40 * 2**30)
+    res["chunk_cap_bytes"] = cap
+    chunks, trace = [], []
+    stage("alloc")
+    try:
+        while (len(chunks) + 1) * 2**30 <= cap:
+            t = torch.empty(2**30, dtype = torch.uint8, device = "cuda")
+            t.fill_(1)
+            chunks.append(t)
+            torch.cuda.synchronize()
+            if len(chunks) % 2 == 0 or (len(chunks) + 1) * 2**30 > cap:
+                rec = {"gib": len(chunks), "mem_get_info_free": torch.cuda.mem_get_info(0)[0], **_s5m_host()}
+                for d, c in _s5m_sysfs_cards().items():
+                    rec[d.split("/")[-2] + "_vram_used"] = c.get("mem_info_vram_used")
+                    rec[d.split("/")[-2] + "_gtt_used"] = c.get("mem_info_gtt_used")
+                trace.append(rec)
+                res["trace"] = trace
+                dump()
+    except Exception as e:  # noqa: BLE001
+        res["alloc_error"] = f"{type(e).__name__}: {e}"[:400]
+    res["allocated_gib"] = len(chunks)
+    del chunks
+    torch.cuda.empty_cache()
+    res["host_after"] = _s5m_host()
+    res["finite"] = True
+
+
 def cell_s5m_um():
     """survey5 D5: Qwen3-0.6B bf16 LoRA, GC 'unsloth', 2 x 2048 tokens, 20 steps. Per step loss + time; peaks of torch
     allocated / reserved, amdgpu VRAM+GTT used, system used and process RSS sampled every 10 ms during training;
@@ -4547,6 +4630,32 @@ def cell_s5m_um():
     gc = GCCounter(model)
     device = model.get_input_embeddings().weight.device
     res["train_device"] = device.index
+    try:
+        from unsloth_zoo import integrated_device as _idev
+        res["memory_pool"] = _idev.device_memory_pool(device.index) if hasattr(_idev, "device_memory_pool") else None
+    except Exception as e:  # noqa: BLE001
+        res["memory_pool"] = repr(e)[:200]
+    ballast = []
+    steps = S5M_STEPS
+    if args.cell == "s5m_um_lc":
+        steps = 10
+        # Leave (driver free + torch cache) at the head's keep headroom + 256 MiB: the head must fall back to offload.
+        free0, total0 = torch.cuda.mem_get_info(device.index)
+        headroom = max(2 * 2**30, int(total0 * 0.05))
+        target = headroom + 256 * 2**20
+
+        def eff_free():
+            f, _ = torch.cuda.mem_get_info(device.index)
+            return f + max(torch.cuda.memory_reserved(device.index) - torch.cuda.memory_allocated(device.index), 0)
+        while eff_free() - 2**30 > target:
+            ballast.append(torch.empty(2**30, dtype = torch.uint8, device = device))
+        rest = eff_free() - target
+        if rest > 0:
+            ballast.append(torch.empty(rest, dtype = torch.uint8, device = device))
+        torch.cuda.synchronize()
+        res["ballast_gib"] = round(sum(b.numel() for b in ballast) / 2**30, 2)
+        res["lc_free_before_train_mb"] = round(eff_free() / 2**20, 1)
+        res["lc_headroom_mb"] = round(headroom / 2**20, 1)
     vocab = model.get_input_embeddings().weight.shape[0]
     ids = torch.randint(10, vocab, (S5M_BS, S5M_SEQ), generator = torch.Generator().manual_seed(0)).to(device)
     batch = {"input_ids": ids, "attention_mask": torch.ones_like(ids), "labels": ids.clone()}
@@ -4576,7 +4685,7 @@ def cell_s5m_um():
     losses, times = [], []
     stage("train")
     try:
-        for s in range(S5M_STEPS):
+        for s in range(steps):
             torch.cuda.synchronize()
             t0 = time.perf_counter()
             out = model(**batch)
@@ -4609,6 +4718,8 @@ def cell_s5m_um():
     keep = getattr(gmod, "_keep_on_device_indices", None)
     res["keep_set"] = sorted(keep()) if keep is not None else None
     res["kept_notice"] = bool(getattr(gmod, "_WARNED_KEEP_ON_DEVICE", False))
+    res["low_memory_notice"] = bool(getattr(gmod, "_WARNED_KEEP_LOW_MEMORY", False))
+    del ballast
     try:
         res["nonreentrant_stats"] = gmod.get_activation_offload_stats()
     except Exception as e:  # noqa: BLE001
@@ -5778,7 +5889,7 @@ def cell_z12(model_key):
     res["peak_alloc_mb"] = r.get("peak_warm_mib")
 
 
-CELLS = {"s5m_um": cell_s5m_um, "s5m_um_r2": cell_s5m_um, "s5m_um_r3": cell_s5m_um, "s5m_um_k0": cell_s5m_um, "u3_verdict": cell_u3_verdict, "nwd_pg_long": lambda: cell_grpo_pg_len(True), "nwd_pg_long_kl": lambda: cell_grpo_pg_len(True, 0.04), "nwd_par": cell_nwd_par, "nwd_par_ss": cell_nwd_par, "nwb_grpo": cell_nwb, "nwa_tq3_ml": lambda: cell_cg2("qwen3"), "nwa_q06_ml": lambda: cell_cg2("q06"), "nwa_q06b4_ml": lambda: cell_cg2("q06b4"), "nwa_q06_ml_skoff": lambda: cell_cg2("q06"), "nwa_tq3": lambda: cell_cg2("qwen3"), "nwa_q06": lambda: cell_cg2("q06"), "nwa_q06b4": lambda: cell_cg2("q06b4"), "nwa_q06_skoff": lambda: cell_cg2("q06"), "kd_r16": lambda: cell_dora(False), "kd_r64": lambda: cell_dora(False, r = 64), "kd_h16acc": lambda: cell_dora(False, half = True, fp16acc = True), "lsh_qwen3": cell_lsh, "z12_whisper": lambda: cell_z12("whisper"), "z12_w2v": lambda: cell_z12("wav2vec2"), "cg5_on": lambda: cell_cg5(True), "cg5_off": lambda: cell_cg5(False), "cg1_fp32": lambda: cell_cg1("fp32"), "cg1_bf16": lambda: cell_cg1("bf16"), "cg2_qwen3_nbc_ml": lambda: cell_cg2("qwen3"), "cg2_qwen3_nbc_ml_off": lambda: cell_cg2("qwen3"), "cg2_llama_nbc_ml": lambda: cell_cg2("llama"), "cg2_llama4_nbc_ml": lambda: cell_cg2("llama4"), "cg2_qwen3": lambda: cell_cg2("qwen3"), "cg2_qwen3_nbc": lambda: cell_cg2("qwen3"), "cg2_qwen3_nbc_off": lambda: cell_cg2("qwen3"), "cg2_llama": lambda: cell_cg2("llama"), "cg2_llama_nbc": lambda: cell_cg2("llama"), "cg2_llama4_nbc": lambda: cell_cg2("llama4"), "z28_ernie": lambda: cell_z28("ernie"), "z28_ernie_nl": lambda: cell_z28("ernie_nl"), "z28_llama": lambda: cell_z28("llama"), "dora16": lambda: cell_dora(False), "dora16_off": lambda: cell_dora(False), "dora4": lambda: cell_dora(True), "dora16_g64": lambda: cell_dora(False), "dora16_lr1": lambda: cell_dora(False), "dora4_lr1": lambda: cell_dora(True), "dora16_lr1_g64": lambda: cell_dora(False), "dora4_lr1_g64": lambda: cell_dora(True), "dora4_g64": lambda: cell_dora(True), "fx32": lambda: cell_fx("float32"), "fx16": lambda: cell_fx("bfloat16"), "cg_forced8": lambda: cell_cg(True, True), "cg_auto8": lambda: cell_cg(False, True), "cg_forced": lambda: cell_cg(True), "cg_auto": lambda: cell_cg(False), "ls_qwen3": cell_ls, "ls_qwen3_off": cell_ls, "pk_qwen3": lambda: cell_pk("pack"), "pk_qwen3_ef1": lambda: cell_pk("pack"), "pf_qwen3": lambda: cell_pk("pfree"), "mgsa_llama": lambda: cell_mg("mgsa_llama"), "mgsa_qwen3": lambda: cell_mg("mgsa_qwen3"), "mgsa_llama_sa0": lambda: cell_mg("mgsa_llama"), "mgpin_llama": lambda: cell_mg("mgpin_llama"), "mgpin_llama_px0": lambda: cell_mg("mgpin_llama"),
+CELLS = {"s5m_um_lc": cell_s5m_um, "s5m_carve": cell_s5m_carve, "s5m_um": cell_s5m_um, "s5m_um_r2": cell_s5m_um, "s5m_um_r3": cell_s5m_um, "s5m_um_k0": cell_s5m_um, "u3_verdict": cell_u3_verdict, "nwd_pg_long": lambda: cell_grpo_pg_len(True), "nwd_pg_long_kl": lambda: cell_grpo_pg_len(True, 0.04), "nwd_par": cell_nwd_par, "nwd_par_ss": cell_nwd_par, "nwb_grpo": cell_nwb, "nwa_tq3_ml": lambda: cell_cg2("qwen3"), "nwa_q06_ml": lambda: cell_cg2("q06"), "nwa_q06b4_ml": lambda: cell_cg2("q06b4"), "nwa_q06_ml_skoff": lambda: cell_cg2("q06"), "nwa_tq3": lambda: cell_cg2("qwen3"), "nwa_q06": lambda: cell_cg2("q06"), "nwa_q06b4": lambda: cell_cg2("q06b4"), "nwa_q06_skoff": lambda: cell_cg2("q06"), "kd_r16": lambda: cell_dora(False), "kd_r64": lambda: cell_dora(False, r = 64), "kd_h16acc": lambda: cell_dora(False, half = True, fp16acc = True), "lsh_qwen3": cell_lsh, "z12_whisper": lambda: cell_z12("whisper"), "z12_w2v": lambda: cell_z12("wav2vec2"), "cg5_on": lambda: cell_cg5(True), "cg5_off": lambda: cell_cg5(False), "cg1_fp32": lambda: cell_cg1("fp32"), "cg1_bf16": lambda: cell_cg1("bf16"), "cg2_qwen3_nbc_ml": lambda: cell_cg2("qwen3"), "cg2_qwen3_nbc_ml_off": lambda: cell_cg2("qwen3"), "cg2_llama_nbc_ml": lambda: cell_cg2("llama"), "cg2_llama4_nbc_ml": lambda: cell_cg2("llama4"), "cg2_qwen3": lambda: cell_cg2("qwen3"), "cg2_qwen3_nbc": lambda: cell_cg2("qwen3"), "cg2_qwen3_nbc_off": lambda: cell_cg2("qwen3"), "cg2_llama": lambda: cell_cg2("llama"), "cg2_llama_nbc": lambda: cell_cg2("llama"), "cg2_llama4_nbc": lambda: cell_cg2("llama4"), "z28_ernie": lambda: cell_z28("ernie"), "z28_ernie_nl": lambda: cell_z28("ernie_nl"), "z28_llama": lambda: cell_z28("llama"), "dora16": lambda: cell_dora(False), "dora16_off": lambda: cell_dora(False), "dora4": lambda: cell_dora(True), "dora16_g64": lambda: cell_dora(False), "dora16_lr1": lambda: cell_dora(False), "dora4_lr1": lambda: cell_dora(True), "dora16_lr1_g64": lambda: cell_dora(False), "dora4_lr1_g64": lambda: cell_dora(True), "dora4_g64": lambda: cell_dora(True), "fx32": lambda: cell_fx("float32"), "fx16": lambda: cell_fx("bfloat16"), "cg_forced8": lambda: cell_cg(True, True), "cg_auto8": lambda: cell_cg(False, True), "cg_forced": lambda: cell_cg(True), "cg_auto": lambda: cell_cg(False), "ls_qwen3": cell_ls, "ls_qwen3_off": cell_ls, "pk_qwen3": lambda: cell_pk("pack"), "pk_qwen3_ef1": lambda: cell_pk("pack"), "pf_qwen3": lambda: cell_pk("pfree"), "mgsa_llama": lambda: cell_mg("mgsa_llama"), "mgsa_qwen3": lambda: cell_mg("mgsa_qwen3"), "mgsa_llama_sa0": lambda: cell_mg("mgsa_llama"), "mgpin_llama": lambda: cell_mg("mgpin_llama"), "mgpin_llama_px0": lambda: cell_mg("mgpin_llama"),
          "hd512_llama": lambda: cell_hd512("llama"), "hd512_gemma4": lambda: cell_hd512("gemma4"),
          "hd512_gemma4_nc": lambda: cell_hd512("gemma4"),
          "bclens": cell_bclens, "bswap": cell_bswap,
