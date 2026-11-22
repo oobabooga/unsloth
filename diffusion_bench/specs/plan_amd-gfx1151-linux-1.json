@@ -1,0 +1,2409 @@
+{
+ "name": "amd_nov22_rimg:amd-gfx1151-linux-1",
+ "description": "plan.py VM amd-gfx1151-linux-1 (amd:gfx1151-linux)",
+ "defaults": {},
+ "cells": [
+  {
+   "backend": "studio",
+   "kind": "image",
+   "width": 1024,
+   "height": 1024,
+   "steps": 12,
+   "guidance": 1.0,
+   "prompts": "image_24",
+   "n": 1,
+   "warmup": 0,
+   "options": {
+    "transformer_quant": "auto",
+    "generate": {},
+    "speed_mode": "default",
+    "local_files_only": false,
+    "target": {
+     "name": "amd:gfx1151-linux",
+     "vm_id": "amd-gfx1151-linux-1",
+     "lane": null,
+     "account": null,
+     "simulated_budget_gib": null,
+     "concurrent_with": null
+    },
+    "arm": {
+     "stack": "studio",
+     "block": 0,
+     "order": "trial",
+     "aa_of": null,
+     "label": "s_int8_auto",
+     "comparison": "qwen-image-2-1_amd-gfx1151-linux",
+     "purpose": "trial",
+     "format": "int8",
+     "tier": "default"
+    }
+   },
+   "env": {},
+   "model": "Qwen/Qwen-Image-2.1",
+   "variant": "int8",
+   "card": "qwen-image-2.1",
+   "venv": {
+    "profile": "studio"
+   },
+   "short_n": 0,
+   "tag": "trial__amd-gfx1151-linux-1",
+   "family": "qwen-image-2.1"
+  },
+  {
+   "backend": "studio",
+   "kind": "image",
+   "width": 1024,
+   "height": 1024,
+   "steps": 12,
+   "guidance": 1.0,
+   "prompts": "image_24",
+   "n": 1,
+   "warmup": 1,
+   "options": {
+    "transformer_quant": "auto",
+    "generate": {},
+    "speed_mode": "default",
+    "local_files_only": false,
+    "target": {
+     "name": "amd:gfx1151-linux",
+     "vm_id": "amd-gfx1151-linux-1",
+     "lane": null,
+     "account": null,
+     "simulated_budget_gib": null,
+     "concurrent_with": null
+    },
+    "arm": {
+     "stack": "studio",
+     "block": 1,
+     "order": "ABBA",
+     "aa_of": null,
+     "label": "s_int8_auto",
+     "comparison": "qwen-image-2-1_amd-gfx1151-linux",
+     "purpose": "timing",
+     "format": "int8",
+     "tier": "default"
+    }
+   },
+   "env": {},
+   "model": "Qwen/Qwen-Image-2.1",
+   "variant": "int8",
+   "card": "qwen-image-2.1",
+   "venv": {
+    "profile": "studio"
+   },
+   "short_n": 0,
+   "tag": "qwen-image-2-1_amd-gfx1151-linux__s_int8_auto__k1p0",
+   "family": "qwen-image-2.1"
+  },
+  {
+   "backend": "studio",
+   "kind": "image",
+   "width": 1024,
+   "height": 1024,
+   "steps": 12,
+   "guidance": 1.0,
+   "prompts": "image_24",
+   "n": 1,
+   "warmup": 1,
+   "options": {
+    "transformer_quant": "none",
+    "generate": {},
+    "speed_mode": "default",
+    "local_files_only": false,
+    "target": {
+     "name": "amd:gfx1151-linux",
+     "vm_id": "amd-gfx1151-linux-1",
+     "lane": null,
+     "account": null,
+     "simulated_budget_gib": null,
+     "concurrent_with": null
+    },
+    "arm": {
+     "stack": "studio",
+     "block": 1,
+     "order": "ABBA",
+     "aa_of": null,
+     "label": "s_int8_bf16dit",
+     "comparison": "qwen-image-2-1_amd-gfx1151-linux",
+     "purpose": "timing",
+     "format": "int8",
+     "tier": "default"
+    }
+   },
+   "env": {},
+   "model": "Qwen/Qwen-Image-2.1",
+   "variant": "int8",
+   "card": "qwen-image-2.1",
+   "venv": {
+    "profile": "studio"
+   },
+   "short_n": 0,
+   "tag": "qwen-image-2-1_amd-gfx1151-linux__s_int8_bf16dit__k1p1",
+   "family": "qwen-image-2.1"
+  },
+  {
+   "backend": "studio",
+   "kind": "image",
+   "width": 1024,
+   "height": 1024,
+   "steps": 12,
+   "guidance": 1.0,
+   "prompts": "image_24",
+   "n": 1,
+   "warmup": 1,
+   "options": {
+    "transformer_quant": "int8",
+    "generate": {},
+    "speed_mode": "default",
+    "local_files_only": false,
+    "target": {
+     "name": "amd:gfx1151-linux",
+     "vm_id": "amd-gfx1151-linux-1",
+     "lane": null,
+     "account": null,
+     "simulated_budget_gib": null,
+     "concurrent_with": null
+    },
+    "arm": {
+     "stack": "studio",
+     "block": 1,
+     "order": "ABBA",
+     "aa_of": null,
+     "label": "s_int8_int8",
+     "comparison": "qwen-image-2-1_amd-gfx1151-linux",
+     "purpose": "timing",
+     "format": "int8",
+     "tier": "default"
+    }
+   },
+   "env": {},
+   "model": "Qwen/Qwen-Image-2.1",
+   "variant": "int8",
+   "card": "qwen-image-2.1",
+   "venv": {
+    "profile": "studio"
+   },
+   "short_n": 0,
+   "tag": "qwen-image-2-1_amd-gfx1151-linux__s_int8_int8__k1p2",
+   "family": "qwen-image-2.1"
+  },
+  {
+   "backend": "studio",
+   "kind": "image",
+   "width": 1024,
+   "height": 1024,
+   "steps": 12,
+   "guidance": 1.0,
+   "prompts": "image_24",
+   "n": 1,
+   "warmup": 1,
+   "options": {
+    "transformer_quant": "int8",
+    "generate": {},
+    "speed_mode": "default",
+    "local_files_only": false,
+    "target": {
+     "name": "amd:gfx1151-linux",
+     "vm_id": "amd-gfx1151-linux-1",
+     "lane": null,
+     "account": null,
+     "simulated_budget_gib": null,
+     "concurrent_with": null
+    },
+    "arm": {
+     "stack": "studio",
+     "block": 1,
+     "order": "ABBA",
+     "aa_of": null,
+     "label": "s_int8_int8ks",
+     "comparison": "qwen-image-2-1_amd-gfx1151-linux",
+     "purpose": "timing",
+     "format": "int8",
+     "tier": "default"
+    }
+   },
+   "env": {
+    "UNSLOTH_ROCM_IMAGE_HOSTED_INT8": "0"
+   },
+   "model": "Qwen/Qwen-Image-2.1",
+   "variant": "int8",
+   "card": "qwen-image-2.1",
+   "venv": {
+    "profile": "studio"
+   },
+   "short_n": 0,
+   "tag": "qwen-image-2-1_amd-gfx1151-linux__s_int8_int8ks__k1p3",
+   "family": "qwen-image-2.1"
+  },
+  {
+   "backend": "studio",
+   "kind": "image",
+   "width": 1024,
+   "height": 1024,
+   "steps": 12,
+   "guidance": 1.0,
+   "prompts": "image_24",
+   "n": 1,
+   "warmup": 1,
+   "options": {
+    "transformer_quant": "int8",
+    "generate": {},
+    "speed_mode": "default",
+    "local_files_only": false,
+    "target": {
+     "name": "amd:gfx1151-linux",
+     "vm_id": "amd-gfx1151-linux-1",
+     "lane": null,
+     "account": null,
+     "simulated_budget_gib": null,
+     "concurrent_with": null
+    },
+    "arm": {
+     "stack": "studio",
+     "block": 1,
+     "order": "ABBA",
+     "aa_of": "qwen-image-2-1_amd-gfx1151-linux__s_int8_int8ks__k1p3",
+     "label": "s_int8_int8ks",
+     "comparison": "qwen-image-2-1_amd-gfx1151-linux",
+     "purpose": "timing",
+     "format": "int8",
+     "tier": "default"
+    }
+   },
+   "env": {
+    "UNSLOTH_ROCM_IMAGE_HOSTED_INT8": "0"
+   },
+   "model": "Qwen/Qwen-Image-2.1",
+   "variant": "int8",
+   "card": "qwen-image-2.1",
+   "venv": {
+    "profile": "studio"
+   },
+   "short_n": 0,
+   "tag": "qwen-image-2-1_amd-gfx1151-linux__s_int8_int8ks__k1p4",
+   "family": "qwen-image-2.1"
+  },
+  {
+   "backend": "studio",
+   "kind": "image",
+   "width": 1024,
+   "height": 1024,
+   "steps": 12,
+   "guidance": 1.0,
+   "prompts": "image_24",
+   "n": 1,
+   "warmup": 1,
+   "options": {
+    "transformer_quant": "int8",
+    "generate": {},
+    "speed_mode": "default",
+    "local_files_only": false,
+    "target": {
+     "name": "amd:gfx1151-linux",
+     "vm_id": "amd-gfx1151-linux-1",
+     "lane": null,
+     "account": null,
+     "simulated_budget_gib": null,
+     "concurrent_with": null
+    },
+    "arm": {
+     "stack": "studio",
+     "block": 1,
+     "order": "ABBA",
+     "aa_of": "qwen-image-2-1_amd-gfx1151-linux__s_int8_int8__k1p2",
+     "label": "s_int8_int8",
+     "comparison": "qwen-image-2-1_amd-gfx1151-linux",
+     "purpose": "timing",
+     "format": "int8",
+     "tier": "default"
+    }
+   },
+   "env": {},
+   "model": "Qwen/Qwen-Image-2.1",
+   "variant": "int8",
+   "card": "qwen-image-2.1",
+   "venv": {
+    "profile": "studio"
+   },
+   "short_n": 0,
+   "tag": "qwen-image-2-1_amd-gfx1151-linux__s_int8_int8__k1p5",
+   "family": "qwen-image-2.1"
+  },
+  {
+   "backend": "studio",
+   "kind": "image",
+   "width": 1024,
+   "height": 1024,
+   "steps": 12,
+   "guidance": 1.0,
+   "prompts": "image_24",
+   "n": 1,
+   "warmup": 1,
+   "options": {
+    "transformer_quant": "none",
+    "generate": {},
+    "speed_mode": "default",
+    "local_files_only": false,
+    "target": {
+     "name": "amd:gfx1151-linux",
+     "vm_id": "amd-gfx1151-linux-1",
+     "lane": null,
+     "account": null,
+     "simulated_budget_gib": null,
+     "concurrent_with": null
+    },
+    "arm": {
+     "stack": "studio",
+     "block": 1,
+     "order": "ABBA",
+     "aa_of": "qwen-image-2-1_amd-gfx1151-linux__s_int8_bf16dit__k1p1",
+     "label": "s_int8_bf16dit",
+     "comparison": "qwen-image-2-1_amd-gfx1151-linux",
+     "purpose": "timing",
+     "format": "int8",
+     "tier": "default"
+    }
+   },
+   "env": {},
+   "model": "Qwen/Qwen-Image-2.1",
+   "variant": "int8",
+   "card": "qwen-image-2.1",
+   "venv": {
+    "profile": "studio"
+   },
+   "short_n": 0,
+   "tag": "qwen-image-2-1_amd-gfx1151-linux__s_int8_bf16dit__k1p6",
+   "family": "qwen-image-2.1"
+  },
+  {
+   "backend": "studio",
+   "kind": "image",
+   "width": 1024,
+   "height": 1024,
+   "steps": 12,
+   "guidance": 1.0,
+   "prompts": "image_24",
+   "n": 1,
+   "warmup": 1,
+   "options": {
+    "transformer_quant": "auto",
+    "generate": {},
+    "speed_mode": "default",
+    "local_files_only": false,
+    "target": {
+     "name": "amd:gfx1151-linux",
+     "vm_id": "amd-gfx1151-linux-1",
+     "lane": null,
+     "account": null,
+     "simulated_budget_gib": null,
+     "concurrent_with": null
+    },
+    "arm": {
+     "stack": "studio",
+     "block": 1,
+     "order": "ABBA",
+     "aa_of": "qwen-image-2-1_amd-gfx1151-linux__s_int8_auto__k1p0",
+     "label": "s_int8_auto",
+     "comparison": "qwen-image-2-1_amd-gfx1151-linux",
+     "purpose": "timing",
+     "format": "int8",
+     "tier": "default"
+    }
+   },
+   "env": {},
+   "model": "Qwen/Qwen-Image-2.1",
+   "variant": "int8",
+   "card": "qwen-image-2.1",
+   "venv": {
+    "profile": "studio"
+   },
+   "short_n": 0,
+   "tag": "qwen-image-2-1_amd-gfx1151-linux__s_int8_auto__k1p7",
+   "family": "qwen-image-2.1"
+  },
+  {
+   "backend": "studio",
+   "kind": "image",
+   "width": 1024,
+   "height": 1024,
+   "steps": 12,
+   "guidance": 1.0,
+   "prompts": "image_24",
+   "n": 1,
+   "warmup": 1,
+   "options": {
+    "transformer_quant": "auto",
+    "generate": {},
+    "speed_mode": "default",
+    "local_files_only": false,
+    "target": {
+     "name": "amd:gfx1151-linux",
+     "vm_id": "amd-gfx1151-linux-1",
+     "lane": null,
+     "account": null,
+     "simulated_budget_gib": null,
+     "concurrent_with": null
+    },
+    "arm": {
+     "stack": "studio",
+     "block": 2,
+     "order": "ABBA",
+     "aa_of": null,
+     "label": "s_int8_auto",
+     "comparison": "qwen-image-2-1_amd-gfx1151-linux",
+     "purpose": "timing",
+     "format": "int8",
+     "tier": "default"
+    }
+   },
+   "env": {},
+   "model": "Qwen/Qwen-Image-2.1",
+   "variant": "int8",
+   "card": "qwen-image-2.1",
+   "venv": {
+    "profile": "studio"
+   },
+   "short_n": 0,
+   "tag": "qwen-image-2-1_amd-gfx1151-linux__s_int8_auto__k2p0",
+   "family": "qwen-image-2.1"
+  },
+  {
+   "backend": "studio",
+   "kind": "image",
+   "width": 1024,
+   "height": 1024,
+   "steps": 12,
+   "guidance": 1.0,
+   "prompts": "image_24",
+   "n": 1,
+   "warmup": 1,
+   "options": {
+    "transformer_quant": "none",
+    "generate": {},
+    "speed_mode": "default",
+    "local_files_only": false,
+    "target": {
+     "name": "amd:gfx1151-linux",
+     "vm_id": "amd-gfx1151-linux-1",
+     "lane": null,
+     "account": null,
+     "simulated_budget_gib": null,
+     "concurrent_with": null
+    },
+    "arm": {
+     "stack": "studio",
+     "block": 2,
+     "order": "ABBA",
+     "aa_of": null,
+     "label": "s_int8_bf16dit",
+     "comparison": "qwen-image-2-1_amd-gfx1151-linux",
+     "purpose": "timing",
+     "format": "int8",
+     "tier": "default"
+    }
+   },
+   "env": {},
+   "model": "Qwen/Qwen-Image-2.1",
+   "variant": "int8",
+   "card": "qwen-image-2.1",
+   "venv": {
+    "profile": "studio"
+   },
+   "short_n": 0,
+   "tag": "qwen-image-2-1_amd-gfx1151-linux__s_int8_bf16dit__k2p1",
+   "family": "qwen-image-2.1"
+  },
+  {
+   "backend": "studio",
+   "kind": "image",
+   "width": 1024,
+   "height": 1024,
+   "steps": 12,
+   "guidance": 1.0,
+   "prompts": "image_24",
+   "n": 1,
+   "warmup": 1,
+   "options": {
+    "transformer_quant": "int8",
+    "generate": {},
+    "speed_mode": "default",
+    "local_files_only": false,
+    "target": {
+     "name": "amd:gfx1151-linux",
+     "vm_id": "amd-gfx1151-linux-1",
+     "lane": null,
+     "account": null,
+     "simulated_budget_gib": null,
+     "concurrent_with": null
+    },
+    "arm": {
+     "stack": "studio",
+     "block": 2,
+     "order": "ABBA",
+     "aa_of": null,
+     "label": "s_int8_int8",
+     "comparison": "qwen-image-2-1_amd-gfx1151-linux",
+     "purpose": "timing",
+     "format": "int8",
+     "tier": "default"
+    }
+   },
+   "env": {},
+   "model": "Qwen/Qwen-Image-2.1",
+   "variant": "int8",
+   "card": "qwen-image-2.1",
+   "venv": {
+    "profile": "studio"
+   },
+   "short_n": 0,
+   "tag": "qwen-image-2-1_amd-gfx1151-linux__s_int8_int8__k2p2",
+   "family": "qwen-image-2.1"
+  },
+  {
+   "backend": "studio",
+   "kind": "image",
+   "width": 1024,
+   "height": 1024,
+   "steps": 12,
+   "guidance": 1.0,
+   "prompts": "image_24",
+   "n": 1,
+   "warmup": 1,
+   "options": {
+    "transformer_quant": "int8",
+    "generate": {},
+    "speed_mode": "default",
+    "local_files_only": false,
+    "target": {
+     "name": "amd:gfx1151-linux",
+     "vm_id": "amd-gfx1151-linux-1",
+     "lane": null,
+     "account": null,
+     "simulated_budget_gib": null,
+     "concurrent_with": null
+    },
+    "arm": {
+     "stack": "studio",
+     "block": 2,
+     "order": "ABBA",
+     "aa_of": null,
+     "label": "s_int8_int8ks",
+     "comparison": "qwen-image-2-1_amd-gfx1151-linux",
+     "purpose": "timing",
+     "format": "int8",
+     "tier": "default"
+    }
+   },
+   "env": {
+    "UNSLOTH_ROCM_IMAGE_HOSTED_INT8": "0"
+   },
+   "model": "Qwen/Qwen-Image-2.1",
+   "variant": "int8",
+   "card": "qwen-image-2.1",
+   "venv": {
+    "profile": "studio"
+   },
+   "short_n": 0,
+   "tag": "qwen-image-2-1_amd-gfx1151-linux__s_int8_int8ks__k2p3",
+   "family": "qwen-image-2.1"
+  },
+  {
+   "backend": "studio",
+   "kind": "image",
+   "width": 1024,
+   "height": 1024,
+   "steps": 12,
+   "guidance": 1.0,
+   "prompts": "image_24",
+   "n": 1,
+   "warmup": 1,
+   "options": {
+    "transformer_quant": "int8",
+    "generate": {},
+    "speed_mode": "default",
+    "local_files_only": false,
+    "target": {
+     "name": "amd:gfx1151-linux",
+     "vm_id": "amd-gfx1151-linux-1",
+     "lane": null,
+     "account": null,
+     "simulated_budget_gib": null,
+     "concurrent_with": null
+    },
+    "arm": {
+     "stack": "studio",
+     "block": 2,
+     "order": "ABBA",
+     "aa_of": "qwen-image-2-1_amd-gfx1151-linux__s_int8_int8ks__k2p3",
+     "label": "s_int8_int8ks",
+     "comparison": "qwen-image-2-1_amd-gfx1151-linux",
+     "purpose": "timing",
+     "format": "int8",
+     "tier": "default"
+    }
+   },
+   "env": {
+    "UNSLOTH_ROCM_IMAGE_HOSTED_INT8": "0"
+   },
+   "model": "Qwen/Qwen-Image-2.1",
+   "variant": "int8",
+   "card": "qwen-image-2.1",
+   "venv": {
+    "profile": "studio"
+   },
+   "short_n": 0,
+   "tag": "qwen-image-2-1_amd-gfx1151-linux__s_int8_int8ks__k2p4",
+   "family": "qwen-image-2.1"
+  },
+  {
+   "backend": "studio",
+   "kind": "image",
+   "width": 1024,
+   "height": 1024,
+   "steps": 12,
+   "guidance": 1.0,
+   "prompts": "image_24",
+   "n": 1,
+   "warmup": 1,
+   "options": {
+    "transformer_quant": "int8",
+    "generate": {},
+    "speed_mode": "default",
+    "local_files_only": false,
+    "target": {
+     "name": "amd:gfx1151-linux",
+     "vm_id": "amd-gfx1151-linux-1",
+     "lane": null,
+     "account": null,
+     "simulated_budget_gib": null,
+     "concurrent_with": null
+    },
+    "arm": {
+     "stack": "studio",
+     "block": 2,
+     "order": "ABBA",
+     "aa_of": "qwen-image-2-1_amd-gfx1151-linux__s_int8_int8__k2p2",
+     "label": "s_int8_int8",
+     "comparison": "qwen-image-2-1_amd-gfx1151-linux",
+     "purpose": "timing",
+     "format": "int8",
+     "tier": "default"
+    }
+   },
+   "env": {},
+   "model": "Qwen/Qwen-Image-2.1",
+   "variant": "int8",
+   "card": "qwen-image-2.1",
+   "venv": {
+    "profile": "studio"
+   },
+   "short_n": 0,
+   "tag": "qwen-image-2-1_amd-gfx1151-linux__s_int8_int8__k2p5",
+   "family": "qwen-image-2.1"
+  },
+  {
+   "backend": "studio",
+   "kind": "image",
+   "width": 1024,
+   "height": 1024,
+   "steps": 12,
+   "guidance": 1.0,
+   "prompts": "image_24",
+   "n": 1,
+   "warmup": 1,
+   "options": {
+    "transformer_quant": "none",
+    "generate": {},
+    "speed_mode": "default",
+    "local_files_only": false,
+    "target": {
+     "name": "amd:gfx1151-linux",
+     "vm_id": "amd-gfx1151-linux-1",
+     "lane": null,
+     "account": null,
+     "simulated_budget_gib": null,
+     "concurrent_with": null
+    },
+    "arm": {
+     "stack": "studio",
+     "block": 2,
+     "order": "ABBA",
+     "aa_of": "qwen-image-2-1_amd-gfx1151-linux__s_int8_bf16dit__k2p1",
+     "label": "s_int8_bf16dit",
+     "comparison": "qwen-image-2-1_amd-gfx1151-linux",
+     "purpose": "timing",
+     "format": "int8",
+     "tier": "default"
+    }
+   },
+   "env": {},
+   "model": "Qwen/Qwen-Image-2.1",
+   "variant": "int8",
+   "card": "qwen-image-2.1",
+   "venv": {
+    "profile": "studio"
+   },
+   "short_n": 0,
+   "tag": "qwen-image-2-1_amd-gfx1151-linux__s_int8_bf16dit__k2p6",
+   "family": "qwen-image-2.1"
+  },
+  {
+   "backend": "studio",
+   "kind": "image",
+   "width": 1024,
+   "height": 1024,
+   "steps": 12,
+   "guidance": 1.0,
+   "prompts": "image_24",
+   "n": 1,
+   "warmup": 1,
+   "options": {
+    "transformer_quant": "auto",
+    "generate": {},
+    "speed_mode": "default",
+    "local_files_only": false,
+    "target": {
+     "name": "amd:gfx1151-linux",
+     "vm_id": "amd-gfx1151-linux-1",
+     "lane": null,
+     "account": null,
+     "simulated_budget_gib": null,
+     "concurrent_with": null
+    },
+    "arm": {
+     "stack": "studio",
+     "block": 2,
+     "order": "ABBA",
+     "aa_of": "qwen-image-2-1_amd-gfx1151-linux__s_int8_auto__k2p0",
+     "label": "s_int8_auto",
+     "comparison": "qwen-image-2-1_amd-gfx1151-linux",
+     "purpose": "timing",
+     "format": "int8",
+     "tier": "default"
+    }
+   },
+   "env": {},
+   "model": "Qwen/Qwen-Image-2.1",
+   "variant": "int8",
+   "card": "qwen-image-2.1",
+   "venv": {
+    "profile": "studio"
+   },
+   "short_n": 0,
+   "tag": "qwen-image-2-1_amd-gfx1151-linux__s_int8_auto__k2p7",
+   "family": "qwen-image-2.1"
+  },
+  {
+   "backend": "studio",
+   "kind": "image",
+   "width": 1024,
+   "height": 1024,
+   "steps": 16,
+   "guidance": 1.0,
+   "prompts": "image_24",
+   "n": 1,
+   "warmup": 1,
+   "options": {
+    "transformer_quant": "auto",
+    "generate": {},
+    "speed_mode": "default",
+    "local_files_only": false,
+    "target": {
+     "name": "amd:gfx1151-linux",
+     "vm_id": "amd-gfx1151-linux-1",
+     "lane": null,
+     "account": null,
+     "simulated_budget_gib": null,
+     "concurrent_with": null
+    },
+    "arm": {
+     "stack": "studio",
+     "block": 1,
+     "order": "ABBA",
+     "aa_of": null,
+     "label": "s_int8_auto",
+     "comparison": "flux-3-klein_amd-gfx1151-linux",
+     "purpose": "timing",
+     "format": "int8",
+     "tier": "default"
+    }
+   },
+   "env": {},
+   "model": "unsloth/flux-3-image-klein",
+   "variant": "int8",
+   "card": "flux.3-klein",
+   "venv": {
+    "profile": "studio"
+   },
+   "short_n": 0,
+   "tag": "flux-3-klein_amd-gfx1151-linux__s_int8_auto__k1p0",
+   "family": "flux.3-klein"
+  },
+  {
+   "backend": "studio",
+   "kind": "image",
+   "width": 1024,
+   "height": 1024,
+   "steps": 16,
+   "guidance": 1.0,
+   "prompts": "image_24",
+   "n": 1,
+   "warmup": 1,
+   "options": {
+    "transformer_quant": "none",
+    "generate": {},
+    "speed_mode": "default",
+    "local_files_only": false,
+    "target": {
+     "name": "amd:gfx1151-linux",
+     "vm_id": "amd-gfx1151-linux-1",
+     "lane": null,
+     "account": null,
+     "simulated_budget_gib": null,
+     "concurrent_with": null
+    },
+    "arm": {
+     "stack": "studio",
+     "block": 1,
+     "order": "ABBA",
+     "aa_of": null,
+     "label": "s_int8_bf16dit",
+     "comparison": "flux-3-klein_amd-gfx1151-linux",
+     "purpose": "timing",
+     "format": "int8",
+     "tier": "default"
+    }
+   },
+   "env": {},
+   "model": "unsloth/flux-3-image-klein",
+   "variant": "int8",
+   "card": "flux.3-klein",
+   "venv": {
+    "profile": "studio"
+   },
+   "short_n": 0,
+   "tag": "flux-3-klein_amd-gfx1151-linux__s_int8_bf16dit__k1p1",
+   "family": "flux.3-klein"
+  },
+  {
+   "backend": "studio",
+   "kind": "image",
+   "width": 1024,
+   "height": 1024,
+   "steps": 16,
+   "guidance": 1.0,
+   "prompts": "image_24",
+   "n": 1,
+   "warmup": 1,
+   "options": {
+    "transformer_quant": "int8",
+    "generate": {},
+    "speed_mode": "default",
+    "local_files_only": false,
+    "target": {
+     "name": "amd:gfx1151-linux",
+     "vm_id": "amd-gfx1151-linux-1",
+     "lane": null,
+     "account": null,
+     "simulated_budget_gib": null,
+     "concurrent_with": null
+    },
+    "arm": {
+     "stack": "studio",
+     "block": 1,
+     "order": "ABBA",
+     "aa_of": null,
+     "label": "s_int8_int8",
+     "comparison": "flux-3-klein_amd-gfx1151-linux",
+     "purpose": "timing",
+     "format": "int8",
+     "tier": "default"
+    }
+   },
+   "env": {},
+   "model": "unsloth/flux-3-image-klein",
+   "variant": "int8",
+   "card": "flux.3-klein",
+   "venv": {
+    "profile": "studio"
+   },
+   "short_n": 0,
+   "tag": "flux-3-klein_amd-gfx1151-linux__s_int8_int8__k1p2",
+   "family": "flux.3-klein"
+  },
+  {
+   "backend": "studio",
+   "kind": "image",
+   "width": 1024,
+   "height": 1024,
+   "steps": 16,
+   "guidance": 1.0,
+   "prompts": "image_24",
+   "n": 1,
+   "warmup": 1,
+   "options": {
+    "transformer_quant": "int8",
+    "generate": {},
+    "speed_mode": "default",
+    "local_files_only": false,
+    "target": {
+     "name": "amd:gfx1151-linux",
+     "vm_id": "amd-gfx1151-linux-1",
+     "lane": null,
+     "account": null,
+     "simulated_budget_gib": null,
+     "concurrent_with": null
+    },
+    "arm": {
+     "stack": "studio",
+     "block": 1,
+     "order": "ABBA",
+     "aa_of": null,
+     "label": "s_int8_int8ks",
+     "comparison": "flux-3-klein_amd-gfx1151-linux",
+     "purpose": "timing",
+     "format": "int8",
+     "tier": "default"
+    }
+   },
+   "env": {
+    "UNSLOTH_ROCM_IMAGE_HOSTED_INT8": "0"
+   },
+   "model": "unsloth/flux-3-image-klein",
+   "variant": "int8",
+   "card": "flux.3-klein",
+   "venv": {
+    "profile": "studio"
+   },
+   "short_n": 0,
+   "tag": "flux-3-klein_amd-gfx1151-linux__s_int8_int8ks__k1p3",
+   "family": "flux.3-klein"
+  },
+  {
+   "backend": "studio",
+   "kind": "image",
+   "width": 1024,
+   "height": 1024,
+   "steps": 16,
+   "guidance": 1.0,
+   "prompts": "image_24",
+   "n": 1,
+   "warmup": 1,
+   "options": {
+    "transformer_quant": "int8",
+    "generate": {},
+    "speed_mode": "default",
+    "local_files_only": false,
+    "target": {
+     "name": "amd:gfx1151-linux",
+     "vm_id": "amd-gfx1151-linux-1",
+     "lane": null,
+     "account": null,
+     "simulated_budget_gib": null,
+     "concurrent_with": null
+    },
+    "arm": {
+     "stack": "studio",
+     "block": 1,
+     "order": "ABBA",
+     "aa_of": "flux-3-klein_amd-gfx1151-linux__s_int8_int8ks__k1p3",
+     "label": "s_int8_int8ks",
+     "comparison": "flux-3-klein_amd-gfx1151-linux",
+     "purpose": "timing",
+     "format": "int8",
+     "tier": "default"
+    }
+   },
+   "env": {
+    "UNSLOTH_ROCM_IMAGE_HOSTED_INT8": "0"
+   },
+   "model": "unsloth/flux-3-image-klein",
+   "variant": "int8",
+   "card": "flux.3-klein",
+   "venv": {
+    "profile": "studio"
+   },
+   "short_n": 0,
+   "tag": "flux-3-klein_amd-gfx1151-linux__s_int8_int8ks__k1p4",
+   "family": "flux.3-klein"
+  },
+  {
+   "backend": "studio",
+   "kind": "image",
+   "width": 1024,
+   "height": 1024,
+   "steps": 16,
+   "guidance": 1.0,
+   "prompts": "image_24",
+   "n": 1,
+   "warmup": 1,
+   "options": {
+    "transformer_quant": "int8",
+    "generate": {},
+    "speed_mode": "default",
+    "local_files_only": false,
+    "target": {
+     "name": "amd:gfx1151-linux",
+     "vm_id": "amd-gfx1151-linux-1",
+     "lane": null,
+     "account": null,
+     "simulated_budget_gib": null,
+     "concurrent_with": null
+    },
+    "arm": {
+     "stack": "studio",
+     "block": 1,
+     "order": "ABBA",
+     "aa_of": "flux-3-klein_amd-gfx1151-linux__s_int8_int8__k1p2",
+     "label": "s_int8_int8",
+     "comparison": "flux-3-klein_amd-gfx1151-linux",
+     "purpose": "timing",
+     "format": "int8",
+     "tier": "default"
+    }
+   },
+   "env": {},
+   "model": "unsloth/flux-3-image-klein",
+   "variant": "int8",
+   "card": "flux.3-klein",
+   "venv": {
+    "profile": "studio"
+   },
+   "short_n": 0,
+   "tag": "flux-3-klein_amd-gfx1151-linux__s_int8_int8__k1p5",
+   "family": "flux.3-klein"
+  },
+  {
+   "backend": "studio",
+   "kind": "image",
+   "width": 1024,
+   "height": 1024,
+   "steps": 16,
+   "guidance": 1.0,
+   "prompts": "image_24",
+   "n": 1,
+   "warmup": 1,
+   "options": {
+    "transformer_quant": "none",
+    "generate": {},
+    "speed_mode": "default",
+    "local_files_only": false,
+    "target": {
+     "name": "amd:gfx1151-linux",
+     "vm_id": "amd-gfx1151-linux-1",
+     "lane": null,
+     "account": null,
+     "simulated_budget_gib": null,
+     "concurrent_with": null
+    },
+    "arm": {
+     "stack": "studio",
+     "block": 1,
+     "order": "ABBA",
+     "aa_of": "flux-3-klein_amd-gfx1151-linux__s_int8_bf16dit__k1p1",
+     "label": "s_int8_bf16dit",
+     "comparison": "flux-3-klein_amd-gfx1151-linux",
+     "purpose": "timing",
+     "format": "int8",
+     "tier": "default"
+    }
+   },
+   "env": {},
+   "model": "unsloth/flux-3-image-klein",
+   "variant": "int8",
+   "card": "flux.3-klein",
+   "venv": {
+    "profile": "studio"
+   },
+   "short_n": 0,
+   "tag": "flux-3-klein_amd-gfx1151-linux__s_int8_bf16dit__k1p6",
+   "family": "flux.3-klein"
+  },
+  {
+   "backend": "studio",
+   "kind": "image",
+   "width": 1024,
+   "height": 1024,
+   "steps": 16,
+   "guidance": 1.0,
+   "prompts": "image_24",
+   "n": 1,
+   "warmup": 1,
+   "options": {
+    "transformer_quant": "auto",
+    "generate": {},
+    "speed_mode": "default",
+    "local_files_only": false,
+    "target": {
+     "name": "amd:gfx1151-linux",
+     "vm_id": "amd-gfx1151-linux-1",
+     "lane": null,
+     "account": null,
+     "simulated_budget_gib": null,
+     "concurrent_with": null
+    },
+    "arm": {
+     "stack": "studio",
+     "block": 1,
+     "order": "ABBA",
+     "aa_of": "flux-3-klein_amd-gfx1151-linux__s_int8_auto__k1p0",
+     "label": "s_int8_auto",
+     "comparison": "flux-3-klein_amd-gfx1151-linux",
+     "purpose": "timing",
+     "format": "int8",
+     "tier": "default"
+    }
+   },
+   "env": {},
+   "model": "unsloth/flux-3-image-klein",
+   "variant": "int8",
+   "card": "flux.3-klein",
+   "venv": {
+    "profile": "studio"
+   },
+   "short_n": 0,
+   "tag": "flux-3-klein_amd-gfx1151-linux__s_int8_auto__k1p7",
+   "family": "flux.3-klein"
+  },
+  {
+   "backend": "studio",
+   "kind": "image",
+   "width": 1024,
+   "height": 1024,
+   "steps": 16,
+   "guidance": 1.0,
+   "prompts": "image_24",
+   "n": 1,
+   "warmup": 1,
+   "options": {
+    "transformer_quant": "auto",
+    "generate": {},
+    "speed_mode": "default",
+    "local_files_only": false,
+    "target": {
+     "name": "amd:gfx1151-linux",
+     "vm_id": "amd-gfx1151-linux-1",
+     "lane": null,
+     "account": null,
+     "simulated_budget_gib": null,
+     "concurrent_with": null
+    },
+    "arm": {
+     "stack": "studio",
+     "block": 2,
+     "order": "ABBA",
+     "aa_of": null,
+     "label": "s_int8_auto",
+     "comparison": "flux-3-klein_amd-gfx1151-linux",
+     "purpose": "timing",
+     "format": "int8",
+     "tier": "default"
+    }
+   },
+   "env": {},
+   "model": "unsloth/flux-3-image-klein",
+   "variant": "int8",
+   "card": "flux.3-klein",
+   "venv": {
+    "profile": "studio"
+   },
+   "short_n": 0,
+   "tag": "flux-3-klein_amd-gfx1151-linux__s_int8_auto__k2p0",
+   "family": "flux.3-klein"
+  },
+  {
+   "backend": "studio",
+   "kind": "image",
+   "width": 1024,
+   "height": 1024,
+   "steps": 16,
+   "guidance": 1.0,
+   "prompts": "image_24",
+   "n": 1,
+   "warmup": 1,
+   "options": {
+    "transformer_quant": "none",
+    "generate": {},
+    "speed_mode": "default",
+    "local_files_only": false,
+    "target": {
+     "name": "amd:gfx1151-linux",
+     "vm_id": "amd-gfx1151-linux-1",
+     "lane": null,
+     "account": null,
+     "simulated_budget_gib": null,
+     "concurrent_with": null
+    },
+    "arm": {
+     "stack": "studio",
+     "block": 2,
+     "order": "ABBA",
+     "aa_of": null,
+     "label": "s_int8_bf16dit",
+     "comparison": "flux-3-klein_amd-gfx1151-linux",
+     "purpose": "timing",
+     "format": "int8",
+     "tier": "default"
+    }
+   },
+   "env": {},
+   "model": "unsloth/flux-3-image-klein",
+   "variant": "int8",
+   "card": "flux.3-klein",
+   "venv": {
+    "profile": "studio"
+   },
+   "short_n": 0,
+   "tag": "flux-3-klein_amd-gfx1151-linux__s_int8_bf16dit__k2p1",
+   "family": "flux.3-klein"
+  },
+  {
+   "backend": "studio",
+   "kind": "image",
+   "width": 1024,
+   "height": 1024,
+   "steps": 16,
+   "guidance": 1.0,
+   "prompts": "image_24",
+   "n": 1,
+   "warmup": 1,
+   "options": {
+    "transformer_quant": "int8",
+    "generate": {},
+    "speed_mode": "default",
+    "local_files_only": false,
+    "target": {
+     "name": "amd:gfx1151-linux",
+     "vm_id": "amd-gfx1151-linux-1",
+     "lane": null,
+     "account": null,
+     "simulated_budget_gib": null,
+     "concurrent_with": null
+    },
+    "arm": {
+     "stack": "studio",
+     "block": 2,
+     "order": "ABBA",
+     "aa_of": null,
+     "label": "s_int8_int8",
+     "comparison": "flux-3-klein_amd-gfx1151-linux",
+     "purpose": "timing",
+     "format": "int8",
+     "tier": "default"
+    }
+   },
+   "env": {},
+   "model": "unsloth/flux-3-image-klein",
+   "variant": "int8",
+   "card": "flux.3-klein",
+   "venv": {
+    "profile": "studio"
+   },
+   "short_n": 0,
+   "tag": "flux-3-klein_amd-gfx1151-linux__s_int8_int8__k2p2",
+   "family": "flux.3-klein"
+  },
+  {
+   "backend": "studio",
+   "kind": "image",
+   "width": 1024,
+   "height": 1024,
+   "steps": 16,
+   "guidance": 1.0,
+   "prompts": "image_24",
+   "n": 1,
+   "warmup": 1,
+   "options": {
+    "transformer_quant": "int8",
+    "generate": {},
+    "speed_mode": "default",
+    "local_files_only": false,
+    "target": {
+     "name": "amd:gfx1151-linux",
+     "vm_id": "amd-gfx1151-linux-1",
+     "lane": null,
+     "account": null,
+     "simulated_budget_gib": null,
+     "concurrent_with": null
+    },
+    "arm": {
+     "stack": "studio",
+     "block": 2,
+     "order": "ABBA",
+     "aa_of": null,
+     "label": "s_int8_int8ks",
+     "comparison": "flux-3-klein_amd-gfx1151-linux",
+     "purpose": "timing",
+     "format": "int8",
+     "tier": "default"
+    }
+   },
+   "env": {
+    "UNSLOTH_ROCM_IMAGE_HOSTED_INT8": "0"
+   },
+   "model": "unsloth/flux-3-image-klein",
+   "variant": "int8",
+   "card": "flux.3-klein",
+   "venv": {
+    "profile": "studio"
+   },
+   "short_n": 0,
+   "tag": "flux-3-klein_amd-gfx1151-linux__s_int8_int8ks__k2p3",
+   "family": "flux.3-klein"
+  },
+  {
+   "backend": "studio",
+   "kind": "image",
+   "width": 1024,
+   "height": 1024,
+   "steps": 16,
+   "guidance": 1.0,
+   "prompts": "image_24",
+   "n": 1,
+   "warmup": 1,
+   "options": {
+    "transformer_quant": "int8",
+    "generate": {},
+    "speed_mode": "default",
+    "local_files_only": false,
+    "target": {
+     "name": "amd:gfx1151-linux",
+     "vm_id": "amd-gfx1151-linux-1",
+     "lane": null,
+     "account": null,
+     "simulated_budget_gib": null,
+     "concurrent_with": null
+    },
+    "arm": {
+     "stack": "studio",
+     "block": 2,
+     "order": "ABBA",
+     "aa_of": "flux-3-klein_amd-gfx1151-linux__s_int8_int8ks__k2p3",
+     "label": "s_int8_int8ks",
+     "comparison": "flux-3-klein_amd-gfx1151-linux",
+     "purpose": "timing",
+     "format": "int8",
+     "tier": "default"
+    }
+   },
+   "env": {
+    "UNSLOTH_ROCM_IMAGE_HOSTED_INT8": "0"
+   },
+   "model": "unsloth/flux-3-image-klein",
+   "variant": "int8",
+   "card": "flux.3-klein",
+   "venv": {
+    "profile": "studio"
+   },
+   "short_n": 0,
+   "tag": "flux-3-klein_amd-gfx1151-linux__s_int8_int8ks__k2p4",
+   "family": "flux.3-klein"
+  },
+  {
+   "backend": "studio",
+   "kind": "image",
+   "width": 1024,
+   "height": 1024,
+   "steps": 16,
+   "guidance": 1.0,
+   "prompts": "image_24",
+   "n": 1,
+   "warmup": 1,
+   "options": {
+    "transformer_quant": "int8",
+    "generate": {},
+    "speed_mode": "default",
+    "local_files_only": false,
+    "target": {
+     "name": "amd:gfx1151-linux",
+     "vm_id": "amd-gfx1151-linux-1",
+     "lane": null,
+     "account": null,
+     "simulated_budget_gib": null,
+     "concurrent_with": null
+    },
+    "arm": {
+     "stack": "studio",
+     "block": 2,
+     "order": "ABBA",
+     "aa_of": "flux-3-klein_amd-gfx1151-linux__s_int8_int8__k2p2",
+     "label": "s_int8_int8",
+     "comparison": "flux-3-klein_amd-gfx1151-linux",
+     "purpose": "timing",
+     "format": "int8",
+     "tier": "default"
+    }
+   },
+   "env": {},
+   "model": "unsloth/flux-3-image-klein",
+   "variant": "int8",
+   "card": "flux.3-klein",
+   "venv": {
+    "profile": "studio"
+   },
+   "short_n": 0,
+   "tag": "flux-3-klein_amd-gfx1151-linux__s_int8_int8__k2p5",
+   "family": "flux.3-klein"
+  },
+  {
+   "backend": "studio",
+   "kind": "image",
+   "width": 1024,
+   "height": 1024,
+   "steps": 16,
+   "guidance": 1.0,
+   "prompts": "image_24",
+   "n": 1,
+   "warmup": 1,
+   "options": {
+    "transformer_quant": "none",
+    "generate": {},
+    "speed_mode": "default",
+    "local_files_only": false,
+    "target": {
+     "name": "amd:gfx1151-linux",
+     "vm_id": "amd-gfx1151-linux-1",
+     "lane": null,
+     "account": null,
+     "simulated_budget_gib": null,
+     "concurrent_with": null
+    },
+    "arm": {
+     "stack": "studio",
+     "block": 2,
+     "order": "ABBA",
+     "aa_of": "flux-3-klein_amd-gfx1151-linux__s_int8_bf16dit__k2p1",
+     "label": "s_int8_bf16dit",
+     "comparison": "flux-3-klein_amd-gfx1151-linux",
+     "purpose": "timing",
+     "format": "int8",
+     "tier": "default"
+    }
+   },
+   "env": {},
+   "model": "unsloth/flux-3-image-klein",
+   "variant": "int8",
+   "card": "flux.3-klein",
+   "venv": {
+    "profile": "studio"
+   },
+   "short_n": 0,
+   "tag": "flux-3-klein_amd-gfx1151-linux__s_int8_bf16dit__k2p6",
+   "family": "flux.3-klein"
+  },
+  {
+   "backend": "studio",
+   "kind": "image",
+   "width": 1024,
+   "height": 1024,
+   "steps": 16,
+   "guidance": 1.0,
+   "prompts": "image_24",
+   "n": 1,
+   "warmup": 1,
+   "options": {
+    "transformer_quant": "auto",
+    "generate": {},
+    "speed_mode": "default",
+    "local_files_only": false,
+    "target": {
+     "name": "amd:gfx1151-linux",
+     "vm_id": "amd-gfx1151-linux-1",
+     "lane": null,
+     "account": null,
+     "simulated_budget_gib": null,
+     "concurrent_with": null
+    },
+    "arm": {
+     "stack": "studio",
+     "block": 2,
+     "order": "ABBA",
+     "aa_of": "flux-3-klein_amd-gfx1151-linux__s_int8_auto__k2p0",
+     "label": "s_int8_auto",
+     "comparison": "flux-3-klein_amd-gfx1151-linux",
+     "purpose": "timing",
+     "format": "int8",
+     "tier": "default"
+    }
+   },
+   "env": {},
+   "model": "unsloth/flux-3-image-klein",
+   "variant": "int8",
+   "card": "flux.3-klein",
+   "venv": {
+    "profile": "studio"
+   },
+   "short_n": 0,
+   "tag": "flux-3-klein_amd-gfx1151-linux__s_int8_auto__k2p7",
+   "family": "flux.3-klein"
+  },
+  {
+   "backend": "studio",
+   "kind": "image",
+   "width": 1024,
+   "height": 1024,
+   "steps": 8,
+   "guidance": 0.0,
+   "prompts": "image_24",
+   "n": 1,
+   "warmup": 1,
+   "options": {
+    "transformer_quant": "none",
+    "text_encoder_quant": "none",
+    "generate": {},
+    "speed_mode": "default",
+    "local_files_only": false,
+    "target": {
+     "name": "amd:gfx1151-linux",
+     "vm_id": "amd-gfx1151-linux-1",
+     "lane": null,
+     "account": null,
+     "simulated_budget_gib": null,
+     "concurrent_with": null
+    },
+    "arm": {
+     "stack": "studio",
+     "block": 1,
+     "order": "ABBA",
+     "aa_of": null,
+     "label": "s_bf16_bf16",
+     "comparison": "z-image-turbo_amd-gfx1151-linux",
+     "purpose": "timing",
+     "format": "bf16",
+     "tier": "default"
+    }
+   },
+   "env": {},
+   "model": "Tongyi-MAI/Z-Image-Turbo",
+   "variant": "bf16",
+   "card": "z-image-turbo",
+   "venv": {
+    "profile": "studio"
+   },
+   "short_n": 0,
+   "tag": "z-image-turbo_amd-gfx1151-linux__s_bf16_bf16__k1p0",
+   "family": "z-image-turbo"
+  },
+  {
+   "backend": "studio",
+   "kind": "image",
+   "width": 1024,
+   "height": 1024,
+   "steps": 8,
+   "guidance": 0.0,
+   "prompts": "image_24",
+   "n": 1,
+   "warmup": 1,
+   "options": {
+    "transformer_quant": "int8",
+    "generate": {},
+    "speed_mode": "default",
+    "local_files_only": false,
+    "target": {
+     "name": "amd:gfx1151-linux",
+     "vm_id": "amd-gfx1151-linux-1",
+     "lane": null,
+     "account": null,
+     "simulated_budget_gib": null,
+     "concurrent_with": null
+    },
+    "arm": {
+     "stack": "studio",
+     "block": 1,
+     "order": "ABBA",
+     "aa_of": null,
+     "label": "s_int8_int8",
+     "comparison": "z-image-turbo_amd-gfx1151-linux",
+     "purpose": "timing",
+     "format": "int8",
+     "tier": "default"
+    }
+   },
+   "env": {},
+   "model": "Tongyi-MAI/Z-Image-Turbo",
+   "variant": "int8",
+   "card": "z-image-turbo",
+   "venv": {
+    "profile": "studio"
+   },
+   "short_n": 0,
+   "tag": "z-image-turbo_amd-gfx1151-linux__s_int8_int8__k1p1",
+   "family": "z-image-turbo"
+  },
+  {
+   "backend": "studio",
+   "kind": "image",
+   "width": 1024,
+   "height": 1024,
+   "steps": 8,
+   "guidance": 0.0,
+   "prompts": "image_24",
+   "n": 1,
+   "warmup": 1,
+   "options": {
+    "transformer_quant": "int8",
+    "generate": {},
+    "speed_mode": "default",
+    "local_files_only": false,
+    "target": {
+     "name": "amd:gfx1151-linux",
+     "vm_id": "amd-gfx1151-linux-1",
+     "lane": null,
+     "account": null,
+     "simulated_budget_gib": null,
+     "concurrent_with": null
+    },
+    "arm": {
+     "stack": "studio",
+     "block": 1,
+     "order": "ABBA",
+     "aa_of": null,
+     "label": "s_int8_int8act",
+     "comparison": "z-image-turbo_amd-gfx1151-linux",
+     "purpose": "timing",
+     "format": "int8",
+     "tier": "default"
+    }
+   },
+   "env": {
+    "UNSLOTH_NATIVE_INT8_ACT": "1"
+   },
+   "model": "Tongyi-MAI/Z-Image-Turbo",
+   "variant": "int8",
+   "card": "z-image-turbo",
+   "venv": {
+    "profile": "studio"
+   },
+   "short_n": 0,
+   "tag": "z-image-turbo_amd-gfx1151-linux__s_int8_int8act__k1p2",
+   "family": "z-image-turbo"
+  },
+  {
+   "backend": "studio",
+   "kind": "image",
+   "width": 1024,
+   "height": 1024,
+   "steps": 8,
+   "guidance": 0.0,
+   "prompts": "image_24",
+   "n": 1,
+   "warmup": 1,
+   "options": {
+    "transformer_quant": "int8",
+    "generate": {},
+    "speed_mode": "default",
+    "local_files_only": false,
+    "target": {
+     "name": "amd:gfx1151-linux",
+     "vm_id": "amd-gfx1151-linux-1",
+     "lane": null,
+     "account": null,
+     "simulated_budget_gib": null,
+     "concurrent_with": null
+    },
+    "arm": {
+     "stack": "studio",
+     "block": 1,
+     "order": "ABBA",
+     "aa_of": "z-image-turbo_amd-gfx1151-linux__s_int8_int8act__k1p2",
+     "label": "s_int8_int8act",
+     "comparison": "z-image-turbo_amd-gfx1151-linux",
+     "purpose": "timing",
+     "format": "int8",
+     "tier": "default"
+    }
+   },
+   "env": {
+    "UNSLOTH_NATIVE_INT8_ACT": "1"
+   },
+   "model": "Tongyi-MAI/Z-Image-Turbo",
+   "variant": "int8",
+   "card": "z-image-turbo",
+   "venv": {
+    "profile": "studio"
+   },
+   "short_n": 0,
+   "tag": "z-image-turbo_amd-gfx1151-linux__s_int8_int8act__k1p3",
+   "family": "z-image-turbo"
+  },
+  {
+   "backend": "studio",
+   "kind": "image",
+   "width": 1024,
+   "height": 1024,
+   "steps": 8,
+   "guidance": 0.0,
+   "prompts": "image_24",
+   "n": 1,
+   "warmup": 1,
+   "options": {
+    "transformer_quant": "int8",
+    "generate": {},
+    "speed_mode": "default",
+    "local_files_only": false,
+    "target": {
+     "name": "amd:gfx1151-linux",
+     "vm_id": "amd-gfx1151-linux-1",
+     "lane": null,
+     "account": null,
+     "simulated_budget_gib": null,
+     "concurrent_with": null
+    },
+    "arm": {
+     "stack": "studio",
+     "block": 1,
+     "order": "ABBA",
+     "aa_of": "z-image-turbo_amd-gfx1151-linux__s_int8_int8__k1p1",
+     "label": "s_int8_int8",
+     "comparison": "z-image-turbo_amd-gfx1151-linux",
+     "purpose": "timing",
+     "format": "int8",
+     "tier": "default"
+    }
+   },
+   "env": {},
+   "model": "Tongyi-MAI/Z-Image-Turbo",
+   "variant": "int8",
+   "card": "z-image-turbo",
+   "venv": {
+    "profile": "studio"
+   },
+   "short_n": 0,
+   "tag": "z-image-turbo_amd-gfx1151-linux__s_int8_int8__k1p4",
+   "family": "z-image-turbo"
+  },
+  {
+   "backend": "studio",
+   "kind": "image",
+   "width": 1024,
+   "height": 1024,
+   "steps": 8,
+   "guidance": 0.0,
+   "prompts": "image_24",
+   "n": 1,
+   "warmup": 1,
+   "options": {
+    "transformer_quant": "none",
+    "text_encoder_quant": "none",
+    "generate": {},
+    "speed_mode": "default",
+    "local_files_only": false,
+    "target": {
+     "name": "amd:gfx1151-linux",
+     "vm_id": "amd-gfx1151-linux-1",
+     "lane": null,
+     "account": null,
+     "simulated_budget_gib": null,
+     "concurrent_with": null
+    },
+    "arm": {
+     "stack": "studio",
+     "block": 1,
+     "order": "ABBA",
+     "aa_of": "z-image-turbo_amd-gfx1151-linux__s_bf16_bf16__k1p0",
+     "label": "s_bf16_bf16",
+     "comparison": "z-image-turbo_amd-gfx1151-linux",
+     "purpose": "timing",
+     "format": "bf16",
+     "tier": "default"
+    }
+   },
+   "env": {},
+   "model": "Tongyi-MAI/Z-Image-Turbo",
+   "variant": "bf16",
+   "card": "z-image-turbo",
+   "venv": {
+    "profile": "studio"
+   },
+   "short_n": 0,
+   "tag": "z-image-turbo_amd-gfx1151-linux__s_bf16_bf16__k1p5",
+   "family": "z-image-turbo"
+  },
+  {
+   "backend": "studio",
+   "kind": "image",
+   "width": 1024,
+   "height": 1024,
+   "steps": 8,
+   "guidance": 0.0,
+   "prompts": "image_24",
+   "n": 1,
+   "warmup": 1,
+   "options": {
+    "transformer_quant": "none",
+    "text_encoder_quant": "none",
+    "generate": {},
+    "speed_mode": "default",
+    "local_files_only": false,
+    "target": {
+     "name": "amd:gfx1151-linux",
+     "vm_id": "amd-gfx1151-linux-1",
+     "lane": null,
+     "account": null,
+     "simulated_budget_gib": null,
+     "concurrent_with": null
+    },
+    "arm": {
+     "stack": "studio",
+     "block": 2,
+     "order": "ABBA",
+     "aa_of": null,
+     "label": "s_bf16_bf16",
+     "comparison": "z-image-turbo_amd-gfx1151-linux",
+     "purpose": "timing",
+     "format": "bf16",
+     "tier": "default"
+    }
+   },
+   "env": {},
+   "model": "Tongyi-MAI/Z-Image-Turbo",
+   "variant": "bf16",
+   "card": "z-image-turbo",
+   "venv": {
+    "profile": "studio"
+   },
+   "short_n": 0,
+   "tag": "z-image-turbo_amd-gfx1151-linux__s_bf16_bf16__k2p0",
+   "family": "z-image-turbo"
+  },
+  {
+   "backend": "studio",
+   "kind": "image",
+   "width": 1024,
+   "height": 1024,
+   "steps": 8,
+   "guidance": 0.0,
+   "prompts": "image_24",
+   "n": 1,
+   "warmup": 1,
+   "options": {
+    "transformer_quant": "int8",
+    "generate": {},
+    "speed_mode": "default",
+    "local_files_only": false,
+    "target": {
+     "name": "amd:gfx1151-linux",
+     "vm_id": "amd-gfx1151-linux-1",
+     "lane": null,
+     "account": null,
+     "simulated_budget_gib": null,
+     "concurrent_with": null
+    },
+    "arm": {
+     "stack": "studio",
+     "block": 2,
+     "order": "ABBA",
+     "aa_of": null,
+     "label": "s_int8_int8",
+     "comparison": "z-image-turbo_amd-gfx1151-linux",
+     "purpose": "timing",
+     "format": "int8",
+     "tier": "default"
+    }
+   },
+   "env": {},
+   "model": "Tongyi-MAI/Z-Image-Turbo",
+   "variant": "int8",
+   "card": "z-image-turbo",
+   "venv": {
+    "profile": "studio"
+   },
+   "short_n": 0,
+   "tag": "z-image-turbo_amd-gfx1151-linux__s_int8_int8__k2p1",
+   "family": "z-image-turbo"
+  },
+  {
+   "backend": "studio",
+   "kind": "image",
+   "width": 1024,
+   "height": 1024,
+   "steps": 8,
+   "guidance": 0.0,
+   "prompts": "image_24",
+   "n": 1,
+   "warmup": 1,
+   "options": {
+    "transformer_quant": "int8",
+    "generate": {},
+    "speed_mode": "default",
+    "local_files_only": false,
+    "target": {
+     "name": "amd:gfx1151-linux",
+     "vm_id": "amd-gfx1151-linux-1",
+     "lane": null,
+     "account": null,
+     "simulated_budget_gib": null,
+     "concurrent_with": null
+    },
+    "arm": {
+     "stack": "studio",
+     "block": 2,
+     "order": "ABBA",
+     "aa_of": null,
+     "label": "s_int8_int8act",
+     "comparison": "z-image-turbo_amd-gfx1151-linux",
+     "purpose": "timing",
+     "format": "int8",
+     "tier": "default"
+    }
+   },
+   "env": {
+    "UNSLOTH_NATIVE_INT8_ACT": "1"
+   },
+   "model": "Tongyi-MAI/Z-Image-Turbo",
+   "variant": "int8",
+   "card": "z-image-turbo",
+   "venv": {
+    "profile": "studio"
+   },
+   "short_n": 0,
+   "tag": "z-image-turbo_amd-gfx1151-linux__s_int8_int8act__k2p2",
+   "family": "z-image-turbo"
+  },
+  {
+   "backend": "studio",
+   "kind": "image",
+   "width": 1024,
+   "height": 1024,
+   "steps": 8,
+   "guidance": 0.0,
+   "prompts": "image_24",
+   "n": 1,
+   "warmup": 1,
+   "options": {
+    "transformer_quant": "int8",
+    "generate": {},
+    "speed_mode": "default",
+    "local_files_only": false,
+    "target": {
+     "name": "amd:gfx1151-linux",
+     "vm_id": "amd-gfx1151-linux-1",
+     "lane": null,
+     "account": null,
+     "simulated_budget_gib": null,
+     "concurrent_with": null
+    },
+    "arm": {
+     "stack": "studio",
+     "block": 2,
+     "order": "ABBA",
+     "aa_of": "z-image-turbo_amd-gfx1151-linux__s_int8_int8act__k2p2",
+     "label": "s_int8_int8act",
+     "comparison": "z-image-turbo_amd-gfx1151-linux",
+     "purpose": "timing",
+     "format": "int8",
+     "tier": "default"
+    }
+   },
+   "env": {
+    "UNSLOTH_NATIVE_INT8_ACT": "1"
+   },
+   "model": "Tongyi-MAI/Z-Image-Turbo",
+   "variant": "int8",
+   "card": "z-image-turbo",
+   "venv": {
+    "profile": "studio"
+   },
+   "short_n": 0,
+   "tag": "z-image-turbo_amd-gfx1151-linux__s_int8_int8act__k2p3",
+   "family": "z-image-turbo"
+  },
+  {
+   "backend": "studio",
+   "kind": "image",
+   "width": 1024,
+   "height": 1024,
+   "steps": 8,
+   "guidance": 0.0,
+   "prompts": "image_24",
+   "n": 1,
+   "warmup": 1,
+   "options": {
+    "transformer_quant": "int8",
+    "generate": {},
+    "speed_mode": "default",
+    "local_files_only": false,
+    "target": {
+     "name": "amd:gfx1151-linux",
+     "vm_id": "amd-gfx1151-linux-1",
+     "lane": null,
+     "account": null,
+     "simulated_budget_gib": null,
+     "concurrent_with": null
+    },
+    "arm": {
+     "stack": "studio",
+     "block": 2,
+     "order": "ABBA",
+     "aa_of": "z-image-turbo_amd-gfx1151-linux__s_int8_int8__k2p1",
+     "label": "s_int8_int8",
+     "comparison": "z-image-turbo_amd-gfx1151-linux",
+     "purpose": "timing",
+     "format": "int8",
+     "tier": "default"
+    }
+   },
+   "env": {},
+   "model": "Tongyi-MAI/Z-Image-Turbo",
+   "variant": "int8",
+   "card": "z-image-turbo",
+   "venv": {
+    "profile": "studio"
+   },
+   "short_n": 0,
+   "tag": "z-image-turbo_amd-gfx1151-linux__s_int8_int8__k2p4",
+   "family": "z-image-turbo"
+  },
+  {
+   "backend": "studio",
+   "kind": "image",
+   "width": 1024,
+   "height": 1024,
+   "steps": 8,
+   "guidance": 0.0,
+   "prompts": "image_24",
+   "n": 1,
+   "warmup": 1,
+   "options": {
+    "transformer_quant": "none",
+    "text_encoder_quant": "none",
+    "generate": {},
+    "speed_mode": "default",
+    "local_files_only": false,
+    "target": {
+     "name": "amd:gfx1151-linux",
+     "vm_id": "amd-gfx1151-linux-1",
+     "lane": null,
+     "account": null,
+     "simulated_budget_gib": null,
+     "concurrent_with": null
+    },
+    "arm": {
+     "stack": "studio",
+     "block": 2,
+     "order": "ABBA",
+     "aa_of": "z-image-turbo_amd-gfx1151-linux__s_bf16_bf16__k2p0",
+     "label": "s_bf16_bf16",
+     "comparison": "z-image-turbo_amd-gfx1151-linux",
+     "purpose": "timing",
+     "format": "bf16",
+     "tier": "default"
+    }
+   },
+   "env": {},
+   "model": "Tongyi-MAI/Z-Image-Turbo",
+   "variant": "bf16",
+   "card": "z-image-turbo",
+   "venv": {
+    "profile": "studio"
+   },
+   "short_n": 0,
+   "tag": "z-image-turbo_amd-gfx1151-linux__s_bf16_bf16__k2p5",
+   "family": "z-image-turbo"
+  }
+ ],
+ "plan_vm": {
+  "vm_id": "amd-gfx1151-linux-1",
+  "target": "amd:gfx1151-linux",
+  "purpose": "timing"
+ },
+ "downloads": {},
+ "prefetch": {
+  "unsloth/flux-3-image-klein:*": {
+   "repo": "unsloth/flux-3-image-klein",
+   "file": null
+  },
+  "Qwen/Qwen-Image-2.1:*": {
+   "repo": "Qwen/Qwen-Image-2.1",
+   "file": null
+  },
+  "Tongyi-MAI/Z-Image-Turbo:*": {
+   "repo": "Tongyi-MAI/Z-Image-Turbo",
+   "file": null
+  }
+ },
+ "comparisons": [
+  {
+   "id": "flux-3-klein_amd-gfx1151-linux",
+   "family": "flux.3-klein",
+   "target": "amd:gfx1151-linux",
+   "budget_gib": null,
+   "purpose": "timing",
+   "arms": [
+    "s_int8_auto",
+    "s_int8_bf16dit",
+    "s_int8_int8",
+    "s_int8_int8ks"
+   ],
+   "runs": {
+    "s_int8_auto": [
+     "flux-3-klein_amd-gfx1151-linux__s_int8_auto__k1p0",
+     "flux-3-klein_amd-gfx1151-linux__s_int8_auto__k1p7",
+     "flux-3-klein_amd-gfx1151-linux__s_int8_auto__k2p0",
+     "flux-3-klein_amd-gfx1151-linux__s_int8_auto__k2p7"
+    ],
+    "s_int8_bf16dit": [
+     "flux-3-klein_amd-gfx1151-linux__s_int8_bf16dit__k1p1",
+     "flux-3-klein_amd-gfx1151-linux__s_int8_bf16dit__k1p6",
+     "flux-3-klein_amd-gfx1151-linux__s_int8_bf16dit__k2p1",
+     "flux-3-klein_amd-gfx1151-linux__s_int8_bf16dit__k2p6"
+    ],
+    "s_int8_int8": [
+     "flux-3-klein_amd-gfx1151-linux__s_int8_int8__k1p2",
+     "flux-3-klein_amd-gfx1151-linux__s_int8_int8__k1p5",
+     "flux-3-klein_amd-gfx1151-linux__s_int8_int8__k2p2",
+     "flux-3-klein_amd-gfx1151-linux__s_int8_int8__k2p5"
+    ],
+    "s_int8_int8ks": [
+     "flux-3-klein_amd-gfx1151-linux__s_int8_int8ks__k1p3",
+     "flux-3-klein_amd-gfx1151-linux__s_int8_int8ks__k1p4",
+     "flux-3-klein_amd-gfx1151-linux__s_int8_int8ks__k2p3",
+     "flux-3-klein_amd-gfx1151-linux__s_int8_int8ks__k2p4"
+    ]
+   },
+   "order": [
+    "flux-3-klein_amd-gfx1151-linux__s_int8_auto__k1p0",
+    "flux-3-klein_amd-gfx1151-linux__s_int8_bf16dit__k1p1",
+    "flux-3-klein_amd-gfx1151-linux__s_int8_int8__k1p2",
+    "flux-3-klein_amd-gfx1151-linux__s_int8_int8ks__k1p3",
+    "flux-3-klein_amd-gfx1151-linux__s_int8_int8ks__k1p4",
+    "flux-3-klein_amd-gfx1151-linux__s_int8_int8__k1p5",
+    "flux-3-klein_amd-gfx1151-linux__s_int8_bf16dit__k1p6",
+    "flux-3-klein_amd-gfx1151-linux__s_int8_auto__k1p7",
+    "flux-3-klein_amd-gfx1151-linux__s_int8_auto__k2p0",
+    "flux-3-klein_amd-gfx1151-linux__s_int8_bf16dit__k2p1",
+    "flux-3-klein_amd-gfx1151-linux__s_int8_int8__k2p2",
+    "flux-3-klein_amd-gfx1151-linux__s_int8_int8ks__k2p3",
+    "flux-3-klein_amd-gfx1151-linux__s_int8_int8ks__k2p4",
+    "flux-3-klein_amd-gfx1151-linux__s_int8_int8__k2p5",
+    "flux-3-klein_amd-gfx1151-linux__s_int8_bf16dit__k2p6",
+    "flux-3-klein_amd-gfx1151-linux__s_int8_auto__k2p7"
+   ],
+   "aa_pairs": [
+    [
+     "flux-3-klein_amd-gfx1151-linux__s_int8_int8ks__k1p3",
+     "flux-3-klein_amd-gfx1151-linux__s_int8_int8ks__k1p4"
+    ],
+    [
+     "flux-3-klein_amd-gfx1151-linux__s_int8_int8__k1p2",
+     "flux-3-klein_amd-gfx1151-linux__s_int8_int8__k1p5"
+    ],
+    [
+     "flux-3-klein_amd-gfx1151-linux__s_int8_bf16dit__k1p1",
+     "flux-3-klein_amd-gfx1151-linux__s_int8_bf16dit__k1p6"
+    ],
+    [
+     "flux-3-klein_amd-gfx1151-linux__s_int8_auto__k1p0",
+     "flux-3-klein_amd-gfx1151-linux__s_int8_auto__k1p7"
+    ],
+    [
+     "flux-3-klein_amd-gfx1151-linux__s_int8_int8ks__k2p3",
+     "flux-3-klein_amd-gfx1151-linux__s_int8_int8ks__k2p4"
+    ],
+    [
+     "flux-3-klein_amd-gfx1151-linux__s_int8_int8__k2p2",
+     "flux-3-klein_amd-gfx1151-linux__s_int8_int8__k2p5"
+    ],
+    [
+     "flux-3-klein_amd-gfx1151-linux__s_int8_bf16dit__k2p1",
+     "flux-3-klein_amd-gfx1151-linux__s_int8_bf16dit__k2p6"
+    ],
+    [
+     "flux-3-klein_amd-gfx1151-linux__s_int8_auto__k2p0",
+     "flux-3-klein_amd-gfx1151-linux__s_int8_auto__k2p7"
+    ]
+   ],
+   "valid_if": "same vm_id and lane; SM clocks within 3% between the paired runs",
+   "est_min": 40.0,
+   "prefetch": [
+    "unsloth/flux-3-image-klein:*"
+   ],
+   "parity_pairs": [],
+   "vm_id": "amd-gfx1151-linux-1",
+   "lane": 0
+  },
+  {
+   "id": "qwen-image-2-1_amd-gfx1151-linux",
+   "family": "qwen-image-2.1",
+   "target": "amd:gfx1151-linux",
+   "budget_gib": null,
+   "purpose": "timing",
+   "arms": [
+    "s_int8_auto",
+    "s_int8_bf16dit",
+    "s_int8_int8",
+    "s_int8_int8ks"
+   ],
+   "runs": {
+    "s_int8_auto": [
+     "qwen-image-2-1_amd-gfx1151-linux__s_int8_auto__k1p0",
+     "qwen-image-2-1_amd-gfx1151-linux__s_int8_auto__k1p7",
+     "qwen-image-2-1_amd-gfx1151-linux__s_int8_auto__k2p0",
+     "qwen-image-2-1_amd-gfx1151-linux__s_int8_auto__k2p7"
+    ],
+    "s_int8_bf16dit": [
+     "qwen-image-2-1_amd-gfx1151-linux__s_int8_bf16dit__k1p1",
+     "qwen-image-2-1_amd-gfx1151-linux__s_int8_bf16dit__k1p6",
+     "qwen-image-2-1_amd-gfx1151-linux__s_int8_bf16dit__k2p1",
+     "qwen-image-2-1_amd-gfx1151-linux__s_int8_bf16dit__k2p6"
+    ],
+    "s_int8_int8": [
+     "qwen-image-2-1_amd-gfx1151-linux__s_int8_int8__k1p2",
+     "qwen-image-2-1_amd-gfx1151-linux__s_int8_int8__k1p5",
+     "qwen-image-2-1_amd-gfx1151-linux__s_int8_int8__k2p2",
+     "qwen-image-2-1_amd-gfx1151-linux__s_int8_int8__k2p5"
+    ],
+    "s_int8_int8ks": [
+     "qwen-image-2-1_amd-gfx1151-linux__s_int8_int8ks__k1p3",
+     "qwen-image-2-1_amd-gfx1151-linux__s_int8_int8ks__k1p4",
+     "qwen-image-2-1_amd-gfx1151-linux__s_int8_int8ks__k2p3",
+     "qwen-image-2-1_amd-gfx1151-linux__s_int8_int8ks__k2p4"
+    ]
+   },
+   "order": [
+    "qwen-image-2-1_amd-gfx1151-linux__s_int8_auto__k1p0",
+    "qwen-image-2-1_amd-gfx1151-linux__s_int8_bf16dit__k1p1",
+    "qwen-image-2-1_amd-gfx1151-linux__s_int8_int8__k1p2",
+    "qwen-image-2-1_amd-gfx1151-linux__s_int8_int8ks__k1p3",
+    "qwen-image-2-1_amd-gfx1151-linux__s_int8_int8ks__k1p4",
+    "qwen-image-2-1_amd-gfx1151-linux__s_int8_int8__k1p5",
+    "qwen-image-2-1_amd-gfx1151-linux__s_int8_bf16dit__k1p6",
+    "qwen-image-2-1_amd-gfx1151-linux__s_int8_auto__k1p7",
+    "qwen-image-2-1_amd-gfx1151-linux__s_int8_auto__k2p0",
+    "qwen-image-2-1_amd-gfx1151-linux__s_int8_bf16dit__k2p1",
+    "qwen-image-2-1_amd-gfx1151-linux__s_int8_int8__k2p2",
+    "qwen-image-2-1_amd-gfx1151-linux__s_int8_int8ks__k2p3",
+    "qwen-image-2-1_amd-gfx1151-linux__s_int8_int8ks__k2p4",
+    "qwen-image-2-1_amd-gfx1151-linux__s_int8_int8__k2p5",
+    "qwen-image-2-1_amd-gfx1151-linux__s_int8_bf16dit__k2p6",
+    "qwen-image-2-1_amd-gfx1151-linux__s_int8_auto__k2p7"
+   ],
+   "aa_pairs": [
+    [
+     "qwen-image-2-1_amd-gfx1151-linux__s_int8_int8ks__k1p3",
+     "qwen-image-2-1_amd-gfx1151-linux__s_int8_int8ks__k1p4"
+    ],
+    [
+     "qwen-image-2-1_amd-gfx1151-linux__s_int8_int8__k1p2",
+     "qwen-image-2-1_amd-gfx1151-linux__s_int8_int8__k1p5"
+    ],
+    [
+     "qwen-image-2-1_amd-gfx1151-linux__s_int8_bf16dit__k1p1",
+     "qwen-image-2-1_amd-gfx1151-linux__s_int8_bf16dit__k1p6"
+    ],
+    [
+     "qwen-image-2-1_amd-gfx1151-linux__s_int8_auto__k1p0",
+     "qwen-image-2-1_amd-gfx1151-linux__s_int8_auto__k1p7"
+    ],
+    [
+     "qwen-image-2-1_amd-gfx1151-linux__s_int8_int8ks__k2p3",
+     "qwen-image-2-1_amd-gfx1151-linux__s_int8_int8ks__k2p4"
+    ],
+    [
+     "qwen-image-2-1_amd-gfx1151-linux__s_int8_int8__k2p2",
+     "qwen-image-2-1_amd-gfx1151-linux__s_int8_int8__k2p5"
+    ],
+    [
+     "qwen-image-2-1_amd-gfx1151-linux__s_int8_bf16dit__k2p1",
+     "qwen-image-2-1_amd-gfx1151-linux__s_int8_bf16dit__k2p6"
+    ],
+    [
+     "qwen-image-2-1_amd-gfx1151-linux__s_int8_auto__k2p0",
+     "qwen-image-2-1_amd-gfx1151-linux__s_int8_auto__k2p7"
+    ]
+   ],
+   "valid_if": "same vm_id and lane; SM clocks within 3% between the paired runs",
+   "est_min": 50.4,
+   "prefetch": [
+    "Qwen/Qwen-Image-2.1:*"
+   ],
+   "parity_pairs": [],
+   "vm_id": "amd-gfx1151-linux-1",
+   "lane": 0
+  },
+  {
+   "id": "z-image-turbo_amd-gfx1151-linux",
+   "family": "z-image-turbo",
+   "target": "amd:gfx1151-linux",
+   "budget_gib": null,
+   "purpose": "timing",
+   "arms": [
+    "s_bf16_bf16",
+    "s_int8_int8",
+    "s_int8_int8act"
+   ],
+   "runs": {
+    "s_bf16_bf16": [
+     "z-image-turbo_amd-gfx1151-linux__s_bf16_bf16__k1p0",
+     "z-image-turbo_amd-gfx1151-linux__s_bf16_bf16__k1p5",
+     "z-image-turbo_amd-gfx1151-linux__s_bf16_bf16__k2p0",
+     "z-image-turbo_amd-gfx1151-linux__s_bf16_bf16__k2p5"
+    ],
+    "s_int8_int8": [
+     "z-image-turbo_amd-gfx1151-linux__s_int8_int8__k1p1",
+     "z-image-turbo_amd-gfx1151-linux__s_int8_int8__k1p4",
+     "z-image-turbo_amd-gfx1151-linux__s_int8_int8__k2p1",
+     "z-image-turbo_amd-gfx1151-linux__s_int8_int8__k2p4"
+    ],
+    "s_int8_int8act": [
+     "z-image-turbo_amd-gfx1151-linux__s_int8_int8act__k1p2",
+     "z-image-turbo_amd-gfx1151-linux__s_int8_int8act__k1p3",
+     "z-image-turbo_amd-gfx1151-linux__s_int8_int8act__k2p2",
+     "z-image-turbo_amd-gfx1151-linux__s_int8_int8act__k2p3"
+    ]
+   },
+   "order": [
+    "z-image-turbo_amd-gfx1151-linux__s_bf16_bf16__k1p0",
+    "z-image-turbo_amd-gfx1151-linux__s_int8_int8__k1p1",
+    "z-image-turbo_amd-gfx1151-linux__s_int8_int8act__k1p2",
+    "z-image-turbo_amd-gfx1151-linux__s_int8_int8act__k1p3",
+    "z-image-turbo_amd-gfx1151-linux__s_int8_int8__k1p4",
+    "z-image-turbo_amd-gfx1151-linux__s_bf16_bf16__k1p5",
+    "z-image-turbo_amd-gfx1151-linux__s_bf16_bf16__k2p0",
+    "z-image-turbo_amd-gfx1151-linux__s_int8_int8__k2p1",
+    "z-image-turbo_amd-gfx1151-linux__s_int8_int8act__k2p2",
+    "z-image-turbo_amd-gfx1151-linux__s_int8_int8act__k2p3",
+    "z-image-turbo_amd-gfx1151-linux__s_int8_int8__k2p4",
+    "z-image-turbo_amd-gfx1151-linux__s_bf16_bf16__k2p5"
+   ],
+   "aa_pairs": [
+    [
+     "z-image-turbo_amd-gfx1151-linux__s_int8_int8act__k1p2",
+     "z-image-turbo_amd-gfx1151-linux__s_int8_int8act__k1p3"
+    ],
+    [
+     "z-image-turbo_amd-gfx1151-linux__s_int8_int8__k1p1",
+     "z-image-turbo_amd-gfx1151-linux__s_int8_int8__k1p4"
+    ],
+    [
+     "z-image-turbo_amd-gfx1151-linux__s_bf16_bf16__k1p0",
+     "z-image-turbo_amd-gfx1151-linux__s_bf16_bf16__k1p5"
+    ],
+    [
+     "z-image-turbo_amd-gfx1151-linux__s_int8_int8act__k2p2",
+     "z-image-turbo_amd-gfx1151-linux__s_int8_int8act__k2p3"
+    ],
+    [
+     "z-image-turbo_amd-gfx1151-linux__s_int8_int8__k2p1",
+     "z-image-turbo_amd-gfx1151-linux__s_int8_int8__k2p4"
+    ],
+    [
+     "z-image-turbo_amd-gfx1151-linux__s_bf16_bf16__k2p0",
+     "z-image-turbo_amd-gfx1151-linux__s_bf16_bf16__k2p5"
+    ]
+   ],
+   "valid_if": "same vm_id and lane; SM clocks within 3% between the paired runs",
+   "est_min": 31.7,
+   "prefetch": [
+    "Tongyi-MAI/Z-Image-Turbo:*"
+   ],
+   "parity_pairs": [],
+   "vm_id": "amd-gfx1151-linux-1",
+   "lane": 0
+  }
+ ],
+ "revisions": {
+  "unsloth_sha": "d480a0ade9c1f5e6a3fd67feb519c347c0ab3c09",
+  "bline_ref": "v0.46.2"
+ }
+}

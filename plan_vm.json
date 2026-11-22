@@ -1,0 +1,520 @@
+{
+ "vm": {
+  "vm_id": "amd-gfx1151-linux-1",
+  "target": "amd:gfx1151-linux",
+  "kind": "amd",
+  "gpu": "gfx1151",
+  "lanes": 1,
+  "lane_mode": "single",
+  "lane_mode_effective": "single",
+  "purpose": "timing",
+  "account": null,
+  "comparisons": [
+   "qwen-image-2-1_amd-gfx1151-linux",
+   "flux-3-klein_amd-gfx1151-linux",
+   "z-image-turbo_amd-gfx1151-linux"
+  ],
+  "slots": [
+   [
+    {
+     "tag": "trial__amd-gfx1151-linux-1",
+     "lane": 0,
+     "stack": "studio",
+     "timed": false,
+     "comparison": null,
+     "est_min": 1.57,
+     "trial": true
+    }
+   ],
+   [
+    {
+     "tag": "qwen-image-2-1_amd-gfx1151-linux__s_int8_auto__k1p0",
+     "lane": 0,
+     "stack": "studio",
+     "timed": true,
+     "family": "qwen-image-2.1",
+     "comparison": "qwen-image-2-1_amd-gfx1151-linux",
+     "est_min": 3.15
+    }
+   ],
+   [
+    {
+     "tag": "qwen-image-2-1_amd-gfx1151-linux__s_int8_bf16dit__k1p1",
+     "lane": 0,
+     "stack": "studio",
+     "timed": true,
+     "family": "qwen-image-2.1",
+     "comparison": "qwen-image-2-1_amd-gfx1151-linux",
+     "est_min": 3.15
+    }
+   ],
+   [
+    {
+     "tag": "qwen-image-2-1_amd-gfx1151-linux__s_int8_int8__k1p2",
+     "lane": 0,
+     "stack": "studio",
+     "timed": true,
+     "family": "qwen-image-2.1",
+     "comparison": "qwen-image-2-1_amd-gfx1151-linux",
+     "est_min": 3.15
+    }
+   ],
+   [
+    {
+     "tag": "qwen-image-2-1_amd-gfx1151-linux__s_int8_int8ks__k1p3",
+     "lane": 0,
+     "stack": "studio",
+     "timed": true,
+     "family": "qwen-image-2.1",
+     "comparison": "qwen-image-2-1_amd-gfx1151-linux",
+     "est_min": 3.15
+    }
+   ],
+   [
+    {
+     "tag": "qwen-image-2-1_amd-gfx1151-linux__s_int8_int8ks__k1p4",
+     "lane": 0,
+     "stack": "studio",
+     "timed": true,
+     "family": "qwen-image-2.1",
+     "comparison": "qwen-image-2-1_amd-gfx1151-linux",
+     "est_min": 3.15
+    }
+   ],
+   [
+    {
+     "tag": "qwen-image-2-1_amd-gfx1151-linux__s_int8_int8__k1p5",
+     "lane": 0,
+     "stack": "studio",
+     "timed": true,
+     "family": "qwen-image-2.1",
+     "comparison": "qwen-image-2-1_amd-gfx1151-linux",
+     "est_min": 3.15
+    }
+   ],
+   [
+    {
+     "tag": "qwen-image-2-1_amd-gfx1151-linux__s_int8_bf16dit__k1p6",
+     "lane": 0,
+     "stack": "studio",
+     "timed": true,
+     "family": "qwen-image-2.1",
+     "comparison": "qwen-image-2-1_amd-gfx1151-linux",
+     "est_min": 3.15
+    }
+   ],
+   [
+    {
+     "tag": "qwen-image-2-1_amd-gfx1151-linux__s_int8_auto__k1p7",
+     "lane": 0,
+     "stack": "studio",
+     "timed": true,
+     "family": "qwen-image-2.1",
+     "comparison": "qwen-image-2-1_amd-gfx1151-linux",
+     "est_min": 3.15
+    }
+   ],
+   [
+    {
+     "tag": "qwen-image-2-1_amd-gfx1151-linux__s_int8_auto__k2p0",
+     "lane": 0,
+     "stack": "studio",
+     "timed": true,
+     "family": "qwen-image-2.1",
+     "comparison": "qwen-image-2-1_amd-gfx1151-linux",
+     "est_min": 3.15
+    }
+   ],
+   [
+    {
+     "tag": "qwen-image-2-1_amd-gfx1151-linux__s_int8_bf16dit__k2p1",
+     "lane": 0,
+     "stack": "studio",
+     "timed": true,
+     "family": "qwen-image-2.1",
+     "comparison": "qwen-image-2-1_amd-gfx1151-linux",
+     "est_min": 3.15
+    }
+   ],
+   [
+    {
+     "tag": "qwen-image-2-1_amd-gfx1151-linux__s_int8_int8__k2p2",
+     "lane": 0,
+     "stack": "studio",
+     "timed": true,
+     "family": "qwen-image-2.1",
+     "comparison": "qwen-image-2-1_amd-gfx1151-linux",
+     "est_min": 3.15
+    }
+   ],
+   [
+    {
+     "tag": "qwen-image-2-1_amd-gfx1151-linux__s_int8_int8ks__k2p3",
+     "lane": 0,
+     "stack": "studio",
+     "timed": true,
+     "family": "qwen-image-2.1",
+     "comparison": "qwen-image-2-1_amd-gfx1151-linux",
+     "est_min": 3.15
+    }
+   ],
+   [
+    {
+     "tag": "qwen-image-2-1_amd-gfx1151-linux__s_int8_int8ks__k2p4",
+     "lane": 0,
+     "stack": "studio",
+     "timed": true,
+     "family": "qwen-image-2.1",
+     "comparison": "qwen-image-2-1_amd-gfx1151-linux",
+     "est_min": 3.15
+    }
+   ],
+   [
+    {
+     "tag": "qwen-image-2-1_amd-gfx1151-linux__s_int8_int8__k2p5",
+     "lane": 0,
+     "stack": "studio",
+     "timed": true,
+     "family": "qwen-image-2.1",
+     "comparison": "qwen-image-2-1_amd-gfx1151-linux",
+     "est_min": 3.15
+    }
+   ],
+   [
+    {
+     "tag": "qwen-image-2-1_amd-gfx1151-linux__s_int8_bf16dit__k2p6",
+     "lane": 0,
+     "stack": "studio",
+     "timed": true,
+     "family": "qwen-image-2.1",
+     "comparison": "qwen-image-2-1_amd-gfx1151-linux",
+     "est_min": 3.15
+    }
+   ],
+   [
+    {
+     "tag": "qwen-image-2-1_amd-gfx1151-linux__s_int8_auto__k2p7",
+     "lane": 0,
+     "stack": "studio",
+     "timed": true,
+     "family": "qwen-image-2.1",
+     "comparison": "qwen-image-2-1_amd-gfx1151-linux",
+     "est_min": 3.15
+    }
+   ],
+   [
+    {
+     "tag": "flux-3-klein_amd-gfx1151-linux__s_int8_auto__k1p0",
+     "lane": 0,
+     "stack": "studio",
+     "timed": true,
+     "family": "flux.3-klein",
+     "comparison": "flux-3-klein_amd-gfx1151-linux",
+     "est_min": 2.5
+    }
+   ],
+   [
+    {
+     "tag": "flux-3-klein_amd-gfx1151-linux__s_int8_bf16dit__k1p1",
+     "lane": 0,
+     "stack": "studio",
+     "timed": true,
+     "family": "flux.3-klein",
+     "comparison": "flux-3-klein_amd-gfx1151-linux",
+     "est_min": 2.5
+    }
+   ],
+   [
+    {
+     "tag": "flux-3-klein_amd-gfx1151-linux__s_int8_int8__k1p2",
+     "lane": 0,
+     "stack": "studio",
+     "timed": true,
+     "family": "flux.3-klein",
+     "comparison": "flux-3-klein_amd-gfx1151-linux",
+     "est_min": 2.5
+    }
+   ],
+   [
+    {
+     "tag": "flux-3-klein_amd-gfx1151-linux__s_int8_int8ks__k1p3",
+     "lane": 0,
+     "stack": "studio",
+     "timed": true,
+     "family": "flux.3-klein",
+     "comparison": "flux-3-klein_amd-gfx1151-linux",
+     "est_min": 2.5
+    }
+   ],
+   [
+    {
+     "tag": "flux-3-klein_amd-gfx1151-linux__s_int8_int8ks__k1p4",
+     "lane": 0,
+     "stack": "studio",
+     "timed": true,
+     "family": "flux.3-klein",
+     "comparison": "flux-3-klein_amd-gfx1151-linux",
+     "est_min": 2.5
+    }
+   ],
+   [
+    {
+     "tag": "flux-3-klein_amd-gfx1151-linux__s_int8_int8__k1p5",
+     "lane": 0,
+     "stack": "studio",
+     "timed": true,
+     "family": "flux.3-klein",
+     "comparison": "flux-3-klein_amd-gfx1151-linux",
+     "est_min": 2.5
+    }
+   ],
+   [
+    {
+     "tag": "flux-3-klein_amd-gfx1151-linux__s_int8_bf16dit__k1p6",
+     "lane": 0,
+     "stack": "studio",
+     "timed": true,
+     "family": "flux.3-klein",
+     "comparison": "flux-3-klein_amd-gfx1151-linux",
+     "est_min": 2.5
+    }
+   ],
+   [
+    {
+     "tag": "flux-3-klein_amd-gfx1151-linux__s_int8_auto__k1p7",
+     "lane": 0,
+     "stack": "studio",
+     "timed": true,
+     "family": "flux.3-klein",
+     "comparison": "flux-3-klein_amd-gfx1151-linux",
+     "est_min": 2.5
+    }
+   ],
+   [
+    {
+     "tag": "flux-3-klein_amd-gfx1151-linux__s_int8_auto__k2p0",
+     "lane": 0,
+     "stack": "studio",
+     "timed": true,
+     "family": "flux.3-klein",
+     "comparison": "flux-3-klein_amd-gfx1151-linux",
+     "est_min": 2.5
+    }
+   ],
+   [
+    {
+     "tag": "flux-3-klein_amd-gfx1151-linux__s_int8_bf16dit__k2p1",
+     "lane": 0,
+     "stack": "studio",
+     "timed": true,
+     "family": "flux.3-klein",
+     "comparison": "flux-3-klein_amd-gfx1151-linux",
+     "est_min": 2.5
+    }
+   ],
+   [
+    {
+     "tag": "flux-3-klein_amd-gfx1151-linux__s_int8_int8__k2p2",
+     "lane": 0,
+     "stack": "studio",
+     "timed": true,
+     "family": "flux.3-klein",
+     "comparison": "flux-3-klein_amd-gfx1151-linux",
+     "est_min": 2.5
+    }
+   ],
+   [
+    {
+     "tag": "flux-3-klein_amd-gfx1151-linux__s_int8_int8ks__k2p3",
+     "lane": 0,
+     "stack": "studio",
+     "timed": true,
+     "family": "flux.3-klein",
+     "comparison": "flux-3-klein_amd-gfx1151-linux",
+     "est_min": 2.5
+    }
+   ],
+   [
+    {
+     "tag": "flux-3-klein_amd-gfx1151-linux__s_int8_int8ks__k2p4",
+     "lane": 0,
+     "stack": "studio",
+     "timed": true,
+     "family": "flux.3-klein",
+     "comparison": "flux-3-klein_amd-gfx1151-linux",
+     "est_min": 2.5
+    }
+   ],
+   [
+    {
+     "tag": "flux-3-klein_amd-gfx1151-linux__s_int8_int8__k2p5",
+     "lane": 0,
+     "stack": "studio",
+     "timed": true,
+     "family": "flux.3-klein",
+     "comparison": "flux-3-klein_amd-gfx1151-linux",
+     "est_min": 2.5
+    }
+   ],
+   [
+    {
+     "tag": "flux-3-klein_amd-gfx1151-linux__s_int8_bf16dit__k2p6",
+     "lane": 0,
+     "stack": "studio",
+     "timed": true,
+     "family": "flux.3-klein",
+     "comparison": "flux-3-klein_amd-gfx1151-linux",
+     "est_min": 2.5
+    }
+   ],
+   [
+    {
+     "tag": "flux-3-klein_amd-gfx1151-linux__s_int8_auto__k2p7",
+     "lane": 0,
+     "stack": "studio",
+     "timed": true,
+     "family": "flux.3-klein",
+     "comparison": "flux-3-klein_amd-gfx1151-linux",
+     "est_min": 2.5
+    }
+   ],
+   [
+    {
+     "tag": "z-image-turbo_amd-gfx1151-linux__s_bf16_bf16__k1p0",
+     "lane": 0,
+     "stack": "studio",
+     "timed": true,
+     "family": "z-image-turbo",
+     "comparison": "z-image-turbo_amd-gfx1151-linux",
+     "est_min": 2.64
+    }
+   ],
+   [
+    {
+     "tag": "z-image-turbo_amd-gfx1151-linux__s_int8_int8__k1p1",
+     "lane": 0,
+     "stack": "studio",
+     "timed": true,
+     "family": "z-image-turbo",
+     "comparison": "z-image-turbo_amd-gfx1151-linux",
+     "est_min": 2.64
+    }
+   ],
+   [
+    {
+     "tag": "z-image-turbo_amd-gfx1151-linux__s_int8_int8act__k1p2",
+     "lane": 0,
+     "stack": "studio",
+     "timed": true,
+     "family": "z-image-turbo",
+     "comparison": "z-image-turbo_amd-gfx1151-linux",
+     "est_min": 2.64
+    }
+   ],
+   [
+    {
+     "tag": "z-image-turbo_amd-gfx1151-linux__s_int8_int8act__k1p3",
+     "lane": 0,
+     "stack": "studio",
+     "timed": true,
+     "family": "z-image-turbo",
+     "comparison": "z-image-turbo_amd-gfx1151-linux",
+     "est_min": 2.64
+    }
+   ],
+   [
+    {
+     "tag": "z-image-turbo_amd-gfx1151-linux__s_int8_int8__k1p4",
+     "lane": 0,
+     "stack": "studio",
+     "timed": true,
+     "family": "z-image-turbo",
+     "comparison": "z-image-turbo_amd-gfx1151-linux",
+     "est_min": 2.64
+    }
+   ],
+   [
+    {
+     "tag": "z-image-turbo_amd-gfx1151-linux__s_bf16_bf16__k1p5",
+     "lane": 0,
+     "stack": "studio",
+     "timed": true,
+     "family": "z-image-turbo",
+     "comparison": "z-image-turbo_amd-gfx1151-linux",
+     "est_min": 2.64
+    }
+   ],
+   [
+    {
+     "tag": "z-image-turbo_amd-gfx1151-linux__s_bf16_bf16__k2p0",
+     "lane": 0,
+     "stack": "studio",
+     "timed": true,
+     "family": "z-image-turbo",
+     "comparison": "z-image-turbo_amd-gfx1151-linux",
+     "est_min": 2.64
+    }
+   ],
+   [
+    {
+     "tag": "z-image-turbo_amd-gfx1151-linux__s_int8_int8__k2p1",
+     "lane": 0,
+     "stack": "studio",
+     "timed": true,
+     "family": "z-image-turbo",
+     "comparison": "z-image-turbo_amd-gfx1151-linux",
+     "est_min": 2.64
+    }
+   ],
+   [
+    {
+     "tag": "z-image-turbo_amd-gfx1151-linux__s_int8_int8act__k2p2",
+     "lane": 0,
+     "stack": "studio",
+     "timed": true,
+     "family": "z-image-turbo",
+     "comparison": "z-image-turbo_amd-gfx1151-linux",
+     "est_min": 2.64
+    }
+   ],
+   [
+    {
+     "tag": "z-image-turbo_amd-gfx1151-linux__s_int8_int8act__k2p3",
+     "lane": 0,
+     "stack": "studio",
+     "timed": true,
+     "family": "z-image-turbo",
+     "comparison": "z-image-turbo_amd-gfx1151-linux",
+     "est_min": 2.64
+    }
+   ],
+   [
+    {
+     "tag": "z-image-turbo_amd-gfx1151-linux__s_int8_int8__k2p4",
+     "lane": 0,
+     "stack": "studio",
+     "timed": true,
+     "family": "z-image-turbo",
+     "comparison": "z-image-turbo_amd-gfx1151-linux",
+     "est_min": 2.64
+    }
+   ],
+   [
+    {
+     "tag": "z-image-turbo_amd-gfx1151-linux__s_bf16_bf16__k2p5",
+     "lane": 0,
+     "stack": "studio",
+     "timed": true,
+     "family": "z-image-turbo",
+     "comparison": "z-image-turbo_amd-gfx1151-linux",
+     "est_min": 2.64
+    }
+   ]
+  ],
+  "est_min": 183.7,
+  "est_cu": 0.0
+ },
+ "base_sha": "d480a0ade9c1f5e6a3fd67feb519c347c0ab3c09",
+ "bline_ref": "v0.46.2",
+ "branch": "amd-ci-nov22-rimg"
+}
