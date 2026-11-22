@@ -1,8 +1,8 @@
 diff --git a/studio/backend/core/training/diffusion_dit_trainer.py b/studio/backend/core/training/diffusion_dit_trainer.py
-index bf1a2fca32..777841e2f7 100644
+index 12e2423adf..0a7670fa68 100644
 --- a/studio/backend/core/training/diffusion_dit_trainer.py
 +++ b/studio/backend/core/training/diffusion_dit_trainer.py
-@@ -4523,7 +4523,7 @@ def _dequant_cache_wanted(
+@@ -4905,7 +4905,7 @@ def _dequant_cache_wanted(
      fp16_amp,
      int8_base = False,
  ) -> bool:
@@ -11,7 +11,7 @@ index bf1a2fca32..777841e2f7 100644
      (on a T4 both planned from step 1's free memory and step 2 OOMed). int8 runs eager, so the cache is its only
      relief from torchao's per-call weight cast."""
      from core.training.diffusion_lora_fast import dequant_cache_enabled, int8_dequant_cache_enabled
-@@ -4531,7 +4531,6 @@ def _dequant_cache_wanted(
+@@ -4913,7 +4913,6 @@ def _dequant_cache_wanted(
          (base_is_bnb or (int8_base and int8_dequant_cache_enabled()))
          and device == "cuda"
          and not fp16_amp
@@ -115,3 +115,106 @@ index 7f1fd5e580..b8cd20a4be 100644
          allocated = torch.cuda.memory_allocated()
          reserved = torch.cuda.memory_reserved()
      except Exception:  # noqa: BLE001 -- no probe: leave the cache as it is
+diff --git a/studio/backend/tests/test_diffusion_dit_fp16_t4.py b/studio/backend/tests/test_diffusion_dit_fp16_t4.py
+index ffb4f78b9d..f27ffafb5a 100644
+--- a/studio/backend/tests/test_diffusion_dit_fp16_t4.py
++++ b/studio/backend/tests/test_diffusion_dit_fp16_t4.py
+@@ -570,9 +570,11 @@ def test_dequant_cache_stays_off_on_the_fp16_path(monkeypatch):
+     assert not dit._dequant_cache_wanted(True, "xpu", False)
+     monkeypatch.setenv("UNSLOTH_DIFFUSION_DEQUANT_CACHE", "0")
+     assert not fl.dequant_cache_enabled() and not dit._dequant_cache_wanted(True, "cuda", False)
++    # ROCm keeps the cache too (gfx1151 nf4 klein LoRA 1.68x Linux / 1.63x Windows); the fp16 path still declines it
+     monkeypatch.setattr(dit, "torch_is_rocm", lambda: True)
+     monkeypatch.delenv("UNSLOTH_DIFFUSION_DEQUANT_CACHE")
+-    assert not dit._dequant_cache_wanted(True, "cuda", False)
++    assert dit._dequant_cache_wanted(True, "cuda", False)
++    assert not dit._dequant_cache_wanted(True, "cuda", True)
+ 
+ 
+ @pytest.mark.parametrize(
+diff --git a/studio/backend/tests/test_diffusion_gc_budget.py b/studio/backend/tests/test_diffusion_gc_budget.py
+index e0237b168a..74ecdb107a 100644
+--- a/studio/backend/tests/test_diffusion_gc_budget.py
++++ b/studio/backend/tests/test_diffusion_gc_budget.py
+@@ -62,12 +62,55 @@ def test_kill_switch_keeps_the_old_path(mode, monkeypatch):
+     assert model.func is None
+ 
+ 
+-def test_rocm_keeps_the_old_path(monkeypatch):
++def test_rocm_uses_the_budget_too(monkeypatch):
++    # gfx1151 Linux + Windows: 1.40x / 2.18x bf16 klein LoRA steps, Linux losses bitwise equal to every block checkpointed
+     monkeypatch.delenv(gb.GC_MODE_ENV, raising = False)
+     monkeypatch.setattr(gb, "_is_rocm", lambda: True)
++    model = _Model()
++    budget = gb.enable_budgeted_checkpointing(model, "cuda")
++    assert isinstance(budget, gb.BudgetedCheckpoint) and model.func is budget
++    monkeypatch.setenv(gb.GC_MODE_ENV, "plain")
+     assert gb.enable_budgeted_checkpointing(_Model(), "cuda") is None
+ 
+ 
++def test_budget_reads_trusted_free(monkeypatch):
++    # Windows ROCm's WDDM free over-report is capped (utils.hardware.trusted_mem_get_info) before any plan
++    import utils.hardware as hw
++    monkeypatch.setattr(hw, "trusted_mem_get_info", lambda *a, **k: (7, 9))
++    assert gb._mem_get_info() == (7, 9)
++
++
++@pytest.mark.parametrize(
++    "platform, hip, device, capped",
++    [
++        ("win32", "6.4.0", None, True),  # the spawned trainer: detection never ran, a ROCm torch
++        ("win32", None, None, False),  # Windows NVIDIA
++        ("linux", "6.4.0", None, False),  # Linux ROCm: the driver figure is trusted
++        ("win32", "6.4.0", "cuda", False),  # detection ran and did not say ROCm
++    ],
++)
++def test_trainer_child_caps_windows_rocm_free(platform, hip, device, capped, monkeypatch):
++    # The trainer is a spawned process that never runs detect_hardware(), so IS_ROCM stays False there
++    import types
++
++    import utils.hardware.hardware as hwmod
++    import core.training.diffusion_lora_fast as fl
++
++    gib = 1 << 30
++    fake = types.ModuleType("torch")
++    fake.version = types.SimpleNamespace(hip = hip)
++    fake.__version__ = "2.9.1"
++    fake.cuda = types.SimpleNamespace(
++        mem_get_info = lambda *a: (16 * gib, 16 * gib), memory_reserved = lambda *a: 6 * gib
++    )
++    monkeypatch.setitem(__import__("sys").modules, "torch", fake)
++    monkeypatch.setattr(hwmod.sys, "platform", platform)
++    monkeypatch.setattr(hwmod, "IS_ROCM", False)
++    monkeypatch.setattr(hwmod, "DEVICE", device)
++    want = (10 * gib if capped else 16 * gib, 16 * gib)
++    assert gb._mem_get_info() == want and fl._mem_get_info() == want
++
++
+ def _planned(
+     class_cost,
+     blocks,
+diff --git a/studio/backend/utils/hardware/hardware.py b/studio/backend/utils/hardware/hardware.py
+index 907b581d79..8c6a6ff8fe 100644
+--- a/studio/backend/utils/hardware/hardware.py
++++ b/studio/backend/utils/hardware/hardware.py
+@@ -3089,7 +3089,19 @@ def _torch_get_physical_gpu_count() -> Optional[int]:
+ 
+ def rocm_windows_free_is_untrusted() -> bool:
+     """Whether ``mem_get_info``'s FREE half must be treated as an over-report. AMD documents it: on Windows the free memory only accounts for this process's allocations, because WDDM virtualises video memory, so a fresh process sees free at or near total whatever else is resident (ROCm/librocdxg#57 measured 24410 of 24560 MiB free on a filled card; ROCm/TheRock#3724 is the same symptom). Near ``total``, not equal, so callers cap rather than test a sentinel. The TOTAL half is fine, and WSL is deliberately left alone: sys.platform is "linux" there and free tracks physical residency."""
+-    return sys.platform == "win32" and IS_ROCM
++    if sys.platform != "win32":
++        return False
++    if IS_ROCM:
++        return True
++    # A spawned child that never ran detect_hardware() (the diffusion trainer) keeps IS_ROCM False: until detection
++    # has answered, the torch build already imported here decides. Never imports torch.
++    if DEVICE is not None:
++        return False
++    mod = sys.modules.get("torch")
++    return mod is not None and bool(
++        getattr(getattr(mod, "version", None), "hip", None)
++        or "rocm" in str(getattr(mod, "__version__", "")).lower()
++    )
+ 
+ 
+ def trusted_mem_get_info(device: Any = None, *, module: Any = None) -> tuple[int, int]:

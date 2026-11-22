@@ -30,7 +30,7 @@ name: "AMD CI (Windows): validate PR 18760"
 
 on:
   push:
-    branches: [amd-ci-nov21-trainlev3-win]
+    branches: [amd-ci-nov21-trainlev4-win]
   workflow_dispatch:
 
 permissions:
@@ -42,9 +42,9 @@ env:
   # Set to "1" for a PR already merged: compares the merge commit to its parent.
   MERGED: "0"
   # Set by scaffold.py --patch: base = PATCH_BASE, head = PATCH_BASE plus this diff (relative to the checkout).
-  PATCH_BASE: "ee62cb7857ded11ecfe68a11f123a03f803ff55e"
+  PATCH_BASE: "923e1a0b44a04ddb768c0f2b35daa7bc50eca07f"
   PATCH_FILE: "amd_ci/patches/train_levers.diff"
-  PATCH_SHA256: "b7344a26dd407a6bc1ed330492af485e0db660a878e74fcb0f624546743cfbaa"
+  PATCH_SHA256: "2ff276df03c6b0c4e9a2d233483a6b12e433d9408e55983bd16de00036e8db4b"
 
 jobs:
 
