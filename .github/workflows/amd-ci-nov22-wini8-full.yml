@@ -201,6 +201,12 @@ jobs:
         if: always()
         with:
           name: pr18903-windows
-          path: ${{ env.AMD_CI_WORK }}/out
+          path: |
+            ${{ env.AMD_CI_WORK }}/out
+            !${{ env.AMD_CI_WORK }}/out/dbench/hf_home
+            !${{ env.AMD_CI_WORK }}/out/dbench/torch_home
+            !${{ env.AMD_CI_WORK }}/out/dbench/models
+            !${{ env.AMD_CI_WORK }}/out/dbench/**/studio_home
+            !${{ env.AMD_CI_WORK }}/out/dbench/**/_cache
           retention-days: 7
           if-no-files-found: warn
