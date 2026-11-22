@@ -1,0 +1,542 @@
+diff --git a/studio/backend/core/inference/video.py b/studio/backend/core/inference/video.py
+index 1430d0fe9a..d39a791efb 100644
+--- a/studio/backend/core/inference/video.py
++++ b/studio/backend/core/inference/video.py
+@@ -12103,6 +12103,13 @@ class VideoBackend:
+                 if install_untiled_decode(pipe, fam.name, logger = logger):
+                     speed_optims += ("vae_untiled_when_fits",)
+             install_frame_pad_fix(pipe, target, logger = logger)
++            # Windows ROCm: decoder Conv3d calls over 2 GiB run as per-tap Conv2d (stock Conv3d falls off a cliff there).
++            try:
++                from .video_vae_rocm_pertap import install_on_pipe as install_vae_rocm_pertap
++                if install_vae_rocm_pertap(pipe, target, logger = logger):
++                    speed_optims += ("vae_rocm_pertap_conv",)
++            except Exception as exc:  # noqa: BLE001 - the stock Conv3d decode stays
++                logger.warning("video.vae_rocm_pertap: not installed: %s", exc)
+             if vae_tiling and target.device == "cuda":
+                 # Tiled Wan decodes share their spatial tiles with the selection's second card (bitwise the stock tiles).
+                 try:
+diff --git a/studio/backend/core/inference/video_vae_rocm_pertap.py b/studio/backend/core/inference/video_vae_rocm_pertap.py
+new file mode 100644
+index 0000000000..4b0a056f04
+--- /dev/null
++++ b/studio/backend/core/inference/video_vae_rocm_pertap.py
+@@ -0,0 +1,187 @@
++# SPDX-License-Identifier: AGPL-3.0-only
++# Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
++
++"""Windows ROCm: run a large video VAE decoder Conv3d as one Conv2d per temporal tap.
++
++On Windows gfx1151 (torch 2.11 + ROCm 7.14) a Conv3d whose input or output tensor exceeds 2 GiB runs about 10x slower
++per element than the same conv below that size; measured on the LTX-2.3 decoder across 6 conv shape classes and
++5 clip sizes. Splitting such a call into Conv2d calls, one per temporal tap with time folded into the batch, summed in
++fp32 with the bias added once, decodes 1920x1088x121 about 1.8x faster and closer to a CPU fp32 decode. Below 2 GiB
++the stock Conv3d is faster, and Linux ROCm has no cliff, so only Windows ROCm installs it and only calls over 2 GiB
++take it. UNSLOTH_VIDEO_VAE_ROCM_PERTAP=0 turns it off (read per call).
++"""
++
++from __future__ import annotations
++
++import os
++import sys
++import types
++from typing import Any
++
++PERTAP_ENV = "UNSLOTH_VIDEO_VAE_ROCM_PERTAP"
++# A call takes the per-tap path when its input or output tensor is larger than this.
++ENGAGE_BYTES = 2**31
++# Output frames per Conv2d batch: the fp32 accumulator of one chunk stays under this.
++CHUNK_BYTES = 256 * 2**20
++# Device types the per-tap path runs on (ROCm torch reports "cuda").
++ENGAGE_DEVICE_TYPES = ("cuda",)
++
++_VAE_CLASSES = frozenset({"AutoencoderKLLTX2Video"})
++_MARK = "_unsloth_rocm_pertap"
++_CALLS = "_unsloth_rocm_pertap_calls"
++
++
++def pertap_disabled() -> bool:
++    return (os.environ.get(PERTAP_ENV) or "").strip().lower() in ("0", "false", "no", "off")
++
++
++def platform_applies(torch: Any) -> bool:
++    """Windows + ROCm torch (AMD SDK wheels included: the tag may only sit in ``__version__``)."""
++    from .rocm_bf16 import is_rocm_torch
++    return sys.platform == "win32" and is_rocm_torch(torch)
++
++
++def _out_size(size: int, k: int, s: int, p: int, d: int) -> int:
++    return (size + 2 * p - d * (k - 1) - 1) // s + 1
++
++
++def pertap_conv3d(
++    x: Any,
++    weight: Any,
++    bias: Any,
++    stride: tuple,
++    padding: tuple,
++    dilation: tuple,
++    groups: int = 1,
++) -> Any:
++    """``F.conv3d(x, weight, bias, stride, padding, dilation, groups)`` (zero padding, int tuples) as one Conv2d per
++    temporal tap over output-frame chunks, taps summed in fp32, bias added once; returns a contiguous tensor."""
++    import torch
++    import torch.nn.functional as F
++
++    kt = int(weight.shape[2])
++    st, sh, sw = (int(v) for v in stride)
++    pt, ph, pw = (int(v) for v in padding)
++    dt, dh, dw = (int(v) for v in dilation)
++    if pt:
++        x = F.pad(x, (0, 0, 0, 0, pt, pt))
++    B, C, T, H, W = x.shape
++    O = int(weight.shape[0])
++    tout = _out_size(T, kt, st, 0, dt)
++    ho = _out_size(H, int(weight.shape[3]), sh, ph, dh)
++    wo = _out_size(W, int(weight.shape[4]), sw, pw, dw)
++    out = torch.empty((B, O, max(tout, 0), ho, wo), device = x.device, dtype = x.dtype)
++    if tout <= 0:
++        return out
++    chunk = max(1, min(tout, CHUNK_BYTES // max(1, B * O * ho * wo * 4)))
++    bias32 = None if bias is None else bias.float().view(1, -1, 1, 1)
++    for t0 in range(0, tout, chunk):
++        n = min(tout, t0 + chunk) - t0
++        acc = None
++        for k in range(kt):
++            s = t0 * st + k * dt
++            frames = x[:, :, s : s + st * (n - 1) + 1 : st]  # (B, C, n, H, W)
++            frames = frames.transpose(1, 2).reshape(B * n, C, H, W)
++            y = F.conv2d(frames, weight[:, :, k], None, (sh, sw), (ph, pw), (dh, dw), groups)
++            if acc is None:
++                acc = y.float()
++            else:
++                acc.add_(y)
++            del frames, y
++        if bias32 is not None:
++            acc.add_(bias32)
++        out[:, :, t0 : t0 + n] = acc.view(B, n, O, ho, wo).transpose(1, 2)
++        del acc
++    return out
++
++
++def _pertap_eligible(conv: Any, x: Any) -> bool:
++    import torch
++
++    if pertap_disabled() or torch.compiler.is_compiling():
++        return False
++    if x.dim() != 5 or x.device.type not in ENGAGE_DEVICE_TYPES or isinstance(conv.padding, str):
++        return False
++    if torch.is_grad_enabled() and (x.requires_grad or conv.weight.requires_grad):
++        return False
++    itemsize = x.element_size()
++    if x.numel() * itemsize > ENGAGE_BYTES:
++        return True
++    pad = (0, 0, 0) if conv.padding_mode != "zeros" else conv.padding
++    B, _, T, H, W = x.shape
++    if conv.padding_mode != "zeros":
++        # stock pre-pads with padding_mode, then convolves unpadded
++        T, H, W = (s + 2 * p for s, p in zip((T, H, W), conv.padding))
++    dims = [
++        _out_size(s, k, st, p, d)
++        for s, k, st, p, d in zip((T, H, W), conv.kernel_size, conv.stride, pad, conv.dilation)
++    ]
++    return B * conv.out_channels * dims[0] * dims[1] * dims[2] * itemsize > ENGAGE_BYTES
++
++
++def _forward(self: Any, x: Any) -> Any:
++    stock = type(self).forward
++    if not _pertap_eligible(self, x):
++        return stock(self, x)
++    padding = self.padding
++    if self.padding_mode != "zeros":
++        import torch.nn.functional as F
++        x = F.pad(x, self._reversed_padding_repeated_twice, mode = self.padding_mode)
++        padding = (0, 0, 0)
++    setattr(self, _CALLS, getattr(self, _CALLS, 0) + 1)
++    return pertap_conv3d(
++        x, self.weight, self.bias, self.stride, padding, self.dilation, self.groups
++    )
++
++
++def _covered(vae: Any) -> bool:
++    return type(vae).__name__ in _VAE_CLASSES and getattr(vae, "decoder", None) is not None
++
++
++def install(vae: Any, logger: Any = None) -> int:
++    """Patch ``vae.decoder``'s Conv3d modules on Windows ROCm; returns how many carry the patch (0 = not installed).
++    Idempotent; skips convs whose forward something else already replaced."""
++    if pertap_disabled() or not _covered(vae):
++        return 0
++    import torch
++
++    if not platform_applies(torch):
++        return 0
++    patched = 0
++    for module in vae.decoder.modules():
++        if not isinstance(module, torch.nn.Conv3d):
++            continue
++        if getattr(module, _MARK, False):
++            patched += 1
++            continue
++        if "forward" in module.__dict__:
++            continue
++        module.forward = types.MethodType(_forward, module)
++        setattr(module, _MARK, True)
++        patched += 1
++    if patched and logger is not None:
++        logger.info(
++            "video.vae_rocm_pertap: %s decoder runs %d Conv3d as per-tap Conv2d when a tensor exceeds %d MiB",
++            type(vae).__name__,
++            patched,
++            ENGAGE_BYTES // 2**20,
++        )
++    return patched
++
++
++def install_on_pipe(
++    pipe: Any,
++    target: Any,
++    logger: Any = None,
++) -> int:
++    if getattr(target, "device", None) != "cuda":
++        return 0
++    return install(getattr(pipe, "vae", None), logger)
++
++
++def pertap_calls(vae: Any) -> int:
++    """How many Conv3d calls in ``vae``'s decoder took the per-tap path since load."""
++    decoder = getattr(vae, "decoder", None)
++    if decoder is None:
++        return 0
++    return sum(int(getattr(m, _CALLS, 0)) for m in decoder.modules())
+diff --git a/studio/backend/tests/test_video_vae_rocm_pertap.py b/studio/backend/tests/test_video_vae_rocm_pertap.py
+new file mode 100644
+index 0000000000..aeb24df0f9
+--- /dev/null
++++ b/studio/backend/tests/test_video_vae_rocm_pertap.py
+@@ -0,0 +1,325 @@
++# SPDX-License-Identifier: AGPL-3.0-only
++# Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
++
++"""Windows ROCm per-tap Conv3d for video VAE decoders: equals F.conv3d, engages only over the size gate, installs only
++on Windows ROCm, and the env switch turns it off per call."""
++
++from __future__ import annotations
++
++import ast
++import logging
++import sys
++import types
++from pathlib import Path
++
++import pytest
++
++_BACKEND = Path(__file__).resolve().parents[1]
++if str(_BACKEND) not in sys.path:
++    sys.path.insert(0, str(_BACKEND))
++
++torch = pytest.importorskip("torch")
++import torch.nn.functional as F  # noqa: E402
++
++from core.inference import video_vae_rocm_pertap as P  # noqa: E402
++
++# (cin, cout, kernel, stride, padding, dilation, groups, T, H, W)
++GEOMETRIES = {
++    "ltx_k3_tpad0": (16, 24, (3, 3, 3), (1, 1, 1), (0, 1, 1), (1, 1, 1), 1, 7, 10, 12),
++    "ltx_k1_shortcut": (16, 8, (1, 1, 1), (1, 1, 1), (0, 0, 0), (1, 1, 1), 1, 5, 9, 11),
++    "k3_pad_all": (8, 12, (3, 3, 3), (1, 1, 1), (1, 1, 1), (1, 1, 1), 1, 6, 8, 8),
++    "stride_t2_s2": (8, 8, (3, 3, 3), (2, 2, 2), (1, 1, 1), (1, 1, 1), 1, 9, 12, 10),
++    "dilation_t2": (8, 8, (3, 3, 3), (1, 1, 1), (0, 1, 1), (2, 1, 1), 1, 9, 8, 8),
++    "dilation_hw2": (8, 8, (3, 3, 3), (1, 1, 1), (0, 2, 2), (1, 2, 2), 1, 5, 9, 9),
++    "groups2": (8, 12, (3, 3, 3), (1, 1, 1), (0, 1, 1), (1, 1, 1), 2, 6, 8, 8),
++    "k2_t_only": (8, 8, (2, 1, 1), (1, 1, 1), (0, 0, 0), (1, 1, 1), 1, 6, 5, 5),
++}
++
++
++def _conv(
++    geom: tuple,
++    dtype,
++    bias: bool = True,
++    padding_mode: str = "zeros",
++):
++    cin, cout, k, s, p, d, g, *_ = geom
++    torch.manual_seed(0)
++    return torch.nn.Conv3d(cin, cout, k, s, p, d, g, bias = bias, padding_mode = padding_mode).to(dtype)
++
++
++def _input(
++    geom: tuple,
++    dtype,
++    batch: int = 1,
++):
++    cin, *_, T, H, W = geom
++    g = torch.Generator().manual_seed(1)
++    return torch.randn(batch, cin, T, H, W, generator = g).to(dtype)
++
++
++@pytest.fixture
++def engage_on_cpu(monkeypatch):
++    """Every call on CPU takes the per-tap path (the real gate is 2 GiB on a ROCm device)."""
++    monkeypatch.setattr(P, "ENGAGE_BYTES", 0)
++    monkeypatch.setattr(P, "ENGAGE_DEVICE_TYPES", ("cpu",))
++    monkeypatch.delenv(P.PERTAP_ENV, raising = False)
++
++
++def _patch(conv):
++    conv.forward = types.MethodType(P._forward, conv)
++    return conv
++
++
++@pytest.mark.parametrize("name", sorted(GEOMETRIES))
++@pytest.mark.parametrize("bias", [True, False])
++@pytest.mark.parametrize("batch", [1, 2])
++def test_pertap_matches_conv3d_fp32(name, bias, batch, monkeypatch):
++    geom = GEOMETRIES[name]
++    conv = _conv(geom, torch.float32, bias)
++    x = _input(geom, torch.float32, batch)
++    ref = F.conv3d(x, conv.weight, conv.bias, conv.stride, conv.padding, conv.dilation, conv.groups)
++    for chunk in (P.CHUNK_BYTES, 1):  # one chunk, then one output frame per chunk
++        monkeypatch.setattr(P, "CHUNK_BYTES", chunk)
++        with torch.no_grad():
++            y = P.pertap_conv3d(
++                x, conv.weight, conv.bias, conv.stride, conv.padding, conv.dilation, conv.groups
++            )
++        assert y.shape == ref.shape and y.dtype == ref.dtype and y.is_contiguous()
++        torch.testing.assert_close(y, ref, rtol = 1e-5, atol = 1e-5)
++
++
++@pytest.mark.parametrize("name", sorted(GEOMETRIES))
++def test_pertap_bf16_no_worse_than_stock(name):
++    geom = GEOMETRIES[name]
++    conv = _conv(geom, torch.bfloat16)
++    x = _input(geom, torch.bfloat16)
++    w64, b64 = conv.weight.double(), conv.bias.double()
++    exact = F.conv3d(x.double(), w64, b64, conv.stride, conv.padding, conv.dilation, conv.groups)
++    with torch.no_grad():
++        stock = conv(x)
++        y = P.pertap_conv3d(
++            x, conv.weight, conv.bias, conv.stride, conv.padding, conv.dilation, conv.groups
++        )
++    assert y.dtype == torch.bfloat16 and y.shape == stock.shape
++    err_y = (y.double() - exact).abs().max().item()
++    err_stock = (stock.double() - exact).abs().max().item()
++    scale = exact.abs().max().item()
++    assert err_y <= max(1.5 * err_stock, 1e-2 * scale)
++    torch.testing.assert_close(y.float(), stock.float(), rtol = 2e-2, atol = 2e-2 * scale)
++
++
++@pytest.mark.parametrize("mode", ["reflect", "replicate", "circular"])
++def test_patched_forward_non_zero_padding_mode(mode, engage_on_cpu):
++    geom = GEOMETRIES["k3_pad_all"]
++    conv = _conv(geom, torch.float32, padding_mode = mode)
++    x = _input(geom, torch.float32)
++    with torch.no_grad():
++        ref = conv(x)
++        y = _patch(conv)(x)
++    assert conv._unsloth_rocm_pertap_calls == 1
++    torch.testing.assert_close(y, ref, rtol = 1e-5, atol = 1e-5)
++
++
++@pytest.mark.parametrize("causal", [True, False])
++def test_ltx2_causal_conv_padding(causal, engage_on_cpu):
++    """The LTX-2 decoder pads time by repeating edge frames outside the Conv3d (temporal padding 0)."""
++    mod = pytest.importorskip("diffusers.models.autoencoders.autoencoder_kl_ltx2")
++    torch.manual_seed(0)
++    layer = mod.LTX2VideoCausalConv3d(8, 12, 3).eval()
++    x = torch.randn(1, 8, 5, 9, 7)
++    with torch.no_grad():
++        ref = layer(x, causal = causal)
++        _patch(layer.conv)
++        y = layer(x, causal = causal)
++    assert layer.conv._unsloth_rocm_pertap_calls == 1
++    torch.testing.assert_close(y, ref, rtol = 1e-5, atol = 1e-5)
++
++
++def test_size_gate_input_and_output(monkeypatch):
++    monkeypatch.setattr(P, "ENGAGE_DEVICE_TYPES", ("cpu",))
++    monkeypatch.delenv(P.PERTAP_ENV, raising = False)
++    narrow = torch.nn.Conv3d(4, 4, (3, 3, 3), padding = (0, 1, 1))
++    wide_out = torch.nn.Conv3d(4, 64, (1, 1, 1))
++    x = torch.randn(
++        1, 4, 6, 8, 8
++    )  # 1536 elements x 4 bytes in; narrow out 4*4*64*4, wide out 64*6*64*4
++    in_bytes = x.numel() * 4
++    with torch.no_grad():
++        monkeypatch.setattr(P, "ENGAGE_BYTES", in_bytes)  # not exceeded: stock
++        assert not P._pertap_eligible(narrow, x)
++        monkeypatch.setattr(P, "ENGAGE_BYTES", in_bytes - 1)
++        assert P._pertap_eligible(narrow, x)
++        # output-only crossing: the input is under, the 16x wider output is over
++        monkeypatch.setattr(P, "ENGAGE_BYTES", in_bytes * 4)
++        assert not P._pertap_eligible(narrow, x)
++        assert P._pertap_eligible(wide_out, x)
++        # half-precision bytes count, not elements
++        monkeypatch.setattr(P, "ENGAGE_BYTES", in_bytes // 2)
++        assert not P._pertap_eligible(narrow.to(torch.float16), x.half())
++
++
++def test_default_gate_is_2gib_and_device_cuda():
++    assert P.ENGAGE_BYTES == 2**31
++    assert P.ENGAGE_DEVICE_TYPES == ("cuda",)
++    conv = torch.nn.Conv3d(4, 4, 3)
++    x = torch.randn(1, 4, 4, 4, 4)
++    assert not P._pertap_eligible(conv, x)  # CPU tensor never engages by default
++
++
++def test_gate_counts_calls_and_falls_back(monkeypatch, engage_on_cpu):
++    geom = GEOMETRIES["ltx_k3_tpad0"]
++    conv = _patch(_conv(geom, torch.float32))
++    x = _input(geom, torch.float32)
++    with torch.no_grad():
++        conv(x)
++        monkeypatch.setattr(P, "ENGAGE_BYTES", 2**40)
++        conv(x)  # under the gate: stock, not counted
++    assert conv._unsloth_rocm_pertap_calls == 1
++    # grad-tracking calls keep the stock op (autograd stays the stock graph)
++    monkeypatch.setattr(P, "ENGAGE_BYTES", 0)
++    y = conv(x)
++    assert y.requires_grad and conv._unsloth_rocm_pertap_calls == 1
++
++
++def test_kill_switch_per_call(monkeypatch, engage_on_cpu):
++    geom = GEOMETRIES["ltx_k3_tpad0"]
++    conv = _patch(_conv(geom, torch.float32))
++    x = _input(geom, torch.float32)
++    for value in ("0", "off", "false", "no"):
++        monkeypatch.setenv(P.PERTAP_ENV, value)
++        with torch.no_grad():
++            conv(x)
++        assert getattr(conv, "_unsloth_rocm_pertap_calls", 0) == 0
++    monkeypatch.setenv(P.PERTAP_ENV, "1")
++    with torch.no_grad():
++        conv(x)
++    assert conv._unsloth_rocm_pertap_calls == 1
++
++
++# ------------------------------------------------------------------ install / platform gate
++class AutoencoderKLLTX2Video(torch.nn.Module):
++    def __init__(self):
++        super().__init__()
++        self.decoder = torch.nn.Sequential(
++            torch.nn.Conv3d(4, 4, 3), torch.nn.ReLU(), torch.nn.Conv3d(4, 4, 1)
++        )
++        self.encoder = torch.nn.Sequential(torch.nn.Conv3d(4, 4, 3))
++
++
++class AutoencoderKLWan(AutoencoderKLLTX2Video):
++    pass
++
++
++def _set_platform(monkeypatch, plat: str, hip, version: str):
++    monkeypatch.setattr(P.sys, "platform", plat)
++    monkeypatch.setattr(torch.version, "hip", hip, raising = False)
++    monkeypatch.setattr(torch, "__version__", version, raising = False)
++    monkeypatch.delenv(P.PERTAP_ENV, raising = False)
++
++
++@pytest.mark.parametrize(
++    "plat,hip,version,expected",
++    [
++        ("win32", "7.14.60850", "2.11.0+rocm7.14.0", 2),  # Windows ROCm wheel
++        ("win32", None, "2.11.0+rocm7.14.0", 2),  # AMD SDK wheel: tag only in __version__
++        ("linux", "7.13.0", "2.11.0+rocm7.13.0", 0),  # Linux ROCm: no cliff measured
++        ("win32", None, "2.11.0+cu128", 0),  # Windows CUDA
++        ("win32", None, "2.11.0+cpu", 0),  # Windows CPU
++        ("darwin", None, "2.11.0", 0),  # macOS / MPS
++        ("linux", None, "2.11.0+cu130", 0),  # Linux CUDA
++    ],
++)
++def test_platform_gate(plat, hip, version, expected, monkeypatch):
++    _set_platform(monkeypatch, plat, hip, version)
++    vae = AutoencoderKLLTX2Video()
++    assert P.install(vae) == expected
++    patched = [m for m in vae.decoder.modules() if "forward" in m.__dict__]
++    assert len(patched) == expected
++    assert all("forward" not in m.__dict__ for m in vae.encoder.modules())
++
++
++def test_install_on_pipe_target_device(monkeypatch):
++    _set_platform(monkeypatch, "win32", "7.14", "2.11.0+rocm7.14.0")
++    for device, expected in (("cuda", 2), ("cpu", 0), ("mps", 0), ("xpu", 0)):
++        pipe = types.SimpleNamespace(vae = AutoencoderKLLTX2Video())
++        assert P.install_on_pipe(pipe, types.SimpleNamespace(device = device)) == expected
++
++
++def test_install_only_ltx2_and_idempotent(monkeypatch, caplog):
++    _set_platform(monkeypatch, "win32", "7.14", "2.11.0+rocm7.14.0")
++    assert P.install(AutoencoderKLWan()) == 0
++    assert P.install(None) == 0
++    vae = AutoencoderKLLTX2Video()
++    first = vae.decoder[0]
++    first.forward = lambda x: x  # something else already owns this conv's forward
++    lg = logging.getLogger("pertap_test")
++    with caplog.at_level(logging.INFO, logger = "pertap_test"):
++        assert P.install(vae, lg) == 1
++    assert "video.vae_rocm_pertap" in caplog.text
++    assert P.install(vae) == 1
++    assert not getattr(first, P._MARK, False)
++
++
++def test_kill_switch_blocks_install(monkeypatch):
++    _set_platform(monkeypatch, "win32", "7.14", "2.11.0+rocm7.14.0")
++    monkeypatch.setenv(P.PERTAP_ENV, "0")
++    vae = AutoencoderKLLTX2Video()
++    assert P.install(vae) == 0
++    assert all("forward" not in m.__dict__ for m in vae.modules())
++
++
++def test_compiled_region_traces_stock_conv(engage_on_cpu):
++    """Under torch.compile the patched forward traces the stock Conv3d: one graph, no break, no recompile."""
++    geom = GEOMETRIES["ltx_k3_tpad0"]
++    conv = _patch(_conv(geom, torch.float32))
++    x = _input(geom, torch.float32)
++    torch._dynamo.reset()
++    compiled = torch.compile(conv, backend = "eager", fullgraph = True)
++    with torch.no_grad(), torch._dynamo.config.patch(error_on_recompile = True):
++        ref = F.conv3d(x, conv.weight, conv.bias, conv.stride, conv.padding)
++        torch.testing.assert_close(compiled(x), ref)
++        torch.testing.assert_close(compiled(x), ref)
++    assert getattr(conv, "_unsloth_rocm_pertap_calls", 0) == 0
++    torch._dynamo.reset()
++
++
++def test_ltx2_decoder_end_to_end(monkeypatch, engage_on_cpu):
++    """A tiny AutoencoderKLLTX2Video with Studio's LTX-2.3 decoder layout decodes the same through the per-tap path."""
++    diffusers = pytest.importorskip("diffusers")
++    cls = getattr(diffusers, "AutoencoderKLLTX2Video", None)
++    if cls is None:
++        pytest.skip("diffusers without AutoencoderKLLTX2Video")
++    from core.inference.video_ltx2 import _VIDEO_VAE_CONFIG
++
++    cfg = dict(_VIDEO_VAE_CONFIG)
++    cfg.update(
++        block_out_channels = (8, 16, 32, 32),
++        decoder_block_out_channels = (8, 16, 16, 32),
++        layers_per_block = (1, 1, 1, 1, 1),
++        decoder_layers_per_block = (1, 1, 1, 1, 1),
++        latent_channels = 8,
++    )
++    torch.manual_seed(0)
++    try:
++        vae = cls(**{k: v for k, v in cfg.items() if not k.startswith("_")}).eval()
++    except TypeError as exc:
++        pytest.skip(f"diffusers LTX-2 VAE config drift: {exc}")
++    z = torch.randn(1, 8, 2, 2, 2)
++    with torch.no_grad():
++        ref = vae.decode(z, return_dict = False)[0]
++        _set_platform(monkeypatch, "win32", "7.14", "2.11.0+rocm7.14.0")
++        n = P.install(vae)
++        y = vae.decode(z, return_dict = False)[0]
++    convs = sum(isinstance(m, torch.nn.Conv3d) for m in vae.decoder.modules())
++    assert n == convs > 0
++    assert P.pertap_calls(vae) >= convs
++    torch.testing.assert_close(y, ref, rtol = 1e-4, atol = 1e-4)
++
++
++def test_video_backend_installs_after_frame_pad_fix():
++    src = (_BACKEND / "core" / "inference" / "video.py").read_text(encoding = "utf-8")
++    ast.parse(src)
++    pad = src.index("install_frame_pad_fix(pipe, target, logger = logger)")
++    pertap = src.index("install_vae_rocm_pertap(pipe, target, logger = logger)")
++    assert 0 < pertap - pad < 600
++    assert '"vae_rocm_pertap_conv"' in src
