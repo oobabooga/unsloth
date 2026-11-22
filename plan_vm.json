@@ -1,0 +1,210 @@
+{
+ "vm": {
+  "vm_id": "amd-gfx1151-linux-1",
+  "target": "amd:gfx1151-linux",
+  "kind": "amd",
+  "gpu": "gfx1151",
+  "lanes": 1,
+  "lane_mode": "single",
+  "lane_mode_effective": "single",
+  "purpose": "timing",
+  "account": null,
+  "comparisons": [
+   "flux3-klein_amd-gfx1151-linux"
+  ],
+  "slots": [
+   [
+    {
+     "tag": "trial__amd-gfx1151-linux-1",
+     "lane": 0,
+     "stack": "studio",
+     "timed": false,
+     "comparison": null,
+     "est_min": 1.64,
+     "trial": true
+    }
+   ],
+   [
+    {
+     "tag": "flux3-klein_amd-gfx1151-linux__s_bf16_aiter16__k1p0",
+     "lane": 0,
+     "stack": "studio",
+     "timed": true,
+     "family": "flux3-klein",
+     "comparison": "flux3-klein_amd-gfx1151-linux",
+     "est_min": 3.28
+    }
+   ],
+   [
+    {
+     "tag": "flux3-klein_amd-gfx1151-linux__s_bf16_aiter4__k1p1",
+     "lane": 0,
+     "stack": "studio",
+     "timed": true,
+     "family": "flux3-klein",
+     "comparison": "flux3-klein_amd-gfx1151-linux",
+     "est_min": 3.28
+    }
+   ],
+   [
+    {
+     "tag": "flux3-klein_amd-gfx1151-linux__s_bf16_default16__k1p2",
+     "lane": 0,
+     "stack": "studio",
+     "timed": true,
+     "family": "flux3-klein",
+     "comparison": "flux3-klein_amd-gfx1151-linux",
+     "est_min": 3.28
+    }
+   ],
+   [
+    {
+     "tag": "flux3-klein_amd-gfx1151-linux__s_bf16_default4__k1p3",
+     "lane": 0,
+     "stack": "studio",
+     "timed": true,
+     "family": "flux3-klein",
+     "comparison": "flux3-klein_amd-gfx1151-linux",
+     "est_min": 3.28
+    }
+   ],
+   [
+    {
+     "tag": "flux3-klein_amd-gfx1151-linux__s_bf16_default4__k1p4",
+     "lane": 0,
+     "stack": "studio",
+     "timed": true,
+     "family": "flux3-klein",
+     "comparison": "flux3-klein_amd-gfx1151-linux",
+     "est_min": 3.28
+    }
+   ],
+   [
+    {
+     "tag": "flux3-klein_amd-gfx1151-linux__s_bf16_default16__k1p5",
+     "lane": 0,
+     "stack": "studio",
+     "timed": true,
+     "family": "flux3-klein",
+     "comparison": "flux3-klein_amd-gfx1151-linux",
+     "est_min": 3.28
+    }
+   ],
+   [
+    {
+     "tag": "flux3-klein_amd-gfx1151-linux__s_bf16_aiter4__k1p6",
+     "lane": 0,
+     "stack": "studio",
+     "timed": true,
+     "family": "flux3-klein",
+     "comparison": "flux3-klein_amd-gfx1151-linux",
+     "est_min": 3.28
+    }
+   ],
+   [
+    {
+     "tag": "flux3-klein_amd-gfx1151-linux__s_bf16_aiter16__k1p7",
+     "lane": 0,
+     "stack": "studio",
+     "timed": true,
+     "family": "flux3-klein",
+     "comparison": "flux3-klein_amd-gfx1151-linux",
+     "est_min": 3.28
+    }
+   ],
+   [
+    {
+     "tag": "flux3-klein_amd-gfx1151-linux__s_bf16_aiter16__k2p0",
+     "lane": 0,
+     "stack": "studio",
+     "timed": true,
+     "family": "flux3-klein",
+     "comparison": "flux3-klein_amd-gfx1151-linux",
+     "est_min": 3.28
+    }
+   ],
+   [
+    {
+     "tag": "flux3-klein_amd-gfx1151-linux__s_bf16_aiter4__k2p1",
+     "lane": 0,
+     "stack": "studio",
+     "timed": true,
+     "family": "flux3-klein",
+     "comparison": "flux3-klein_amd-gfx1151-linux",
+     "est_min": 3.28
+    }
+   ],
+   [
+    {
+     "tag": "flux3-klein_amd-gfx1151-linux__s_bf16_default16__k2p2",
+     "lane": 0,
+     "stack": "studio",
+     "timed": true,
+     "family": "flux3-klein",
+     "comparison": "flux3-klein_amd-gfx1151-linux",
+     "est_min": 3.28
+    }
+   ],
+   [
+    {
+     "tag": "flux3-klein_amd-gfx1151-linux__s_bf16_default4__k2p3",
+     "lane": 0,
+     "stack": "studio",
+     "timed": true,
+     "family": "flux3-klein",
+     "comparison": "flux3-klein_amd-gfx1151-linux",
+     "est_min": 3.28
+    }
+   ],
+   [
+    {
+     "tag": "flux3-klein_amd-gfx1151-linux__s_bf16_default4__k2p4",
+     "lane": 0,
+     "stack": "studio",
+     "timed": true,
+     "family": "flux3-klein",
+     "comparison": "flux3-klein_amd-gfx1151-linux",
+     "est_min": 3.28
+    }
+   ],
+   [
+    {
+     "tag": "flux3-klein_amd-gfx1151-linux__s_bf16_default16__k2p5",
+     "lane": 0,
+     "stack": "studio",
+     "timed": true,
+     "family": "flux3-klein",
+     "comparison": "flux3-klein_amd-gfx1151-linux",
+     "est_min": 3.28
+    }
+   ],
+   [
+    {
+     "tag": "flux3-klein_amd-gfx1151-linux__s_bf16_aiter4__k2p6",
+     "lane": 0,
+     "stack": "studio",
+     "timed": true,
+     "family": "flux3-klein",
+     "comparison": "flux3-klein_amd-gfx1151-linux",
+     "est_min": 3.28
+    }
+   ],
+   [
+    {
+     "tag": "flux3-klein_amd-gfx1151-linux__s_bf16_aiter16__k2p7",
+     "lane": 0,
+     "stack": "studio",
+     "timed": true,
+     "family": "flux3-klein",
+     "comparison": "flux3-klein_amd-gfx1151-linux",
+     "est_min": 3.28
+    }
+   ]
+  ],
+  "est_min": 114.1,
+  "est_cu": 0.0
+ },
+ "base_sha": "da4430f3209ef5b2b1f1e47ce9b8c8ef5a1691b1",
+ "bline_ref": "v0.46.2",
+ "branch": "amd-ci-nov22-aiter"
+}
