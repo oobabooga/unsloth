@@ -30,7 +30,7 @@ name: "AMD CI: AMD levers probe on gfx1151 (Linux + Windows, nov21)"
 
 on:
   push:
-    branches: [amd-ci-nov21-levers-win4]
+    branches: [amd-ci-nov21-foldwin]
   workflow_dispatch:
 
 permissions:
@@ -38,7 +38,7 @@ permissions:
 
 env:
   PR: "18760"
-  BASE_SHA: "8b7cde79ebf5a901b2fd936bbee214fb8c7562c7"
+  BASE_SHA: "f5dfe6812a5dcedbb5075410a7ed5d463cc984e9"
   UPSTREAM: "https://github.com/unslothai/unsloth"
   # Set to "1" for a PR already merged: compares the merge commit to its parent.
   MERGED: "1"
@@ -143,7 +143,7 @@ jobs:
           Remove-Item Env:HF_TOKEN -ErrorAction SilentlyContinue
           & $env:AMD_CI_PY -m pip install -q --no-deps lpips *>&1 | Out-File -Encoding utf8 "$env:AMD_CI_WORK\out\levers\lpips.log"
           & $env:AMD_CI_PY "$env:GITHUB_WORKSPACE\amd_ci\probes\levers_probe.py" --checkout $states.paths.head `
-            --out "$env:AMD_CI_WORK\out\levers\obs.json" --work "$env:AMD_CI_WORK\levers_work" --skip p1,v6,p3,vae_gn,vae_fused,mapping,p2 *>&1 |
+            --out "$env:AMD_CI_WORK\out\levers\obs.json" --work "$env:AMD_CI_WORK\levers_work" --skip p1,v6,p3,vae_gn,vae_fused,mapping,p2,p2x *>&1 |
             Out-File -Encoding utf8 "$env:AMD_CI_WORK\out\levers\probe.log"
           Write-Host "probe exit $LASTEXITCODE"
           Get-Content "$env:AMD_CI_WORK\out\levers\probe.log" -Tail 5 | Write-Host
