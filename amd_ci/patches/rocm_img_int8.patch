@@ -214,7 +214,7 @@ index d755868586..7fec933226 100644
              transformer_cls,
              base_repo,
 diff --git a/studio/backend/core/inference/diffusion_native_hosted.py b/studio/backend/core/inference/diffusion_native_hosted.py
-index a656598b0d..91ba9a5f87 100644
+index a656598b0d..1a01e7bd6c 100644
 --- a/studio/backend/core/inference/diffusion_native_hosted.py
 +++ b/studio/backend/core/inference/diffusion_native_hosted.py
 @@ -45,9 +45,14 @@ def native_hosted_pickle(fam: Any) -> bool:
@@ -283,22 +283,30 @@ index a656598b0d..91ba9a5f87 100644
                  )
                  return None
              parts[fqn + ".weight"] = HostedInt8Parts(codes, scale, zero)
-@@ -242,10 +252,12 @@ def load_native_from_hosted(
+@@ -242,10 +252,19 @@ def load_native_from_hosted(
          model.load_state_dict(state, strict = True, assign = True)
          del state
          if any(t.device.type == "meta" for t in (*model.parameters(), *model.buffers())):
 -            _log(logger, "warning", "hosted int8 checkpoint left meta tensors; not used")
 +            _log(logger, "warning", "hosted int8 checkpoint left meta tensors; not used", tag = tag)
              return None
-         if any(p.dtype != torch.bfloat16 for p in model.parameters() if p.is_floating_point()):
+-        if any(p.dtype != torch.bfloat16 for p in model.parameters() if p.is_floating_point()):
 -            _log(logger, "info", "hosted int8 checkpoint not used (a non-bf16 dense tensor)")
++        # float32 only where a bf16 from_pretrained keeps it (``_keep_in_fp32_modules``, e.g. FLUX.3's norm_q / norm_k).
++        keep_fp32 = set(getattr(transformer_cls, "_keep_in_fp32_modules", None) or ())
++        if any(
++            p.dtype != torch.bfloat16
++            and not (p.dtype == torch.float32 and keep_fp32 & set(name.split(".")))
++            for name, p in model.named_parameters()
++            if p.is_floating_point()
++        ):
 +            _log(
 +                logger, "info", "hosted int8 checkpoint not used (a non-bf16 dense tensor)", tag = tag
 +            )
              return None
          model.eval()
          try:
-@@ -262,10 +274,16 @@ def load_native_from_hosted(
+@@ -262,10 +281,16 @@ def load_native_from_hosted(
              "info",
              f"read {len(quantised)} int8 ConvRot layers of {component} from the hosted checkpoint as native "
              f"Linears in {time.perf_counter() - t0:.1f} s (no dense shards, no runtime quantise)",
@@ -807,3 +815,38 @@ index 0000000000..0afcbd6145
 +        str(path), object, "unused", spec = {"scheme": "int8"}, family = None, logger = _Log()
 +    )
 +    assert seen and seen[0].startswith("video.native_hosted: ")
+diff --git a/studio/backend/tests/test_video_native_hosted.py b/studio/backend/tests/test_video_native_hosted.py
+index 1fa7b16805..4e66361832 100644
+--- a/studio/backend/tests/test_video_native_hosted.py
++++ b/studio/backend/tests/test_video_native_hosted.py
+@@ -251,6 +251,30 @@ def test_refuses_a_file_that_is_not_the_native_build(tmp_path, case):
+     assert _load(path, cfg_dir) is None
+ 
+ 
++def test_keeps_float32_only_where_from_pretrained_does(tmp_path):
++    # FLUX.3 stores its _keep_in_fp32_modules (norm_q / norm_k) as F32, which a bf16 from_pretrained keeps too.
++    def widen(state):
++        state["scale_shift_table"] = state["scale_shift_table"].float()
++
++    path, cfg_dir, _ = _write_hosted(tmp_path, mutate = widen)
++    # Without a keep-list entry a float32 dense tensor is not the bf16 build: refused, as before.
++    assert _load(path, cfg_dir) is None
++
++    class Kept(CLS):
++        _keep_in_fp32_modules = ["scale_shift_table"]
++
++    model = NH.load_native_from_hosted(
++        str(path), Kept, str(cfg_dir), spec = _spec(), family = FAMILY, logger = None
++    )
++    assert model is not None
++    assert model.scale_shift_table.dtype == torch.float32
++    assert all(
++        p.dtype == torch.bfloat16
++        for n, p in model.named_parameters()
++        if p.is_floating_point() and n != "scale_shift_table"
++    )
++
++
+ def test_refuses_a_weight_only_or_unrotated_native_build(tmp_path):
+     path, cfg_dir, _ = _write_hosted(tmp_path)
+     assert _load(path, cfg_dir, spec = native_spec("int8", FAMILY, act_int8 = False)) is None
