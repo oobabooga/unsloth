@@ -30,7 +30,7 @@ name: "AMD CI (Windows): validate PR 18760"
 
 on:
   push:
-    branches: [amd-ci-nov21-trainlev2-win]
+    branches: [amd-ci-nov21-trainlev3-win]
   workflow_dispatch:
 
 permissions:
@@ -166,6 +166,19 @@ jobs:
           # This is the last command, so its exit status is the step's.
           & $env:AMD_CI_PY "$env:GITHUB_WORKSPACE\amd_ci\lib\announce.py" `
             "$env:AMD_CI_WORK\out\windows"
+
+      - name: A/A (base vs base, loss and speed noise floor)
+        if: always()
+        run: |
+          $ErrorActionPreference = "Continue"
+          & $env:AMD_CI_PY -c "import json, os; w = os.environ['AMD_CI_WORK'] + '\\out\\'; s = json.load(open(w + 'states.json', encoding='utf-8')); s['commits']['head'] = s['commits']['base']; s['paths']['head'] = s['paths']['base']; json.dump(s, open(w + 'states_aa.json', 'w', encoding='utf-8'), indent=1)"
+          & $env:AMD_CI_PY "$env:GITHUB_WORKSPACE\amd_ci\lib\differential.py" `
+            --states "$env:AMD_CI_WORK\out\states_aa.json" `
+            --probe "$env:GITHUB_WORKSPACE/amd_ci/probes/diffusion_lora_train_probe.py" `
+            --criteria "$env:GITHUB_WORKSPACE/amd_ci/criteria/diffusion_lora_train.py" `
+            --out-dir "$env:AMD_CI_WORK\out\windows_aa" `
+            --python "$env:AMD_CI_PY" -- -- --suite flux3 --control-state none --precisions bf16,nf4 --steps 20 --no-lora-render --budget-min 220
+          exit 0
 
       - uses: actions/upload-artifact@v4
         if: always()
