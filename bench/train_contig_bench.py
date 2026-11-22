@@ -26,7 +26,24 @@ from pathlib import Path
 
 DATASET = "multimodalart/1920-raider-waite-tarot-public-domain"
 MODEL = "black-forest-labs/FLUX.2-klein-base-4B"
-CELLS = {"flux2k_1024": 1024, "flux2k_512": 512}
+CELLS = {"flux2k_1024": 1024, "flux2k_768": 768, "flux2k_512": 512}
+_ENG = {"eager": 0, "traced": 0}
+_ORIG_HEADS_MAJOR = []
+
+
+def _bump_traced(ctx):  # comptime callback: runs once per trace, no graph break, no free variables
+    _ENG["traced"] += 1
+
+
+def _counted_heads_major(t):
+    import torch
+    from torch._dynamo.comptime import comptime
+
+    if torch.compiler.is_compiling():
+        comptime(_bump_traced)
+    else:
+        _ENG["eager"] += 1
+    return _ORIG_HEADS_MAJOR[0](t)
 KILL_ENV = "UNSLOTH_DIFFUSION_ROCM_TRAIN_CONTIGUOUS_QKV"
 
 
@@ -207,8 +224,6 @@ def _counters():
 
 def stage_train(args) -> dict:
     import torch
-    from torch._dynamo.comptime import comptime
-
     backend = Path(args.checkout) / "studio" / "backend"
     res = {"arm": args.arm, "cell": args.cell, "checkout": args.checkout, "kill_env": os.environ.get(KILL_ENV)}
     assert str(backend) == sys.path[0]
@@ -217,17 +232,8 @@ def stage_train(args) -> dict:
     res["attention_module"] = da.__file__
     assert da.__file__.startswith(str(backend)), "arm imports another tree"
     # Engagement: _heads_major is the one copy the wrapper makes, in every tree (inference k/v hook on base too).
-    eng = {"eager": 0, "traced": 0}
-    orig = da._heads_major
-
-    def counted(t):
-        if torch.compiler.is_compiling():
-            comptime(lambda ctx: eng.__setitem__("traced", eng["traced"] + 1))
-        else:
-            eng["eager"] += 1
-        return orig(t)
-
-    da._heads_major = counted
+    _ORIG_HEADS_MAJOR.append(da._heads_major)
+    da._heads_major = _counted_heads_major
     installs = []
     if hasattr(da, "install_rocm_contiguous_qkv_training"):
         real_install = da.install_rocm_contiguous_qkv_training
@@ -281,7 +287,7 @@ def stage_train(args) -> dict:
     res["step_s"] = [round(b - a, 4) for a, b in zip(times, times[1:])]  # index 0 = step 2
     tail = res["step_s"][1:]  # from step 3
     res["median_step_s_from3"] = round(statistics.median(tail), 4) if tail else None
-    res["engaged"] = dict(eng)
+    res["engaged"] = dict(_ENG)
     res["installs"] = installs
     res["dynamo"] = _counters()
     res["warnings"] = [str(e.get("message"))[:400] for e in events if e.get("type") == "warning"]
@@ -372,8 +378,8 @@ def main() -> int:
     ap.add_argument("--data-dir", default = "")
     ap.add_argument("--steps", type = int, default = 20)
     ap.add_argument("--images", type = int, default = 8)
-    ap.add_argument("--tokens", default = "1024,1536,2048,2560,3072,4096,4608,8192")
-    ap.add_argument("--block-tokens", default = "1024,1536,2048,3072,4096,4608")
+    ap.add_argument("--tokens", default = "1024,1536,2048,2304,2560,2816,3072,4096,4608,8192")
+    ap.add_argument("--block-tokens", default = "1024,1536,2048,2560,2816,3072,4096,4608")
     ap.add_argument("--micro", action = "store_true")
     ap.add_argument("--plan", default = "", help = "cell:arm,arm,...;cell:... (arms base|head|kill, run in order)")
     ap.add_argument("--out", default = "")

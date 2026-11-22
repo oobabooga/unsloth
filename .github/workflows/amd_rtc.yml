@@ -14,7 +14,7 @@ permissions:
 env:
   UPSTREAM: "https://github.com/unslothai/unsloth"
   BASE_SHA: "2bdf8913307d3300d7d624589318dcdc63383a58"
-  PLAN: "flux2k_1024:base,head,kill,base"
+  PLAN: "flux2k_1024:base,head,kill,head,kill,base,kill,base,head;flux2k_768:base,head,kill,head,kill,base,kill,base,head;flux2k_512:base,head,kill,head,kill,base,kill,base,head"
   MICRO: "1"
   STEPS: "20"
 

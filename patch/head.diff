@@ -1,8 +1,8 @@
 diff --git a/studio/backend/core/inference/diffusion_attention.py b/studio/backend/core/inference/diffusion_attention.py
-index fa8d8a7d21..9bab56340e 100644
+index fa8d8a7d21..e4224170a5 100644
 --- a/studio/backend/core/inference/diffusion_attention.py
 +++ b/studio/backend/core/inference/diffusion_attention.py
-@@ -648,6 +648,59 @@ def _heads_major(t: Any) -> Any:
+@@ -648,6 +648,58 @@ def _heads_major(t: Any) -> Any:
      return t.permute(0, 2, 1, 3).contiguous().permute(0, 2, 1, 3)
  
  
@@ -43,7 +43,6 @@ index fa8d8a7d21..9bab56340e 100644
 +            AttentionBackendName,
 +            _AttentionBackendRegistry,
 +        )
-+
 +        backends = _AttentionBackendRegistry._backends
 +        native_fn = backends[AttentionBackendName.NATIVE]
 +    except Exception:  # noqa: BLE001
@@ -62,7 +61,7 @@ index fa8d8a7d21..9bab56340e 100644
  def install_rocm_contiguous_kv(target: Any) -> bool:
      """gfx1151 only: k/v over L2 reach SDPA contiguous (q is not copied). False elsewhere: other GPUs untouched."""
      if os.environ.get(ROCM_CONTIGUOUS_KV_ENV, "").strip().lower() in ("0", "false", "no", "off"):
-@@ -656,10 +709,6 @@ def install_rocm_contiguous_kv(target: Any) -> bool:
+@@ -656,10 +708,6 @@ def install_rocm_contiguous_kv(target: Any) -> bool:
          return False
      try:
          import torch
@@ -73,7 +72,7 @@ index fa8d8a7d21..9bab56340e 100644
  
          device = torch.device(
              _indexed_cuda_device(
-@@ -672,39 +721,76 @@ def install_rocm_contiguous_kv(target: Any) -> bool:
+@@ -672,39 +720,79 @@ def install_rocm_contiguous_kv(target: Any) -> bool:
          )
          index = device.index if device.index is not None else torch.cuda.current_device()
          l2 = int(getattr(torch.cuda.get_device_properties(index), "L2_cache_size", 0) or 0)
@@ -107,12 +106,15 @@ index fa8d8a7d21..9bab56340e 100644
  
 -    setattr(_contiguous_kv, ROCM_CONTIGUOUS_KV_ATTR, True)
 -    _contiguous_kv.__wrapped__ = native_fn  # type: ignore[attr-defined]
-+# Training (forward + backward) copies q as well: gfx1151, torch 2.11 + AOTriton 0.11.2, 24 heads x 128, bf16,
-+# fwd+bwd 1.27x at 4,096 tokens, 1.31x at 5,070, 2.6x at 27,280, but 11% slower at 1,024, hence the token floor.
-+# Bit-identical outputs and gradients. 0 disables; a positive integer moves the floor.
++# Training (forward + backward) copies q as well: on gfx1151 (torch 2.11 + AOTriton 0.11.2, 24 heads x 128, bf16) q/k/v
++# fwd+bwd is 1.10x at 2,560 tokens, 1.26x at 4,096 and 1.36x at 8,192, where k/v alone gains 0.97x / 1.02x / 1.08x;
++# at 1,024 tokens it is 7% slower, at 2,048 even, hence the token floor. Bit-identical outputs and gradients.
++# 0 disables; a positive integer moves the floor.
 +ROCM_CONTIGUOUS_QKV_TRAIN_ENV = "UNSLOTH_DIFFUSION_ROCM_TRAIN_CONTIGUOUS_QKV"
-+ROCM_CONTIGUOUS_QKV_TRAIN_MIN_TOKENS = 4096
-+_ROCM_CONTIGUOUS_QKV_TRAIN: dict[int, int] = {}  # device index -> token floor, gfx1151 cards of a training run only
++ROCM_CONTIGUOUS_QKV_TRAIN_MIN_TOKENS = 2560
++_ROCM_CONTIGUOUS_QKV_TRAIN: dict[
++    int, int
++] = {}  # device index -> token floor, gfx1151 cards of a training run only
 +
 +
 +def _rocm_contiguous_qkv_wanted(query: Any, key: Any, value: Any) -> bool:
@@ -175,31 +177,29 @@ index fa8d8a7d21..9bab56340e 100644
  
  def select_attention_backend(
 diff --git a/studio/backend/core/training/diffusion_train_common.py b/studio/backend/core/training/diffusion_train_common.py
-index bbd2a298a4..6babef084a 100644
+index bbd2a298a4..3b4f63f820 100644
 --- a/studio/backend/core/training/diffusion_train_common.py
 +++ b/studio/backend/core/training/diffusion_train_common.py
-@@ -2129,6 +2129,13 @@ def _apply_perf_flags(
+@@ -2129,6 +2129,12 @@ def _apply_perf_flags(
                      cuda_backends.enable_cudnn_sdp(False)
      except Exception:  # noqa: BLE001 -- perf flags are never fatal
          pass
 +    try:
 +        # gfx1151: diffusers' native backend hands SDPA strided q/k/v; long sequences train faster on contiguous copies.
 +        from core.inference.diffusion_attention import install_rocm_contiguous_qkv_training
-+
 +        snap["rocm_contiguous_qkv"] = install_rocm_contiguous_qkv_training()
 +    except Exception:  # noqa: BLE001 -- perf only
 +        pass
      return snap
  
  
-@@ -2140,6 +2147,13 @@ def _restore_perf_flags(snap: Optional[dict]) -> None:
+@@ -2140,6 +2146,12 @@ def _restore_perf_flags(snap: Optional[dict]) -> None:
      from core.inference.diffusion_speed import restore_backend_flags
  
      restore_backend_flags(snap.get("flags"))
 +    if snap.get("rocm_contiguous_qkv"):
 +        try:
 +            from core.inference.diffusion_attention import uninstall_rocm_contiguous_qkv_training
-+
 +            uninstall_rocm_contiguous_qkv_training(snap["rocm_contiguous_qkv"])
 +        except Exception:  # noqa: BLE001 -- best-effort restore
 +            pass
@@ -208,10 +208,10 @@ index bbd2a298a4..6babef084a 100644
  
 diff --git a/studio/backend/tests/test_diffusion_rocm_train_contiguous_qkv.py b/studio/backend/tests/test_diffusion_rocm_train_contiguous_qkv.py
 new file mode 100644
-index 0000000000..6f55f7ae1e
+index 0000000000..8456363e84
 --- /dev/null
 +++ b/studio/backend/tests/test_diffusion_rocm_train_contiguous_qkv.py
-@@ -0,0 +1,179 @@
+@@ -0,0 +1,194 @@
 +# SPDX-License-Identifier: AGPL-3.0-only
 +# Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
 +
@@ -237,7 +237,9 @@ index 0000000000..6f55f7ae1e
 +@pytest.fixture
 +def registry(monkeypatch):
 +    backends = _AttentionBackendRegistry._backends
-+    monkeypatch.setitem(backends, AttentionBackendName.NATIVE, backends[AttentionBackendName.NATIVE])
++    monkeypatch.setitem(
++        backends, AttentionBackendName.NATIVE, backends[AttentionBackendName.NATIVE]
++    )
 +    monkeypatch.setattr(da, "_ROCM_CONTIGUOUS_KV_L2", {})
 +    monkeypatch.setattr(da, "_ROCM_CONTIGUOUS_QKV_TRAIN", {})
 +    monkeypatch.delenv(da.ROCM_CONTIGUOUS_QKV_TRAIN_ENV, raising = False)
@@ -245,7 +247,12 @@ index 0000000000..6f55f7ae1e
 +    return backends
 +
 +
-+def _fake_cards(monkeypatch, archs = ("gfx1151",), version = "2.11.0+rocm7.13.0", hip = None):
++def _fake_cards(
++    monkeypatch,
++    archs = ("gfx1151",),
++    version = "2.11.0+rocm7.13.0",
++    hip = None,
++):
 +    """An AMD SDK wheel by default: ``version.hip`` unset, the ROCm tag only in ``__version__``."""
 +    monkeypatch.setattr(torch.version, "hip", hip, raising = False)
 +    monkeypatch.setattr(torch, "__version__", version, raising = False)
@@ -267,7 +274,9 @@ index 0000000000..6f55f7ae1e
 +        (("gfx1151",), "2.11.0+cu130", None),  # NVIDIA build: arch strings never consulted
 +    ],
 +)
-+def test_other_gpus_and_builds_keep_the_stock_native_backend(registry, monkeypatch, archs, version, hip):
++def test_other_gpus_and_builds_keep_the_stock_native_backend(
++    registry, monkeypatch, archs, version, hip
++):
 +    _fake_cards(monkeypatch, archs, version, hip)
 +    native = registry[AttentionBackendName.NATIVE]
 +    assert da.install_rocm_contiguous_qkv_training() == ()
@@ -305,23 +314,29 @@ index 0000000000..6f55f7ae1e
 +    assert registry[AttentionBackendName.NATIVE] is native
 +
 +
-+@pytest.mark.parametrize("raw, floor", [("", 4096), ("auto", 4096), ("8192", 8192), ("1", 1)])
++@pytest.mark.parametrize("raw, floor", [("", 2560), ("auto", 2560), ("8192", 8192), ("1", 1)])
 +def test_env_moves_the_token_floor(registry, monkeypatch, raw, floor):
 +    _fake_cards(monkeypatch)
 +    monkeypatch.setenv(da.ROCM_CONTIGUOUS_QKV_TRAIN_ENV, raw)
 +    assert da.install_rocm_contiguous_qkv_training() == (0,)
 +    assert da._ROCM_CONTIGUOUS_QKV_TRAIN == {0: floor}
++    assert da.ROCM_CONTIGUOUS_QKV_TRAIN_MIN_TOKENS == 2560
 +
 +
 +def test_threshold_keeps_short_and_cross_attention_on_the_current_path(monkeypatch):
-+    monkeypatch.setattr(da, "_ROCM_CONTIGUOUS_QKV_TRAIN", {None: 4096})
-+    at, below, text = (torch.zeros(1, s, 2, 8) for s in (4096, 4095, 512))
++    floor = da.ROCM_CONTIGUOUS_QKV_TRAIN_MIN_TOKENS
++    monkeypatch.setattr(da, "_ROCM_CONTIGUOUS_QKV_TRAIN", {None: floor})
++    at, below, text = (torch.zeros(1, s, 2, 8) for s in (floor, floor - 1, 512))
 +    assert da._rocm_contiguous_qkv_wanted(at, at, at)
-+    assert not da._rocm_contiguous_qkv_wanted(below, below, below)  # a 1,024 px still: 1,024 to 4,095 tokens
++    assert not da._rocm_contiguous_qkv_wanted(
++        below, below, below
++    )  # a 1,024 px Wan still (1,024 tokens), a 512 px FLUX.2 (1,536)
 +    assert not da._rocm_contiguous_qkv_wanted(at, text, text)  # cross-attention to a short text
 +    assert not da._rocm_contiguous_qkv_wanted(at.flatten(2), at, at)
-+    monkeypatch.setattr(da, "_ROCM_CONTIGUOUS_QKV_TRAIN", {5: 4096})
-+    assert not da._rocm_contiguous_qkv_wanted(at, at, at)  # the tensor's card is not a covered gfx1151
++    monkeypatch.setattr(da, "_ROCM_CONTIGUOUS_QKV_TRAIN", {5: floor})
++    assert not da._rocm_contiguous_qkv_wanted(
++        at, at, at
++    )  # the tensor's card is not a covered gfx1151
 +    monkeypatch.setattr(da, "_ROCM_CONTIGUOUS_QKV_TRAIN", {})
 +    assert not da._rocm_contiguous_qkv_wanted(at, at, at)
 +
@@ -391,3 +406,172 @@ index 0000000000..6f55f7ae1e
 +    dtc._restore_perf_flags(snap)
 +    assert da._ROCM_CONTIGUOUS_QKV_TRAIN == {}
 +    assert dtc._apply_perf_flags(cfg, "cpu").get("rocm_contiguous_qkv") is None
+diff --git a/tests/test_attention_dispatch_saved_attention.py b/tests/test_attention_dispatch_saved_attention.py
+index 8f4dcb1232..31cb1d902d 100644
+--- a/tests/test_attention_dispatch_saved_attention.py
++++ b/tests/test_attention_dispatch_saved_attention.py
+@@ -127,8 +127,6 @@ def test_replay_reuses_the_attention_output(monkeypatch, checkpointing):
+ 
+ def test_inference_and_unset_flag_take_the_plain_call(monkeypatch, checkpointing):
+     calls = []
+-    # The explicit route outside a frame (on ROCm a frameless call stays plain: tested below).
+-    monkeypatch.setattr(ad, "_ROCM_SDPA_GUARD", False)
+     monkeypatch.setattr(ad, "_saved_attention_call", lambda fn, *t: calls.append(1) or fn(*t))
+     q = torch.randn(1, H, S, D)
+     k = torch.randn(1, KV, S, D)
+@@ -306,79 +304,3 @@ def test_auto_mode_reuses_through_run_attention(monkeypatch, checkpointing):
+     )
+     assert SA.SAVED_ATTENTION_STATS["declined_unmeasured"] == 2
+     assert SA.SAVED_ATTENTION_STATS["reused"] == 2
+-
+-
+-# ROCm with UNSLOTH_GC_SAVE_ATTENTION=1: unsloth_zoo decides per checkpoint frame and device.
+-
+-
+-def test_rocm_explicit_setting_binds_from_configuration(monkeypatch):
+-    """Routing is bound from the setting at import, never from the current GPU's eligibility (which
+-    would freeze the first GPU's answer and allocate on it before ranks are placed)."""
+-    if not hasattr(SA, "save_attention_requested"):
+-        pytest.skip(
+-            "unsloth_zoo without per-device ROCm eligibility: the setting is read as before"
+-        )
+-    monkeypatch.setattr(
+-        SA, "_ROCM_SDPA_SELECT", getattr(SA, "_ROCM_SDPA_SELECT", None), raising = False
+-    )
+-    monkeypatch.setattr(ad, "_ROCM_SDPA_GUARD", True)
+-    monkeypatch.setattr(torch.version, "hip", "7.13.0", raising = False)
+-    monkeypatch.setenv("UNSLOTH_GC_SAVE_ATTENTION", "1")
+-    touched = []
+-    monkeypatch.setattr(SA, "save_attention_enabled", lambda *a: touched.append(a) or False)
+-    monkeypatch.setattr(
+-        SA, "_rocm_sdpa_is_kept", lambda *a, **k: touched.append(a) or False, raising = False
+-    )
+-    assert ad._load_saved_attention() == (SA.saved_attention_call, None)
+-    assert touched == []
+-    assert SA._ROCM_SDPA_SELECT is ad._select_rocm_saved_sdpa
+-
+-
+-def test_rocm_explicit_routing_without_a_frame_compiles_fullgraph(monkeypatch, checkpointing):
+-    """No frame (no Unsloth checkpoint, or a device whose SDPA keeps nothing): the call stays in the
+-    caller's graph, so fullgraph=True training compiles; inside a checkpoint the replay still reuses."""
+-    if not hasattr(SA, "save_attention_requested"):
+-        pytest.skip(
+-            "unsloth_zoo without per-device ROCm eligibility keeps ROCm saved attention off"
+-        )
+-    monkeypatch.setattr(ad, "_ROCM_SDPA_GUARD", True)
+-    monkeypatch.setattr(torch.version, "hip", "7.13.0", raising = False)
+-    monkeypatch.setattr(ad, "_SAVE_ATTENTION", True)
+-    monkeypatch.setattr(ad, "_SAVE_ATTENTION_MIN_SEQ", None)
+-    monkeypatch.setattr(ad, "_saved_attention_call", SA.saved_attention_call)
+-    monkeypatch.setenv("UNSLOTH_GC_SAVE_ATTENTION", "1")
+-    q = torch.randn(1, H, S, D, requires_grad = True)
+-    k = torch.randn(1, KV, S, D, requires_grad = True)
+-    torch._dynamo.reset()
+-    try:
+-        out = torch.compile(_attend(), backend = "eager", fullgraph = True)(q, k, k)
+-    finally:
+-        torch._dynamo.reset()
+-    torch.testing.assert_close(out, _attend()(q, k, k))
+-    weights = _weights()
+-    full = _grads(weights, _attend())
+-    saved = _grads(weights, _attend())
+-    torch.testing.assert_close(saved[0], full[0])
+-    assert SA.SAVED_ATTENTION_STATS["reused"] == 4 and saved[2] == 2
+-
+-
+-def test_rocm_saved_attention_selector_applies_the_sdpa_check(monkeypatch):
+-    from torch.nn.attention import SDPBackend
+-
+-    import unsloth.utils.rocm_sdpa_check as check
+-
+-    monkeypatch.setattr(ad, "_ROCM_SDPA_GUARD", True)
+-    q = torch.empty(1, 2, 16, 64, dtype = torch.bfloat16, requires_grad = True)
+-    verdict = {"flash": True, "efficient": True}
+-    monkeypatch.setattr(check, "rocm_sdpa_verdict", lambda index = 0: verdict)
+-    assert ad._select_rocm_saved_sdpa(q) == int(SDPBackend.FLASH_ATTENTION)
+-    # Flash failed rocm_sdpa_check: never reported as a kept kernel, even when it is the only one enabled.
+-    verdict = {"flash": False, "efficient": True}
+-    assert ad._select_rocm_saved_sdpa(q) not in (
+-        int(SDPBackend.FLASH_ATTENTION),
+-        int(SDPBackend.EFFICIENT_ATTENTION),
+-    )
+-    from torch.nn.attention import sdpa_kernel
+-
+-    with sdpa_kernel(SDPBackend.FLASH_ATTENTION):
+-        assert ad._select_rocm_saved_sdpa(q) == int(SDPBackend.ERROR)
+diff --git a/unsloth/utils/attention_dispatch.py b/unsloth/utils/attention_dispatch.py
+index 8c10fec4b1..79e7150f41 100644
+--- a/unsloth/utils/attention_dispatch.py
++++ b/unsloth/utils/attention_dispatch.py
+@@ -1736,11 +1736,7 @@ def run_attention(
+         _SAVE_ATTENTION
+         and context.training
+         and manager is None
+-        and (
+-            _explicit_saves_attention()
+-            if _SAVE_ATTENTION_MIN_SEQ is None
+-            else _auto_saves_attention(config, context)
+-        )
++        and (_SAVE_ATTENTION_MIN_SEQ is None or _auto_saves_attention(config, context))
+     ):
+         # GC replay reuses the first pass's attention output + logsumexp; graph breaks under compile.
+         traced = torch.compiler.is_compiling()
+@@ -1802,45 +1798,14 @@ def _saved_attention_frames_possible() -> bool:
+     return bool(flag) and bool(flag[0])
+ 
+ 
+-def _explicit_saves_attention() -> bool:
+-    # UNSLOTH_GC_SAVE_ATTENTION=1 / offload. ROCm: zoo makes a frame only for a checkpoint on a device
+-    # whose SDPA keeps an attention kernel, so a call outside a frame stays in the caller's graph instead
+-    # of crossing compiler.disable (Unsupported under fullgraph=True). Dynamo guards on the frame read.
+-    return not _ROCM_SDPA_GUARD or _saved_attention_active()
+-
+-
+-def _select_rocm_saved_sdpa(q):
+-    """zoo's ROCm saved-attention selector: the SDPA backend a training call on q's device runs here,
+-    under the same rocm_sdpa_check filter as scaled_dot_product_attention; a refused kernel is ERROR."""
+-    from torch.nn.attention import SDPBackend
+-    from .rocm_sdpa_check import rocm_sdpa_verdict
+-
+-    index = q.device.index
+-    verdict = rocm_sdpa_verdict(index)
+-    backends = _CUDNN_FREE_BACKENDS[_rocm_sdpa_index_now(index)]
+-    with _sdpa_kernel(backends) if backends is not None else contextlib.nullcontext():
+-        choice = int(torch._fused_sdp_choice(q, q, q, is_causal = True))
+-    if (choice == int(SDPBackend.FLASH_ATTENTION) and not verdict["flash"]) or (
+-        choice == int(SDPBackend.EFFICIENT_ATTENTION) and not verdict["efficient"]
+-    ):
+-        return int(SDPBackend.ERROR)
+-    return choice
+-
+-
+ def _load_saved_attention():
+     """(call, min_seq): min_seq None = every training call (UNSLOTH_GC_SAVE_ATTENTION=1 / offload);
+-    an int = automatic mode from that query length. An unsloth_zoo without automatic mode stays off.
+-    Configuration only: no device is touched here (ranks are placed later; zoo decides per checkpoint)."""
++    an int = automatic mode from that query length. An unsloth_zoo without automatic mode stays off."""
+     try:
+-        from unsloth_zoo import saved_attention as sa
+-        saved_attention_call = sa.saved_attention_call
++        from unsloth_zoo.saved_attention import save_attention_enabled, saved_attention_call
+     except Exception:
+         return None, None
+-    # Older zoo: save_attention_enabled() is the configuration (and keeps ROCm off).
+-    if getattr(sa, "save_attention_requested", sa.save_attention_enabled)():
+-        register = getattr(sa, "register_rocm_saved_attention_selector", None)
+-        if _ROCM_SDPA_GUARD and register is not None:
+-            register(_select_rocm_saved_sdpa)
++    if save_attention_enabled():
+         return saved_attention_call, None
+     try:
+         from unsloth_zoo.saved_attention import save_attention_auto_min_seq
+@@ -1854,9 +1819,6 @@ def _load_saved_attention():
+ 
+ _saved_attention_call, _SAVE_ATTENTION_MIN_SEQ = _load_saved_attention()
+ _SAVE_ATTENTION = _saved_attention_call is not None
+-_saved_attention_active = getattr(
+-    sys.modules.get("unsloth_zoo.saved_attention"), "saved_attention_active", lambda: False
+-)
+ 
+ 
+ def _run_attention(
