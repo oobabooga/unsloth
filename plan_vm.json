@@ -1,0 +1,122 @@
+{
+ "vm": {
+  "vm_id": "amd-gfx1151-linux-1",
+  "target": "amd:gfx1151-linux",
+  "kind": "amd",
+  "gpu": "gfx1151",
+  "lanes": 1,
+  "lane_mode": "single",
+  "lane_mode_effective": "single",
+  "purpose": "timing",
+  "account": null,
+  "comparisons": [
+   "flux-3-klein_amd-gfx1151-linux"
+  ],
+  "slots": [
+   [
+    {
+     "tag": "trial__amd-gfx1151-linux-1",
+     "lane": 0,
+     "stack": "studio",
+     "timed": false,
+     "comparison": null,
+     "est_min": 1.48,
+     "trial": true
+    }
+   ],
+   [
+    {
+     "tag": "flux-3-klein_amd-gfx1151-linux__s_bf16_hipblaslt__k1p0",
+     "lane": 0,
+     "stack": "studio",
+     "timed": true,
+     "family": "flux.3-klein",
+     "comparison": "flux-3-klein_amd-gfx1151-linux",
+     "est_min": 2.96
+    }
+   ],
+   [
+    {
+     "tag": "flux-3-klein_amd-gfx1151-linux__s_bf16_rocblas__k1p1",
+     "lane": 0,
+     "stack": "studio",
+     "timed": true,
+     "family": "flux.3-klein",
+     "comparison": "flux-3-klein_amd-gfx1151-linux",
+     "est_min": 2.96
+    }
+   ],
+   [
+    {
+     "tag": "flux-3-klein_amd-gfx1151-linux__s_bf16_rocblas__k1p2",
+     "lane": 0,
+     "stack": "studio",
+     "timed": true,
+     "family": "flux.3-klein",
+     "comparison": "flux-3-klein_amd-gfx1151-linux",
+     "est_min": 2.96
+    }
+   ],
+   [
+    {
+     "tag": "flux-3-klein_amd-gfx1151-linux__s_bf16_hipblaslt__k1p3",
+     "lane": 0,
+     "stack": "studio",
+     "timed": true,
+     "family": "flux.3-klein",
+     "comparison": "flux-3-klein_amd-gfx1151-linux",
+     "est_min": 2.96
+    }
+   ],
+   [
+    {
+     "tag": "flux-3-klein_amd-gfx1151-linux__s_bf16_hipblaslt__k2p0",
+     "lane": 0,
+     "stack": "studio",
+     "timed": true,
+     "family": "flux.3-klein",
+     "comparison": "flux-3-klein_amd-gfx1151-linux",
+     "est_min": 2.96
+    }
+   ],
+   [
+    {
+     "tag": "flux-3-klein_amd-gfx1151-linux__s_bf16_rocblas__k2p1",
+     "lane": 0,
+     "stack": "studio",
+     "timed": true,
+     "family": "flux.3-klein",
+     "comparison": "flux-3-klein_amd-gfx1151-linux",
+     "est_min": 2.96
+    }
+   ],
+   [
+    {
+     "tag": "flux-3-klein_amd-gfx1151-linux__s_bf16_rocblas__k2p2",
+     "lane": 0,
+     "stack": "studio",
+     "timed": true,
+     "family": "flux.3-klein",
+     "comparison": "flux-3-klein_amd-gfx1151-linux",
+     "est_min": 2.96
+    }
+   ],
+   [
+    {
+     "tag": "flux-3-klein_amd-gfx1151-linux__s_bf16_hipblaslt__k2p3",
+     "lane": 0,
+     "stack": "studio",
+     "timed": true,
+     "family": "flux.3-klein",
+     "comparison": "flux-3-klein_amd-gfx1151-linux",
+     "est_min": 2.96
+    }
+   ]
+  ],
+  "est_min": 85.2,
+  "est_cu": 0.0
+ },
+ "base_sha": "8b7cde79ebf5a901b2fd936bbee214fb8c7562c7",
+ "bline_ref": "v0.46.2",
+ "branch": "amd-ci-nov21-r5blas"
+}
