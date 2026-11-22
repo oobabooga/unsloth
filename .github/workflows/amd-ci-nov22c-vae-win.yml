@@ -18,9 +18,6 @@ jobs:
     name: "LTX-2.3 VAE decode probe (gfx1151 Windows, non-Docker)"
     runs-on: [self-hosted, Windows, strix-halo, devlab-dispatch]
     timeout-minutes: 600
-    concurrency:
-      group: amd-ci-gfx1151-gpu-win-nov22c-vae
-      cancel-in-progress: false
     defaults:
       run:
         shell: powershell
