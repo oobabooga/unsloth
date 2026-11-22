@@ -1,0 +1,18 @@
+--- a/ggml/src/ggml-cuda/fattn-banded.cu
++++ b/ggml/src/ggml-cuda/fattn-banded.cu
+@@ -914,6 +914,15 @@
+     if (dst->op != GGML_OP_FLASH_ATTN_EXT_BANDED) {
+         return false;
+     }
++    // probe: GGML_CUDA_BANDED_FORCE_DENSE=1 declines the banded op, so the graph takes the dense
++    // relative-bias path (regular flash attention, WMMA on RDNA3+). Unset = unchanged.
++    static const bool force_dense = [] {
++        const char * env = getenv("GGML_CUDA_BANDED_FORCE_DENSE");
++        return env != nullptr && atoi(env) != 0;
++    }();
++    if (force_dense) {
++        return false;
++    }
+ 
+     // quantized K/V are read as F16: check the op with F16 K/V of the same shape
+     if (dst->src[1] && dst->src[2] &&

@@ -1,0 +1,146 @@
+name: "AMD CI: Inkling-2-Mini llama.cpp release b12588-mix vs #399 pin set (b12628), correctness and speed (gfx1151 Windows HIP)"
+
+# xgpu/xgpu_job.py builds rel = ggml-org b12588 + rel.diff (release pin set), head = ggml-org b12628 + head.diff
+# (#399 pin set), headp = head + headp.diff (GGML_CUDA_BANDED_FORCE_DENSE probe switch), tree hashes checked, then on
+# ROCm0: test-backend-ops (banded FA + fusions), test-llama-archs, llama-perplexity KLD vs rel logits, llama-bench and
+# llama-batched-bench interleaved (fresh process per run). No GPU group: every timed run records GPU busy % and foreign GPU processes.
+
+on:
+  push:
+    branches: [amd-ci-inkperf4-amd-win]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  ROCM_GFX: "gfx1151"
+
+jobs:
+
+  linux-control:
+    name: "linux control (selector diagnosis)"
+    runs-on: [self-hosted, Linux, strix-halo, devlab-dispatch]
+    timeout-minutes: 10
+    env:
+      HIP_VISIBLE_DEVICES: ""
+      ROCR_VISIBLE_DEVICES: ""
+    steps:
+      - name: Report which machine answered
+        run: |
+          set +e
+          echo "control leg: same selector with Linux in place of Windows; machine: $(uname -n)"
+
+  windows:
+    name: "HIP gfx1151 rel vs head vs headp on Windows (no GPU group, co-tenancy probed before every timed run)"
+    runs-on: [self-hosted, Windows, strix-halo, devlab-dispatch]
+    timeout-minutes: 600
+    defaults:
+      run:
+        shell: powershell
+    steps:
+      - uses: actions/checkout@v4
+        with: { persist-credentials: false }
+
+      - name: Preamble
+        run: |
+          .\amd_ci\lib\preamble.ps1 -Name "inkperf4-amd-windows"
+
+      - name: Locate the system Python
+        run: |
+          $ErrorActionPreference = "Continue"
+          $found = $null
+          foreach ($c in @("C:\Program Files\Python312\python.exe",
+                           "C:\Program Files\Python311\python.exe",
+                           "C:\Program Files\Python310\python.exe")) {
+            if (Test-Path -LiteralPath $c) { $found = $c; break }
+          }
+          if ($null -eq $found) {
+            Write-Host "FATAL: no system Python found at any known location."
+            exit 1
+          }
+          & $found --version
+          Add-Content -Path $env:GITHUB_ENV -Value "AMD_CI_PY=$found"
+
+      - name: Host diagnostics
+        run: |
+          $ErrorActionPreference = "Continue"
+          Write-Host "RUNNER_OS=[$env:RUNNER_OS] machine=$env:COMPUTERNAME"
+          Write-Host "HIP_PATH=[$env:HIP_PATH] VULKAN_SDK=[$env:VULKAN_SDK]"
+          foreach ($b in @("git", "cmake", "ninja", "cl", "link", "clang", "hipcc", "amd-smi", "glslc", "vulkaninfo")) {
+            $c = Get-Command $b -ErrorAction SilentlyContinue
+            if ($c) { Write-Host ("{0,-10} {1}" -f $b, $c.Source) } else { Write-Host ("{0,-10} MISSING" -f $b) }
+          }
+          Get-CimInstance Win32_VideoController | ForEach-Object { Write-Host "GPU: $($_.Name) driver $($_.DriverVersion)" }
+          & $env:AMD_CI_PY "$env:GITHUB_WORKSPACE\amd_ci\lib\gate.py" --no-torch --require windows --out "$env:AMD_CI_WORK\out\host.json"
+
+      - name: Toolchain (HIP SDK or ROCm wheels, MSVC environment)
+        timeout-minutes: 45
+        run: |
+          $ErrorActionPreference = "Continue"
+          $V = "$env:AMD_CI_WORK\venv"
+          & $env:AMD_CI_PY -m venv $V
+          & "$V\Scripts\python.exe" -m pip install -q --upgrade pip
+          & "$V\Scripts\python.exe" -m pip install -q "cmake>=3.28" ninja
+          $root = $null
+          if ($env:HIP_PATH -and (Test-Path -LiteralPath "$env:HIP_PATH\bin\clang.exe")) {
+            $root = $env:HIP_PATH.TrimEnd("\")
+            Write-Host "using the installed HIP SDK at $root"
+          } else {
+            foreach ($idx in @("https://rocm.nightlies.amd.com/v2/$env:ROCM_GFX/", "https://repo.amd.com/rocm/whl/$env:ROCM_GFX/")) {
+              & "$V\Scripts\python.exe" -m pip install -q --index-url $idx "rocm[libraries,devel]"
+              if ($LASTEXITCODE -eq 0) { Write-Host "ROCm SDK wheels from $idx"; break }
+            }
+            $root = (& "$V\Scripts\rocm-sdk.exe" path --root | Select-Object -Last 1)
+            if ($root) { $root = $root.Trim() }
+          }
+          if (-not $root) { Write-Host "FATAL: no HIP SDK and no ROCm wheels"; exit 1 }
+          $clang = $null
+          foreach ($c in @("$root\lib\llvm\bin\clang.exe", "$root\bin\clang.exe")) { if (Test-Path -LiteralPath $c) { $clang = $c; break } }
+          if (-not $clang) { Write-Host "FATAL: no clang.exe under $root"; exit 1 }
+          & $clang --version
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $vs = $null
+          if (Test-Path -LiteralPath $vswhere) { $vs = (& $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath) }
+          if (-not $vs) { Write-Host "FATAL: no Visual Studio C++ build tools on this box"; exit 1 }
+          $vcvars = Join-Path $vs "VC\Auxiliary\Build\vcvars64.bat"
+          Write-Host "MSVC environment from $vcvars"
+          cmd /c "`"$vcvars`" >nul && set" | ForEach-Object {
+            if ($_ -match "^(PATH|INCLUDE|LIB|LIBPATH|VCToolsInstallDir|WindowsSdkDir|UCRTVersion|WindowsSDKVersion)=(.*)$") {
+              $val = $matches[2]
+              if ($matches[1] -eq "PATH") { $val = "$V\Scripts;$root\bin;$root\lib\llvm\bin;$val" }
+              Add-Content -Path $env:GITHUB_ENV -Value "$($matches[1])=$val" -Encoding ascii
+            }
+          }
+          Add-Content -Path $env:GITHUB_ENV -Value "HIP_PATH=$root"
+          Add-Content -Path $env:GITHUB_ENV -Value "ROCM_ROOT=$root"
+          Add-Content -Path $env:GITHUB_ENV -Value "HIPCXX=$clang"
+          Add-Content -Path $env:GITHUB_ENV -Value "CLANG_EXE=$clang"
+
+      - name: Build, correctness and speed (rel, head, headp)
+        timeout-minutes: 560
+        run: |
+          $ErrorActionPreference = "Continue"
+          $env:PATH = "$env:ROCM_ROOT\bin;$env:PATH"
+          & "$env:AMD_CI_WORK\venv\Scripts\python.exe" -m pip install -q huggingface_hub
+          & "$env:AMD_CI_WORK\venv\Scripts\python.exe" -u "$env:GITHUB_WORKSPACE\xgpu\xgpu_job.py" --kit "$env:GITHUB_WORKSPACE\xgpu" --work "$env:AMD_CI_WORK\xg" `
+            --backend hip --arch "$env:ROCM_GFX" --dev ROCm0 --models IQ1_S,Q4_K_XL --ops FLASH_ATTN_EXT_BANDED,CLIP_ROWS_FUSE,SITU_FUSE --archs "inkling2.*" --timeout 5400 *>&1 | Tee-Object -FilePath "$env:AMD_CI_WORK\out\xgpu_job.log"
+          $rc = $LASTEXITCODE
+          New-Item -ItemType Directory -Force -Path "$env:AMD_CI_WORK\out\xg" | Out-Null
+          Copy-Item -Recurse -Force "$env:AMD_CI_WORK\xg\out\*" "$env:AMD_CI_WORK\out\xg\" -ErrorAction SilentlyContinue
+          Write-Host "xgpu job rc=$rc"
+          exit $rc
+
+      - name: Free the work tree (keep only out/)
+        if: always()
+        run: |
+          $ErrorActionPreference = "Continue"
+          Remove-Item -Recurse -Force "$env:AMD_CI_WORK\xg", "$env:AMD_CI_WORK\venv" -ErrorAction SilentlyContinue
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: inkperf4-amd-windows-hip
+          path: ${{ env.AMD_CI_WORK }}/out
+          retention-days: 7
+          if-no-files-found: warn
