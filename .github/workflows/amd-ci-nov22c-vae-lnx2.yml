@@ -1,0 +1,74 @@
+name: "AMD CI: VAE ideas (Qwen-Image tile choice, MIOpen encode) on gfx1151 Linux"
+
+on:
+  push:
+    branches: [amd-ci-nov22c-vae-lnx2]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  BASE_SHA: "12cd6693a3413ae2bde214299a5d651760980048"
+  UPSTREAM: "https://github.com/unslothai/unsloth"
+
+jobs:
+
+  linux:
+    name: "VAE ideas probe (gfx1151 Linux, shared GPU: first-call minutes vs seconds)"
+    runs-on: [self-hosted, Linux, strix-halo, devlab-dispatch]
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v4
+        with: { persist-credentials: false }
+
+      - name: Preamble
+        run: |
+          source amd_ci/lib/preamble.sh "nov22c-vae-linux"
+
+      - name: Studio at BASE_SHA (install.sh --local) and real gate
+        timeout-minutes: 60
+        run: |
+          set -euo pipefail
+          git clone -q --filter=blob:none "$UPSTREAM" "$AMD_CI_WORK/repo"
+          git -C "$AMD_CI_WORK/repo" checkout -q --detach "$BASE_SHA"
+          cd "$AMD_CI_WORK/repo"
+          export UNSLOTH_STUDIO_HOME="$AMD_CI_WORK/studio"
+          export UV_EXTRA_INDEX_URL="https://pypi.org/simple"
+          set +e
+          bash install.sh --local 2>&1 | tail -15
+          rc=${PIPESTATUS[0]}
+          set -e
+          [ "$rc" -eq 0 ] || exit "$rc"
+          V=""
+          for c in "$UNSLOTH_STUDIO_HOME"/unsloth_studio "$UNSLOTH_STUDIO_HOME"/.venv_t5_*; do
+            [ -x "$c/bin/python" ] && { V="$c"; break; }
+          done
+          [ -n "$V" ] || { echo "FATAL: no Studio venv"; exit 1; }
+          echo "AMD_CI_PY=$V/bin/python" >> "$GITHUB_ENV"
+          "$V/bin/python" "$GITHUB_WORKSPACE/amd_ci/lib/gate.py" --require rocm gpu --expect-arch gfx1151 --min-gpus 1 \
+            --out "$AMD_CI_WORK/out/host.json"
+
+      - name: VAE probe (Qwen-Image decode tiles, encode MIOpen)
+        timeout-minutes: 280
+        run: |
+          set +e
+          mkdir -p "$AMD_CI_WORK/out/vae"
+          export HF_HOME="$AMD_CI_WORK/hf_home" HF_HUB_DISABLE_TELEMETRY=1
+          unset HF_TOKEN
+          "$AMD_CI_PY" "$GITHUB_WORKSPACE/amd_ci/probes/amd_vae_probe.py" --suite linux_enc2 --checkout "$AMD_CI_WORK/repo" \
+            --out "$AMD_CI_WORK/out/vae/obs.json" --work "$AMD_CI_WORK/vae_work" \
+            > "$AMD_CI_WORK/out/vae/probe.log" 2>&1
+          echo "probe rc=$?"
+          tail -40 "$AMD_CI_WORK/out/vae/probe.log"
+          cp "$AMD_CI_WORK"/vae_work/*.json "$AMD_CI_WORK/out/vae/"
+          cp "$AMD_CI_WORK"/vae_work/*.log "$AMD_CI_WORK/out/vae/"
+          exit 0
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: nov22c-vae-linux2
+          path: ${{ env.AMD_CI_WORK }}/out
+          retention-days: 7
+          if-no-files-found: warn
