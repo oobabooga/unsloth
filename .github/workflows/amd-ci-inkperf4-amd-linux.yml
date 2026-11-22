@@ -1,0 +1,135 @@
+name: "AMD CI: Inkling-2-Mini llama.cpp release b12588-mix vs #399 pin set (b12628), correctness and speed (gfx1151 Linux ROCm)"
+
+# xgpu/xgpu_job.py builds rel = ggml-org b12588 + rel.diff (release pin set), head = ggml-org b12628 + head.diff
+# (#399 pin set), headp = head + headp.diff (GGML_CUDA_BANDED_FORCE_DENSE probe switch), tree hashes checked, then on
+# ROCm0: test-backend-ops (banded FA + fusions), test-llama-archs, llama-perplexity KLD vs rel logits, llama-bench and
+# llama-batched-bench interleaved (fresh process per run). No GPU group: every timed run records GPU busy % and foreign GPU processes.
+
+on:
+  push:
+    branches: [amd-ci-inkperf4-amd-linux]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  ROCM_GFX: "gfx1151"
+
+jobs:
+
+  gpu:
+    name: "HIP gfx1151 rel vs head vs headp on Linux ROCm (no GPU group, co-tenancy probed before every timed run)"
+    runs-on: [self-hosted, Linux, strix-halo, devlab-dispatch]
+    timeout-minutes: 600
+    steps:
+      - uses: actions/checkout@v4
+        with: { persist-credentials: false }
+
+      - name: Preamble
+        run: |
+          source amd_ci/lib/preamble.sh "inkperf4-amd-gpu"
+      - name: Host diagnostics
+        run: |
+          set +e
+          uname -a
+          nproc
+          free -g
+          ls -d /opt/rocm* || echo "no /opt/rocm"
+          for b in hipconfig hipcc rocminfo amd-smi cmake ninja python3 git glslc vulkaninfo; do
+            printf '%-10s %s\n' "$b" "$(command -v $b || echo MISSING)"
+          done
+          ls -l /dev/kfd /dev/dri || echo "no /dev/kfd or /dev/dri"
+          python3 amd_ci/lib/gate.py --no-torch --out "$AMD_CI_WORK/out/host.json"
+
+      - name: ROCm toolchain
+        timeout-minutes: 45
+        run: |
+          set -eu
+          V="$AMD_CI_WORK/venv"
+          python3 -m venv "$V"
+          "$V/bin/python" -m pip install -q --upgrade pip
+          "$V/bin/python" -m pip install -q "cmake>=3.28" ninja
+          ROOT=""
+          if command -v hipconfig > /dev/null; then
+            ROOT="$(hipconfig -R)"
+            echo "using the host ROCm at $ROOT"
+          else
+            ok=0
+            for idx in "https://rocm.nightlies.amd.com/v2/${ROCM_GFX}/" "https://repo.amd.com/rocm/whl/${ROCM_GFX}/"; do
+              if "$V/bin/python" -m pip install -q --index-url "$idx" "rocm[libraries,devel]"; then
+                ok=1
+                echo "ROCm SDK wheels from $idx"
+                break
+              fi
+            done
+            if [ "$ok" != 1 ]; then
+              echo "FATAL: no ROCm SDK on the host and the wheel install failed"
+              exit 1
+            fi
+            ROOT="$("$V/bin/rocm-sdk" path --root)"
+          fi
+          if [ ! -x "$ROOT/bin/hipconfig" ] && [ ! -x "$ROOT/bin/hipcc" ]; then
+            echo "FATAL: ROCm root $ROOT has no hipconfig/hipcc"
+            exit 1
+          fi
+          CLANG="$ROOT/lib/llvm/bin/clang"
+          if [ ! -x "$CLANG" ]; then
+            CLANG="$(PATH="$ROOT/bin:$PATH" hipconfig -l)/clang"
+          fi
+          {
+            echo "ROCM_ROOT=$ROOT"
+            echo "HIP_PATH=$ROOT"
+            echo "ROCM_PATH=$ROOT"
+            echo "CMAKE_PREFIX_PATH=$ROOT"
+            echo "HIPCXX=$CLANG"
+            echo "PATH=$V/bin:$ROOT/bin:$PATH"
+            echo "LD_LIBRARY_PATH=$ROOT/lib:${LD_LIBRARY_PATH:-}"
+          } >> "$GITHUB_ENV"
+          "$CLANG" --version
+
+      - name: Hardware gate (fails, never skips)
+        run: |
+          set +e
+          rocminfo > "$AMD_CI_WORK/out/rocminfo.txt" 2>&1
+          rc=$?
+          grep -m3 -E "Name: +gfx" "$AMD_CI_WORK/out/rocminfo.txt"
+          if [ "$rc" -ne 0 ]; then
+            echo "GATE FAILED: rocminfo exit $rc"
+            exit 1
+          fi
+          if ! grep -q "$ROCM_GFX" "$AMD_CI_WORK/out/rocminfo.txt"; then
+            echo "GATE FAILED: no $ROCM_GFX agent"
+            exit 1
+          fi
+          echo "gate ok"
+
+      - name: Build, correctness and speed (rel, head, headp)
+        timeout-minutes: 560
+        run: |
+          set +e
+          python3 -m pip --version
+          "$AMD_CI_WORK/venv/bin/python" -m pip install -q huggingface_hub || echo "huggingface_hub install failed (urllib fallback)"
+          "$AMD_CI_WORK/venv/bin/python" -u "$GITHUB_WORKSPACE/xgpu/xgpu_job.py" --kit "$GITHUB_WORKSPACE/xgpu" --work "$AMD_CI_WORK/xg" \
+            --backend hip --arch "$ROCM_GFX" --dev ROCm0 --models IQ1_S,Q4_K_XL --ops FLASH_ATTN_EXT_BANDED,CLIP_ROWS_FUSE,SITU_FUSE --archs "inkling2.*" --timeout 5400 2>&1 | tee "$AMD_CI_WORK/out/xgpu_job.log"
+          rc=${PIPESTATUS[0]}
+          mkdir -p "$AMD_CI_WORK/out/xg"
+          cp -r "$AMD_CI_WORK/xg/out/." "$AMD_CI_WORK/out/xg/" 2>/dev/null
+          echo "xgpu job rc=$rc"
+          exit "$rc"
+
+      - name: Free the work tree (keep only out/)
+        if: always()
+        run: |
+          set +e
+          du -sh "$AMD_CI_WORK" 2>/dev/null
+          rm -rf "${AMD_CI_WORK:?}/xg" "${AMD_CI_WORK:?}/venv"
+          du -sh "$AMD_CI_WORK" 2>/dev/null
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: inkperf4-amd-linux-hip
+          path: ${{ env.AMD_CI_WORK }}/out
+          retention-days: 7
+          if-no-files-found: warn
