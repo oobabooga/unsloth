@@ -132,6 +132,9 @@ jobs:
           ls "$CKR/include/ck_tile/core.hpp"
           git clone -q "$FEATHER_REPO" "$AMD_CI_WORK/src/feather-attn"
           git -C "$AMD_CI_WORK/src/feather-attn" checkout -q "$FEATHER_SHA"
+          # torch 2.11's HeaderOnlyArrayRef has no operator== (author builds on torch 2.14): per-dim compare, same check
+          sed -i 's/dq_acc->sizes() == q.sizes()/(dq_acc->dim() == 4 \&\& dq_acc->size(0) == q.size(0) \&\& dq_acc->size(1) == q.size(1) \&\& dq_acc->size(2) == q.size(2) \&\& dq_acc->size(3) == q.size(3))/' "$AMD_CI_WORK/src/feather-attn/csrc/bwd/bwd.cpp"
+          git -C "$AMD_CI_WORK/src/feather-attn" diff | tee "$O/feather_patch.diff"
           export FEATHER_ATTN_CK_ROOT="$CKR" PYTORCH_ROCM_ARCH=gfx1151
           T0=$(date +%s)
           (cd "$AMD_CI_WORK/src/feather-attn" && "$AMD_CI_PY" -m pip install -v --no-build-isolation --no-deps . > "$O/feather_build.log" 2>&1)
@@ -149,7 +152,7 @@ jobs:
           "$AMD_CI_PY" -m pip list 2>/dev/null | grep -i -E "^(torch|triton|rocm|amd-aiter|feather|diffusers)" | tee "$O/pkgs_after.txt"
           exit 0
 
-      - name: Bench A (Studio's shipping AOTriton; all arms)
+      - name: Bench (Studio SDPA vs FeatherAttn)
         timeout-minutes: 75
         run: |
           set +e
@@ -157,48 +160,9 @@ jobs:
           export TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL=1
           cd "$AMD_CI_WORK"
           rocm-smi --showmeminfo vram 2>/dev/null | tail -5
-          timeout 4200 "$AMD_CI_PY" "$GITHUB_WORKSPACE/bench/attn_train_bench.py" --tag shipping \
-            --out "$AMD_CI_WORK/out/bench_shipping.json" > "$AMD_CI_WORK/out/bench_shipping.log" 2>&1
-          echo "bench rc=$?"; tail -20 "$AMD_CI_WORK/out/bench_shipping.log"
-          exit 0
-
-      - name: Bench B (AOTriton 0.15b swapped in; SDPA arms), then restore and re-run (A/B/A)
-        timeout-minutes: 80
-        run: |
-          set +e
-          unset CI
-          export TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL=1
-          O="$AMD_CI_WORK/out"; D="$AMD_CI_WORK/aot015"; mkdir -p "$D"
-          cd "$AMD_CI_WORK"
-          curl -sSfL -o "$D/shared.tgz" "$AOT_URL/aotriton-0.15b-manylinux_2_28_x86_64-rocm7.14-shared.tar.gz" && \
-          curl -sSfL -o "$D/images.tgz" "$AOT_URL/aotriton-0.15b-images-amd-gfx115x.tar.gz"
-          echo "download rc=$?"
-          tar xzf "$D/shared.tgz" -C "$D" && tar xzf "$D/images.tgz" -C "$D"
-          NEW=$(find "$D" -name 'libaotriton_v2.so.0.15*' -type f | head -1)
-          IMG=$(find "$D" -type d -name aotriton.images | head -1)
-          OLD=$(find "$TORCH_LIB" -maxdepth 1 -name 'libaotriton_v2.so*' -type f | head -1)
-          echo "new=$NEW img=$IMG old=$OLD" | tee "$O/aot_swap.txt"
-          ls "$IMG" | tee -a "$O/aot_swap.txt"
-          if [ -z "$NEW" ] || [ -z "$IMG" ] || [ -z "$OLD" ] || [ ! -d "$TORCH_LIB/aotriton.images" ]; then
-            echo "SWAP_NOT_POSSIBLE (bundled AOTriton not a separate shared lib + images, or download failed)" | tee -a "$O/aot_swap.txt"
-            exit 0
-          fi
-          mkdir -p "$D/backup"
-          cp -a "$OLD" "$D/backup/" && cp -a "$TORCH_LIB/aotriton.images" "$D/backup/"
-          cp -f "$NEW" "$OLD"
-          rm -rf "${TORCH_LIB:?}/aotriton.images"
-          cp -a "$IMG" "$TORCH_LIB/aotriton.images"
-          echo "swapped: $(basename "$OLD") <- $(basename "$NEW")" | tee -a "$O/aot_swap.txt"
-          timeout 3000 "$AMD_CI_PY" "$GITHUB_WORKSPACE/bench/attn_train_bench.py" --tag aot015 --arms studio,studio_A2,sdpa_contig \
-            --out "$O/bench_aot015.json" > "$O/bench_aot015.log" 2>&1
-          echo "bench aot015 rc=$?"; tail -20 "$O/bench_aot015.log"
-          cp -f "$D/backup/$(basename "$OLD")" "$OLD"
-          rm -rf "${TORCH_LIB:?}/aotriton.images"
-          cp -a "$D/backup/aotriton.images" "$TORCH_LIB/aotriton.images"
-          echo "restored" | tee -a "$O/aot_swap.txt"
-          timeout 3000 "$AMD_CI_PY" "$GITHUB_WORKSPACE/bench/attn_train_bench.py" --tag restored --arms studio,studio_A2,sdpa_contig --no-ref \
-            --out "$O/bench_restored.json" > "$O/bench_restored.log" 2>&1
-          echo "bench restored rc=$?"; tail -5 "$O/bench_restored.log"
+          timeout 4200 "$AMD_CI_PY" "$GITHUB_WORKSPACE/bench/attn_train_bench.py" --tag feather --arms studio,studio_A2,sdpa_contig,feather \
+            --out "$AMD_CI_WORK/out/bench_feather.json" > "$AMD_CI_WORK/out/bench_feather.log" 2>&1
+          echo "bench rc=$?"; tail -20 "$AMD_CI_WORK/out/bench_feather.log"
           exit 0
 
       - name: Stop anything this job started
@@ -225,7 +189,7 @@ jobs:
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: attn-train
+          name: attn-train-feather
           path: |
             ${{ env.AMD_CI_WORK }}/out
           retention-days: 14
