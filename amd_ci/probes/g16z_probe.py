@@ -103,7 +103,11 @@ try:
     obs["versions"] = json.loads(line[5:]) if line else {"error": (v.stdout + v.stderr)[-1500:]}
 except Exception as e:  # noqa: BLE001
     obs["versions"] = {"error": repr(e)}
-obs["zoo_import"] = zoo_venv.zoo_import(python, ck)
+# The same env the cell runs with: on a ROCm host a CPU torch makes unsloth_zoo refuse to import unless HIP is hidden.
+_zi = subprocess.run([python, "-c", "import unsloth_zoo; print('AMDCI' + unsloth_zoo.__file__)"], cwd = ck,
+                     env = zoo_venv.state_env(ck, env_extra), capture_output = True, text = True, timeout = 900)
+_zl = next((ln for ln in (_zi.stdout or "").splitlines() if ln.startswith("AMDCI")), None)
+obs["zoo_import"] = {"file": _zl[5:] if _zl else None, "error": None if _zl else (_zi.stdout + _zi.stderr)[-2500:]}
 save()
 
 work = root / f"g16z_work_{a.state}"
