@@ -193,6 +193,7 @@ def p3(out: dict, checkout: Path) -> None:
 # ----------------------------------------------------------------------------------------------------------- P2
 VAES = {
     "flux2_vae_1024": ("unsloth/flux-3-image-klein", "AutoencoderKLFlux2", (1, 32, 128, 128)),
+    "flux2_vae_2048": ("unsloth/flux-3-image-klein", "AutoencoderKLFlux2", (1, 32, 256, 256)),
     "wan22_vae_480p33": ("Wan-AI/Wan2.2-TI2V-5B-Diffusers", "AutoencoderKLWan", (1, 48, 9, 30, 52)),
 }
 
@@ -207,12 +208,19 @@ def p2_child(vae_key: str, mode: str, out_path: Path) -> int:
         import diffusers
 
         repo, cls, shape = VAES[vae_key]
-        if mode.startswith("imm") or mode in ("stock", "fused"):
+        if mode.startswith("imm") or mode.startswith("x_") or mode.startswith("fd_") or mode in ("stock", "fused"):
             torch.backends.miopen.immediate = True
         r["immediate"] = bool(getattr(torch.backends.miopen, "immediate", None))
-        dev, dt = ("cpu", torch.float32) if mode == "cpu" else ("cuda", torch.bfloat16)
+        dev, dt = ("cpu", torch.float32) if mode == "cpu" else ("cuda", torch.float32 if mode == "x_fp32" else torch.bfloat16)
+        if mode == "x_nocudnn":
+            torch.backends.cudnn.enabled = False
         vae = getattr(diffusers, cls).from_pretrained(repo, subfolder = "vae", torch_dtype = dt,
                                                       token = False).to(dev).eval()
+        if mode.startswith("fd_fm"):
+            sys.path.insert(0, os.environ["LEVERS_STUDIO_BACKEND"])
+            from core.inference import diffusion_vae_strips as S
+
+            r["fold_env"] = os.environ.get("UNSLOTH_VAE_UPSAMPLE_FOLD")
         if mode == "fused":
             sys.path.insert(0, os.environ["LEVERS_STUDIO_BACKEND"])
             from core.inference import diffusion_vae_fused as M
@@ -230,10 +238,15 @@ def p2_child(vae_key: str, mode: str, out_path: Path) -> int:
                 if dev == "cuda":
                     torch.cuda.synchronize()
                 t0 = time.perf_counter()
-                img = vae.decode(z).sample
+                if mode.startswith("fd_fm"):
+                    img = S.full_map_decode(vae, z)
+                else:
+                    img = vae.decode(z).sample
                 if dev == "cuda":
                     torch.cuda.synchronize()
                 ts.append(time.perf_counter() - t0)
+        if mode.startswith("fd_fm"):
+            r["fold_calls"] = int(S._FOLD_CALLS[0])
         r["first_s"] = round(ts[0], 3)
         r["decode_s"] = round(statistics.median(ts[1:] or ts), 4)
         r["decode_all_s"] = [round(t, 4) for t in ts]
@@ -322,6 +335,105 @@ def p2(out: dict, work: Path, timeout_s: float, out_dir_for_db: Path) -> None:
                 (keep / f.name).write_bytes(f.read_bytes())
     out["p2"] = r
 
+
+
+MIOPEN_BISECT = {  # immediate mode, one solver family off per arm (MIOpen debug switches), or MIOpen off / fp32
+    "x_no_igemm": {"MIOPEN_DEBUG_CONV_IMPLICIT_GEMM": "0"},
+    "x_no_wino": {"MIOPEN_DEBUG_CONV_WINOGRAD": "0"},
+    "x_no_direct": {"MIOPEN_DEBUG_CONV_DIRECT": "0"},
+    "x_no_gemm": {"MIOPEN_DEBUG_CONV_GEMM": "0"},
+    "x_no_fft": {"MIOPEN_DEBUG_CONV_FFT": "0"},
+    "x_nocudnn": {},
+    "x_fp32": {},
+}
+
+
+def p2x(out: dict, work: Path, timeout_s: float) -> None:
+    """FLUX.2 VAE decode vs CPU fp32 under each MIOpen solver family switched off: which one breaks the decode."""
+    import torch
+
+    vae_key = "flux2_vae_1024"
+    empty = work / "miopen_empty_x"
+    empty.mkdir(parents = True, exist_ok = True)
+    base = {k: v for k, v in os.environ.items() if not k.startswith("MIOPEN_")}
+    rows: dict = {}
+    for mode, env in [("cpu", {}), ("imm", {})] + list(MIOPEN_BISECT.items()):
+        jp = work / f"p2x_{mode}.json"
+        t0 = time.time()
+        try:
+            with open(work / f"p2x_{mode}.log", "w", encoding = "utf-8") as fh:
+                rc = subprocess.run([sys.executable, __file__, "--p2-child", vae_key, mode, str(jp)],
+                                    env = {**base, "MIOPEN_USER_DB_PATH": str(empty), **env}, stdout = fh,
+                                    stderr = subprocess.STDOUT, timeout = timeout_s).returncode
+        except subprocess.TimeoutExpired:
+            rc = "timeout"
+        row = json.loads(jp.read_text(encoding = "utf-8")) if jp.exists() else {"ok": False}
+        row["rc"], row["wall_s"], row["env_set"] = rc, round(time.time() - t0, 1), env
+        rows[mode] = row
+        out["p2x"] = rows
+    try:
+        cref = torch.load(work / "p2x_cpu.pt")
+        for mode in rows:
+            pt = work / f"p2x_{mode}.pt"
+            if mode != "cpu" and pt.exists():
+                x = torch.load(pt)
+                mse = float(((x.clamp(-1, 1) - cref.clamp(-1, 1)) / 2).pow(2).mean())
+                rows[mode]["vs_cpu_fp32"] = {"max_abs": float((x - cref).abs().max()),
+                                             "psnr_db": round(10 * __import__("math").log10(1 / max(mse, 1e-20)), 2),
+                                             "lpips": lpips_of(x, cref)}
+    except Exception as exc:  # noqa: BLE001
+        rows["compare_error"] = err(exc)
+    out["p2x"] = rows
+
+
+def fold_decode(out: dict, work: Path, timeout_s: float, checkout: Path) -> None:
+    """#18792 on ROCm, whole decode: stock vae.decode vs Studio's whole-map strip decode with the fold off / on
+    (UNSLOTH_VAE_UPSAMPLE_FOLD 0 / 1), fresh process per arm, order fm0 fm1 fm1 fm0, same latents."""
+    import torch
+
+    base = {k: v for k, v in os.environ.items() if not k.startswith("MIOPEN_")}
+    base["LEVERS_STUDIO_BACKEND"] = str(checkout / "studio" / "backend")
+    r: dict = {}
+    for vae_key in ("flux2_vae_1024", "flux2_vae_2048"):
+        rows: dict = {}
+        for i, (mode, fold) in enumerate((("fd_stock", None), ("fd_fm0", "0"), ("fd_fm1", "1"), ("fd_fm1", "1"),
+                                          ("fd_fm0", "0"))):
+            name = f"{mode}_{i}"
+            jp = work / f"fd_{vae_key}_{name}.json"
+            env = dict(base)
+            if fold is not None:
+                env["UNSLOTH_VAE_UPSAMPLE_FOLD"] = fold
+            t0 = time.time()
+            try:
+                with open(work / f"fd_{vae_key}_{name}.log", "w", encoding = "utf-8") as fh:
+                    rc = subprocess.run([sys.executable, __file__, "--p2-child", vae_key, mode, str(jp)], env = env,
+                                        stdout = fh, stderr = subprocess.STDOUT, timeout = timeout_s).returncode
+            except subprocess.TimeoutExpired:
+                rc = "timeout"
+            row = json.loads(jp.read_text(encoding = "utf-8")) if jp.exists() else {"ok": False}
+            row["rc"], row["wall_s"] = rc, round(time.time() - t0, 1)
+            if not row.get("ok"):
+                lg = work / f"fd_{vae_key}_{name}.log"
+                row["log_tail"] = lg.read_text(encoding = "utf-8", errors = "replace")[-1500:] if lg.exists() else None
+            rows[name] = row
+            out["fold_decode"] = {**r, vae_key: rows}
+        try:
+            ref = torch.load(work / f"fd_{vae_key}_fd_stock_0.pt")
+            for name in rows:
+                pt = work / f"fd_{vae_key}_{name}.pt"
+                if name != "fd_stock_0" and pt.exists():
+                    x = torch.load(pt)
+                    rows[name]["vs_stock"] = {"max_abs": float((x - ref).abs().max()), "lpips": lpips_of(x, ref)}
+            a, b = work / f"fd_{vae_key}_fd_fm0_1.pt", work / f"fd_{vae_key}_fd_fm1_2.pt"
+            if a.exists() and b.exists():
+                x, y = torch.load(a), torch.load(b)
+                rows["fold_vs_nofold"] = {"max_abs": float((x - y).abs().max()), "lpips": lpips_of(y, x)}
+        except Exception as exc:  # noqa: BLE001
+            rows["compare_error"] = err(exc)
+        r[vae_key] = rows
+        for pt in work.glob(f"fd_{vae_key}_*.pt"):
+            pt.unlink()
+    out["fold_decode"] = r
 
 def lpips_of(x, ref):
     try:
@@ -531,7 +643,9 @@ def main() -> int:
                      ("vae_gn", lambda: gn_kernels(obs, a.checkout)),
                      ("vae_fused", lambda: vae_fused(obs, work, a.p2_timeout_s, a.checkout)),
                      ("mapping", lambda: mapping(obs, work)),
-                     ("p2", lambda: p2(obs, work, a.p2_timeout_s, a.out.parent / "miopen_db"))):
+                     ("p2", lambda: p2(obs, work, a.p2_timeout_s, a.out.parent / "miopen_db")),
+                     ("p2x", lambda: p2x(obs, work, a.p2_timeout_s)),
+                     ("fold_decode", lambda: fold_decode(obs, work, a.p2_timeout_s, a.checkout))):
         if name in skip:
             obs[name] = {"_skipped": True}
             continue

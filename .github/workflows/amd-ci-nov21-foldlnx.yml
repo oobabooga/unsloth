@@ -30,7 +30,7 @@ name: "AMD CI: AMD levers probe on gfx1151 (Linux + Windows, nov21)"
 
 on:
   push:
-    branches: [amd-ci-nov21-levers-lnx]
+    branches: [amd-ci-nov21-foldlnx]
   workflow_dispatch:
 
 permissions:
@@ -38,7 +38,7 @@ permissions:
 
 env:
   PR: "18760"
-  BASE_SHA: "8b7cde79ebf5a901b2fd936bbee214fb8c7562c7"
+  BASE_SHA: "f5dfe6812a5dcedbb5075410a7ed5d463cc984e9"
   UPSTREAM: "https://github.com/unslothai/unsloth"
   # Set to "1" for a PR already merged: compares the merge commit to its parent.
   MERGED: "1"
@@ -95,7 +95,7 @@ jobs:
           export HF_HOME="$AMD_CI_WORK/hf_home" HF_HUB_DISABLE_TELEMETRY=1
           unset HF_TOKEN
           "$AMD_CI_PY" -m pip install -q --no-deps lpips > "$AMD_CI_WORK/out/levers/lpips.log" 2>&1
-          "$AMD_CI_PY" "$GITHUB_WORKSPACE/amd_ci/probes/levers_probe.py" --checkout "$AMD_CI_WORK/repo" \
+          "$AMD_CI_PY" "$GITHUB_WORKSPACE/amd_ci/probes/levers_probe.py" --skip p1,v6,p3,vae_gn,vae_fused,mapping,p2,p2x --checkout "$AMD_CI_WORK/repo" \
             --out "$AMD_CI_WORK/out/levers/obs.json" --work "$AMD_CI_WORK/levers_work" \
             > "$AMD_CI_WORK/out/levers/probe.log" 2>&1
           echo "probe rc=$?"
