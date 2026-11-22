@@ -1,0 +1,119 @@
+{
+ "name": "nov22_win_ltx25_int8_fit",
+ "description": "LTX-2.5 on Windows gfx1151: explicit int8 (hosted int8 DiT read), its kill switch, Auto and the dense DiT, 512x320x17, 8 steps, one clip each. Studio downloads what it loads (local_files_only false).",
+ "defaults": {},
+ "models": {},
+ "prefetch": {},
+ "cells": [
+  {
+   "backend": "studio",
+   "kind": "video",
+   "width": 512,
+   "height": 320,
+   "steps": 8,
+   "guidance": 1.0,
+   "negative_prompt": "pc game, console game, video game, cartoon, childish, ugly",
+   "prompts": "video_3",
+   "n": 1,
+   "warmup": 0,
+   "frames": 17,
+   "fps": 24,
+   "model": "Lightricks/LTX-2.5-Diffusers",
+   "card": "ltx-2.5",
+   "family": "ltx-2.5",
+   "short_n": 0,
+   "tag": "ltx25_win__int8",
+   "options": {
+    "generate": {},
+    "speed_mode": "default",
+    "local_files_only": false,
+    "load_timeout_s": 7000,
+    "transformer_quant": "int8"
+   },
+   "env": {}
+  },
+  {
+   "backend": "studio",
+   "kind": "video",
+   "width": 512,
+   "height": 320,
+   "steps": 8,
+   "guidance": 1.0,
+   "negative_prompt": "pc game, console game, video game, cartoon, childish, ugly",
+   "prompts": "video_3",
+   "n": 1,
+   "warmup": 0,
+   "frames": 17,
+   "fps": 24,
+   "model": "Lightricks/LTX-2.5-Diffusers",
+   "card": "ltx-2.5",
+   "family": "ltx-2.5",
+   "short_n": 0,
+   "tag": "ltx25_win__int8_fit0",
+   "options": {
+    "generate": {},
+    "speed_mode": "default",
+    "local_files_only": false,
+    "load_timeout_s": 7000,
+    "transformer_quant": "int8"
+   },
+   "env": {
+    "UNSLOTH_VIDEO_HOSTED_INT8_FIT": "0"
+   }
+  },
+  {
+   "backend": "studio",
+   "kind": "video",
+   "width": 512,
+   "height": 320,
+   "steps": 8,
+   "guidance": 1.0,
+   "negative_prompt": "pc game, console game, video game, cartoon, childish, ugly",
+   "prompts": "video_3",
+   "n": 1,
+   "warmup": 0,
+   "frames": 17,
+   "fps": 24,
+   "model": "Lightricks/LTX-2.5-Diffusers",
+   "card": "ltx-2.5",
+   "family": "ltx-2.5",
+   "short_n": 0,
+   "tag": "ltx25_win__auto",
+   "options": {
+    "generate": {},
+    "speed_mode": "default",
+    "local_files_only": false,
+    "load_timeout_s": 7000,
+    "transformer_quant": "auto"
+   },
+   "env": {}
+  },
+  {
+   "backend": "studio",
+   "kind": "video",
+   "width": 512,
+   "height": 320,
+   "steps": 8,
+   "guidance": 1.0,
+   "negative_prompt": "pc game, console game, video game, cartoon, childish, ugly",
+   "prompts": "video_3",
+   "n": 1,
+   "warmup": 0,
+   "frames": 17,
+   "fps": 24,
+   "model": "Lightricks/LTX-2.5-Diffusers",
+   "card": "ltx-2.5",
+   "family": "ltx-2.5",
+   "short_n": 0,
+   "tag": "ltx25_win__dense",
+   "options": {
+    "generate": {},
+    "speed_mode": "default",
+    "local_files_only": false,
+    "load_timeout_s": 7000,
+    "transformer_quant": "off"
+   },
+   "env": {}
+  }
+ ]
+}
