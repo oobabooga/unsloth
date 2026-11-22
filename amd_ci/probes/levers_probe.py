@@ -210,8 +210,9 @@ def p2_child(vae_key: str, mode: str, out_path: Path) -> int:
         if mode.startswith("imm") or mode in ("stock", "fused"):
             torch.backends.miopen.immediate = True
         r["immediate"] = bool(getattr(torch.backends.miopen, "immediate", None))
-        vae = getattr(diffusers, cls).from_pretrained(repo, subfolder = "vae", torch_dtype = torch.bfloat16,
-                                                      token = False).to("cuda").eval()
+        dev, dt = ("cpu", torch.float32) if mode == "cpu" else ("cuda", torch.bfloat16)
+        vae = getattr(diffusers, cls).from_pretrained(repo, subfolder = "vae", torch_dtype = dt,
+                                                      token = False).to(dev).eval()
         if mode == "fused":
             sys.path.insert(0, os.environ["LEVERS_STUDIO_BACKEND"])
             from core.inference import diffusion_vae_fused as M
@@ -220,17 +221,21 @@ def p2_child(vae_key: str, mode: str, out_path: Path) -> int:
             r["runtime_ok"] = bool(M.runtime_ok())
             fn = M.install_wan_vae if cls == "AutoencoderKLWan" else M.install_group_norm_vae
             r["patched"] = int(fn(vae, encoder = False))
-        z = torch.randn(*shape, generator = torch.Generator(device = "cpu").manual_seed(0)).to("cuda", torch.bfloat16)
+        # cpu arm: fp32 decode of the SAME bf16-rounded latents, the reference that says which GPU arm is right
+        z = torch.randn(*shape, generator = torch.Generator(device = "cpu").manual_seed(0)).to(torch.bfloat16)
+        z = z.to(dev, dt)
         ts = []
         with torch.no_grad():
-            for i in range(4):
-                torch.cuda.synchronize()
+            for i in range(1 if dev == "cpu" else 4):
+                if dev == "cuda":
+                    torch.cuda.synchronize()
                 t0 = time.perf_counter()
                 img = vae.decode(z).sample
-                torch.cuda.synchronize()
+                if dev == "cuda":
+                    torch.cuda.synchronize()
                 ts.append(time.perf_counter() - t0)
         r["first_s"] = round(ts[0], 3)
-        r["decode_s"] = round(statistics.median(ts[1:]), 4)
+        r["decode_s"] = round(statistics.median(ts[1:] or ts), 4)
         r["decode_all_s"] = [round(t, 4) for t in ts]
         r["peak_alloc_gib"] = round(torch.cuda.max_memory_allocated() / 2 ** 30, 3)
         torch.save(img.float().cpu(), out_path.with_suffix(".pt"))
@@ -256,7 +261,8 @@ def p2(out: dict, work: Path, timeout_s: float, out_dir_for_db: Path) -> None:
         arms = [("imm", {"MIOPEN_USER_DB_PATH": str(empty)}),
                 ("imm_aa", {"MIOPEN_USER_DB_PATH": str(empty)}),
                 ("find", {"MIOPEN_USER_DB_PATH": str(db), "MIOPEN_FIND_MODE": "1", "MIOPEN_FIND_ENFORCE": "4"}),
-                ("imm_db", {"MIOPEN_USER_DB_PATH": str(db), "MIOPEN_LOG_LEVEL": "5"})]
+                ("imm_db", {"MIOPEN_USER_DB_PATH": str(db), "MIOPEN_LOG_LEVEL": "5"}),
+                ("cpu", {"MIOPEN_USER_DB_PATH": str(empty)})]
         rows = {}
         for mode, env in arms:
             jp = work / f"p2_{vae_key}_{mode}.json"
@@ -293,6 +299,18 @@ def p2(out: dict, work: Path, timeout_s: float, out_dir_for_db: Path) -> None:
                     rows[mode]["vs_imm"] = {"max_abs": float(d.max()), "mean_abs": float(d.mean()),
                                             "psnr_db": round(10 * __import__("math").log10(1 / max(mse, 1e-20)), 2),
                                             "lpips": lpips_of(x, ref)}
+            cp = work / f"p2_{vae_key}_cpu.pt"
+            if cp.exists():
+                cref = torch.load(cp)
+                for mode in ("imm", "imm_aa", "find", "imm_db"):
+                    p = work / f"p2_{vae_key}_{mode}.pt"
+                    if p.exists():
+                        x = torch.load(p)
+                        mse = float(((x.clamp(-1, 1) - cref.clamp(-1, 1)) / 2).pow(2).mean())
+                        rows[mode]["vs_cpu_fp32"] = {
+                            "max_abs": float((x - cref).abs().max()),
+                            "psnr_db": round(10 * __import__("math").log10(1 / max(mse, 1e-20)), 2),
+                            "lpips": lpips_of(x, cref)}
         except Exception as exc:  # noqa: BLE001
             rows["compare_error"] = err(exc)
         r[vae_key] = rows

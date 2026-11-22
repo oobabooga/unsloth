@@ -30,7 +30,7 @@ name: "AMD CI: AMD levers probe on gfx1151 (Linux + Windows, nov21)"
 
 on:
   push:
-    branches: [amd-ci-nov21-levers-win2]
+    branches: [amd-ci-nov21-levers-win3]
   workflow_dispatch:
 
 permissions:
@@ -143,7 +143,7 @@ jobs:
           Remove-Item Env:HF_TOKEN -ErrorAction SilentlyContinue
           & $env:AMD_CI_PY -m pip install -q --no-deps lpips *>&1 | Out-File -Encoding utf8 "$env:AMD_CI_WORK\out\levers\lpips.log"
           & $env:AMD_CI_PY "$env:GITHUB_WORKSPACE\amd_ci\probes\levers_probe.py" --checkout $states.paths.head `
-            --out "$env:AMD_CI_WORK\out\levers\obs.json" --work "$env:AMD_CI_WORK\levers_work" --skip p1,v6,p3,p2 *>&1 |
+            --out "$env:AMD_CI_WORK\out\levers\obs.json" --work "$env:AMD_CI_WORK\levers_work" --skip p1,v6,p3,vae_gn,vae_fused,mapping *>&1 |
             Out-File -Encoding utf8 "$env:AMD_CI_WORK\out\levers\probe.log"
           Write-Host "probe exit $LASTEXITCODE"
           Get-Content "$env:AMD_CI_WORK\out\levers\probe.log" -Tail 5 | Write-Host
