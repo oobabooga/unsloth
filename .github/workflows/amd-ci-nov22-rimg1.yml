@@ -195,7 +195,7 @@ jobs:
             --probe diffusion_bench/amd/diffusion_probe.py \
             --criteria diffusion_bench/amd/criteria_no_regression.py \
             --out-dir "$AMD_CI_WORK/out/gpu" \
-            --python "$AMD_CI_PY" -- --spec diffusion_bench/specs/plan_amd-gfx1151-linux-1.json --budget-min 120 --cell-timeout 3600 --only trial__amd-gfx1151-linux-1 --only flux-3-klein_amd-gfx1151-linux__s_int8_int8__k1p0 --state-only head=flux-3-klein_amd-gfx1151-linux__s_int8_int8__k1p0
+            --python "$AMD_CI_PY" -- --spec diffusion_bench/specs/plan_amd-gfx1151-linux-1.json --budget-min 120 --cell-timeout 3600 --only trial__amd-gfx1151-linux-1 --only flux-3-klein_amd-gfx1151-linux__s_int8_int8__k1p0 --only flux-3-klein_amd-gfx1151-linux__s_int8_int8__k1p1 --state-only head=flux-3-klein_amd-gfx1151-linux__s_int8_int8__k1p0 --state-only head=flux-3-klein_amd-gfx1151-linux__s_int8_int8__k1p1
           cat "$AMD_CI_WORK/out/gpu/VERDICT.md" >> "$GITHUB_STEP_SUMMARY"
           python3 "$GITHUB_WORKSPACE/amd_ci/lib/announce.py" "$AMD_CI_WORK/out/gpu"
 

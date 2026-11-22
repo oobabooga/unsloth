@@ -1,8 +1,8 @@
 diff --git a/studio/backend/core/inference/diffusion.py b/studio/backend/core/inference/diffusion.py
-index 977b28fc91..094c204251 100644
+index 977b28fc91..76b5f71188 100644
 --- a/studio/backend/core/inference/diffusion.py
 +++ b/studio/backend/core/inference/diffusion.py
-@@ -4249,6 +4249,38 @@ def _memory_request_forces_offload(memory_mode: Optional[str], cpu_offload: bool
+@@ -4249,6 +4249,42 @@ def _memory_request_forces_offload(memory_mode: Optional[str], cpu_offload: bool
      return mode is None and bool(cpu_offload)
  
  
@@ -20,9 +20,13 @@ index 977b28fc91..094c204251 100644
 +    int8 gates (``rdna_explicit_int8``: explicit int8, pipeline, no forced offload, compiling speed tier) plus
 +    ``rocm_image_hosted_int8_reason``. Never raises."""
 +    try:
-+        from .diffusion_rocm_hosted_int8 import rocm_image_hosted_int8_reason
++        from .diffusion_rocm_hosted_int8 import (
++            rocm_image_hosted_int8_enabled,
++            rocm_image_hosted_int8_reason,
++        )
 +
-+        if kind != "pipeline" or fam is None:
++        # The kill switch first: UNSLOTH_ROCM_IMAGE_HOSTED_INT8=0 asks nothing else of the host.
++        if not rocm_image_hosted_int8_enabled() or kind != "pipeline" or fam is None:
 +            return None
 +        if _memory_request_forces_offload(memory_mode, cpu_offload):
 +            return None
@@ -41,7 +45,7 @@ index 977b28fc91..094c204251 100644
  def _pipeline_quant_uncompilable_reason(
      target: Any,
      fam: Any,
-@@ -6951,7 +6983,22 @@ class DiffusionBackend:
+@@ -6951,7 +6987,22 @@ class DiffusionBackend:
              with diffusion_device_scope(gpu_ordinal):
                  target = self._target_for_ordinal(fam, gpu_ordinal)
                  if not dense_transformer_supported(target):
@@ -65,7 +69,7 @@ index 977b28fc91..094c204251 100644
                  if (
                      _pipeline_quant_uncompilable_reason(target, fam, speed_mode, model_kind = kind)
                      is not None
-@@ -7122,6 +7169,76 @@ class DiffusionBackend:
+@@ -7122,6 +7173,81 @@ class DiffusionBackend:
              logger.warning("diffusion.denoiser_prequant_plan_failed: %s", exc)
              return None
  
@@ -111,7 +115,12 @@ index 977b28fc91..094c204251 100644
 +                local_files_only = local_files_only,
 +                cache_dir = hub_cache_dir(),
 +            )
-+            if source is None or _is_local_cache_entry(source):
++            # Hosted repos only (planning already checked their header against this base); never a local override.
++            if (
++                source is None
++                or getattr(source, "kind", None) != "repo"
++                or _is_local_cache_entry(source)
++            ):
 +                return None
 +            memory = snapshot_device_memory(target)
 +            planned = self._seeded_pipeline_plan(
@@ -142,16 +151,29 @@ index 977b28fc91..094c204251 100644
      def _dit_prequant_plan_source(
          self,
          fam: Any,
-@@ -9214,6 +9331,13 @@ class DiffusionBackend:
+@@ -9214,6 +9340,26 @@ class DiffusionBackend:
                          if seeded_plan is None
                          else torchao_offload_plan(seeded_plan, pipeline_seed_scheme)
                      )
 +                    if (
 +                        seeded_placement is not None
 +                        and not dense_transformer_supported(target)
-+                        and not plan_keeps_transformer_resident(seeded_placement)
++                        and (
++                            not plan_keeps_transformer_resident(seeded_placement)
++                            or _rocm_hosted_int8_route_reason(
++                                fam,
++                                target,
++                                transformer_quant,
++                                kind = kind,
++                                speed_mode = speed_mode,
++                                memory_mode = memory_mode,
++                                cpu_offload = cpu_offload,
++                            )
++                            is None
++                        )
 +                    ):
-+                        # The ROCm hosted int8 read is resident only (the compiled RDNA int8 tier).
++                        # The ROCm hosted int8 read is the compiled RDNA int8 tier's W8A8 build, resident only: re-asked
++                        # here, since a compile probe recorded after planning can turn that tier off.
 +                        seeded_placement = None
                      if seeded_placement is None:
                          # Live free memory can undercut the CAPACITY the plan settled this against.
@@ -214,7 +236,7 @@ index d755868586..7fec933226 100644
              transformer_cls,
              base_repo,
 diff --git a/studio/backend/core/inference/diffusion_native_hosted.py b/studio/backend/core/inference/diffusion_native_hosted.py
-index a656598b0d..91ba9a5f87 100644
+index a656598b0d..db1245007d 100644
 --- a/studio/backend/core/inference/diffusion_native_hosted.py
 +++ b/studio/backend/core/inference/diffusion_native_hosted.py
 @@ -45,9 +45,14 @@ def native_hosted_pickle(fam: Any) -> bool:
@@ -234,15 +256,16 @@ index a656598b0d..91ba9a5f87 100644
  
  
  def hosted_metadata(path: str) -> Optional[dict]:
-@@ -106,6 +111,7 @@ def load_native_from_hosted(
+@@ -106,6 +111,8 @@ def load_native_from_hosted(
      config_kwargs: Optional[dict] = None,
      base: Optional[str] = None,
      logger: Any = None,
 +    tag: str = "video.native_hosted",
++    keep_fp32: bool = False,
  ) -> Any:
      """The native ``component`` built from hosted ``path``, or None (the caller falls back to the dense build). Never
      raises. Refuses unless the file holds exactly the layers, rotation and activation path the runtime build makes."""
-@@ -130,7 +136,7 @@ def load_native_from_hosted(
+@@ -130,7 +137,7 @@ def load_native_from_hosted(
          meta = hosted_metadata(path)
          problem = metadata_refusal(meta, spec, family = family, component = component)
          if problem:
@@ -251,7 +274,7 @@ index a656598b0d..91ba9a5f87 100644
              return None
          from accelerate import init_empty_weights
          from safetensors.torch import load_file
-@@ -162,6 +168,7 @@ def load_native_from_hosted(
+@@ -162,6 +169,7 @@ def load_native_from_hosted(
                  "info",
                  f"hosted int8 checkpoint not used ({len(quantised)} quantised layers, the native build makes "
                  f"{len(wanted)}; e.g. {sorted(quantised ^ wanted)[:2]})",
@@ -259,7 +282,7 @@ index a656598b0d..91ba9a5f87 100644
              )
              return None
          if any(key.endswith(_ACT_PAYLOADS) for key in state):
-@@ -169,6 +176,7 @@ def load_native_from_hosted(
+@@ -169,6 +177,7 @@ def load_native_from_hosted(
                  logger,
                  "info",
                  "hosted int8 checkpoint not used (it carries static activation scales)",
@@ -267,7 +290,7 @@ index a656598b0d..91ba9a5f87 100644
              )
              return None
          modules = dict(model.named_modules())
-@@ -179,6 +187,7 @@ def load_native_from_hosted(
+@@ -179,6 +188,7 @@ def load_native_from_hosted(
                  logger,
                  "info",
                  "hosted int8 checkpoint not used (its rotated layers differ from the native build's)",
@@ -275,7 +298,7 @@ index a656598b0d..91ba9a5f87 100644
              )
              return None
          parts: dict = {}
-@@ -199,6 +208,7 @@ def load_native_from_hosted(
+@@ -199,6 +209,7 @@ def load_native_from_hosted(
                      logger,
                      "info",
                      f"hosted int8 checkpoint not used ({fqn}: unexpected payload layout)",
@@ -283,22 +306,35 @@ index a656598b0d..91ba9a5f87 100644
                  )
                  return None
              parts[fqn + ".weight"] = HostedInt8Parts(codes, scale, zero)
-@@ -242,10 +252,12 @@ def load_native_from_hosted(
+@@ -242,10 +253,24 @@ def load_native_from_hosted(
          model.load_state_dict(state, strict = True, assign = True)
          del state
          if any(t.device.type == "meta" for t in (*model.parameters(), *model.buffers())):
 -            _log(logger, "warning", "hosted int8 checkpoint left meta tensors; not used")
 +            _log(logger, "warning", "hosted int8 checkpoint left meta tensors; not used", tag = tag)
              return None
-         if any(p.dtype != torch.bfloat16 for p in model.parameters() if p.is_floating_point()):
+-        if any(p.dtype != torch.bfloat16 for p in model.parameters() if p.is_floating_point()):
 -            _log(logger, "info", "hosted int8 checkpoint not used (a non-bf16 dense tensor)")
++        # ``keep_fp32``: float32 also where a bf16 from_pretrained keeps it (``_keep_in_fp32_modules``, e.g. FLUX.3's
++        # norm_q / norm_k, which its hosted file stores as F32). Off for the video callers.
++        kept = (
++            set(getattr(transformer_cls, "_keep_in_fp32_modules", None) or ())
++            if keep_fp32
++            else set()
++        )
++        if any(
++            p.dtype != torch.bfloat16
++            and not (p.dtype == torch.float32 and kept & set(name.split(".")))
++            for name, p in model.named_parameters()
++            if p.is_floating_point()
++        ):
 +            _log(
 +                logger, "info", "hosted int8 checkpoint not used (a non-bf16 dense tensor)", tag = tag
 +            )
              return None
          model.eval()
          try:
-@@ -262,10 +274,16 @@ def load_native_from_hosted(
+@@ -262,10 +287,16 @@ def load_native_from_hosted(
              "info",
              f"read {len(quantised)} int8 ConvRot layers of {component} from the hosted checkpoint as native "
              f"Linears in {time.perf_counter() - t0:.1f} s (no dense shards, no runtime quantise)",
@@ -318,10 +354,10 @@ index a656598b0d..91ba9a5f87 100644
  
 diff --git a/studio/backend/core/inference/diffusion_rocm_hosted_int8.py b/studio/backend/core/inference/diffusion_rocm_hosted_int8.py
 new file mode 100644
-index 0000000000..275d8cff29
+index 0000000000..f5216b45b2
 --- /dev/null
 +++ b/studio/backend/core/inference/diffusion_rocm_hosted_int8.py
-@@ -0,0 +1,140 @@
+@@ -0,0 +1,148 @@
 +# SPDX-License-Identifier: AGPL-3.0-only
 +# Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
 +
@@ -431,7 +467,14 @@ index 0000000000..275d8cff29
 +            scheme = TQ_INT8,
 +            logger = logger,
 +        )
-+        if path is None:
++        # The ConvRot safetensors build only: a plain or pickled int8 file is not the native W8A8 build.
++        base_name = os.path.basename(str(path or "")).lower()
++        if not base_name.endswith(".safetensors") or "convrot" not in base_name:
++            if path is not None and logger is not None:
++                logger.info(
++                    "diffusion.rocm_hosted_int8: %s is not an int8 ConvRot safetensors build",
++                    base_name,
++                )
 +            return None
 +        name = getattr(fam, "name", None)
 +        module = load_native_from_hosted(
@@ -450,6 +493,7 @@ index 0000000000..275d8cff29
 +            base = base_repo,
 +            logger = logger,
 +            tag = "diffusion.rocm_hosted_int8",
++            keep_fp32 = True,
 +        )
 +        if module is None:
 +            return None
@@ -464,10 +508,10 @@ index 0000000000..275d8cff29
 +        return None
 diff --git a/studio/backend/tests/test_diffusion_rocm_hosted_int8.py b/studio/backend/tests/test_diffusion_rocm_hosted_int8.py
 new file mode 100644
-index 0000000000..0afcbd6145
+index 0000000000..175d6e35d3
 --- /dev/null
 +++ b/studio/backend/tests/test_diffusion_rocm_hosted_int8.py
-@@ -0,0 +1,339 @@
+@@ -0,0 +1,382 @@
 +# SPDX-License-Identifier: AGPL-3.0-only
 +# Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
 +
@@ -696,6 +740,49 @@ index 0000000000..0afcbd6145
 +    assert _seed(planner) is None
 +
 +
++def test_planner_never_seeds_a_local_override(planner_host, monkeypatch):
++    local = types.SimpleNamespace(kind = "path", location = "/models/flux3-int8.safetensors")
++    monkeypatch.setattr(D, "denoiser_prequant_source", lambda *a, **k: local)
++    assert _seed(_Planner(types.SimpleNamespace(offload_policy = OFFLOAD_NONE))) is None
++
++
++@pytest.mark.parametrize(
++    "name", ["flux-3-image-klein-INT8.safetensors", "Z-Image-Turbo-INT8.pt", "x-INT8-ConvRot.pt"]
++)
++def test_reader_takes_only_a_convrot_safetensors_build(monkeypatch, tmp_path, name):
++    from core.inference import diffusion_prequant as pq
++
++    path = tmp_path / name
++    path.write_bytes(b"")
++    monkeypatch.setattr(pq, "_resolve_checkpoint_path", lambda *a, **k: str(path))
++    called = []
++    monkeypatch.setattr(NH, "load_native_from_hosted", lambda *a, **k: called.append(1))
++    source = types.SimpleNamespace(kind = "repo", location = "unsloth/flux-3-image-klein-FP8")
++    assert RH.load_rocm_hosted_transformer(_fam(), object, FLUX3[0], source) is None
++    assert called == []
++
++
++def test_reader_opts_into_the_keep_fp32_rule(monkeypatch, tmp_path):
++    from core.inference import diffusion_prequant as pq
++
++    path = tmp_path / "flux-3-image-klein-INT8-ConvRot.safetensors"
++    path.write_bytes(b"")
++    monkeypatch.setattr(pq, "_resolve_checkpoint_path", lambda *a, **k: str(path))
++    seen = {}
++    module = types.SimpleNamespace()
++
++    def reader(*a, **k):
++        seen.update(k)
++        return module
++
++    monkeypatch.setattr(NH, "load_native_from_hosted", reader)
++    source = types.SimpleNamespace(kind = "repo", location = "unsloth/flux-3-image-klein-FP8")
++    assert RH.load_rocm_hosted_transformer(_fam(), object, FLUX3[0], source) is module
++    assert seen["keep_fp32"] is True and seen["spec"]["act_int8"] is True
++    assert seen["tag"] == "diffusion.rocm_hosted_int8"
++    assert module._unsloth_prequant_path == str(path)
++
++
 +def test_planner_keeps_the_dense_shards_without_a_hosted_source(planner_host, monkeypatch):
 +    monkeypatch.setattr(D, "denoiser_prequant_source", lambda *a, **k: None)
 +    assert _seed(_Planner(types.SimpleNamespace(offload_policy = OFFLOAD_NONE))) is None
@@ -807,3 +894,45 @@ index 0000000000..0afcbd6145
 +        str(path), object, "unused", spec = {"scheme": "int8"}, family = None, logger = _Log()
 +    )
 +    assert seen and seen[0].startswith("video.native_hosted: ")
+diff --git a/studio/backend/tests/test_video_native_hosted.py b/studio/backend/tests/test_video_native_hosted.py
+index 1fa7b16805..5b18372d25 100644
+--- a/studio/backend/tests/test_video_native_hosted.py
++++ b/studio/backend/tests/test_video_native_hosted.py
+@@ -251,6 +251,37 @@ def test_refuses_a_file_that_is_not_the_native_build(tmp_path, case):
+     assert _load(path, cfg_dir) is None
+ 
+ 
++def test_keeps_float32_only_where_from_pretrained_does(tmp_path):
++    # FLUX.3 stores its _keep_in_fp32_modules (norm_q / norm_k) as F32, which a bf16 from_pretrained keeps too.
++    def widen(state):
++        state["scale_shift_table"] = state["scale_shift_table"].float()
++
++    path, cfg_dir, _ = _write_hosted(tmp_path, mutate = widen)
++    # Without a keep-list entry a float32 dense tensor is not the bf16 build: refused, as before.
++    assert _load(path, cfg_dir) is None
++
++    class Kept(CLS):
++        _keep_in_fp32_modules = ["scale_shift_table"]
++
++    # The video callers keep the strict bf16 rule; only the image caller opts in.
++    assert (
++        NH.load_native_from_hosted(
++            str(path), Kept, str(cfg_dir), spec = _spec(), family = FAMILY, logger = None
++        )
++        is None
++    )
++    model = NH.load_native_from_hosted(
++        str(path), Kept, str(cfg_dir), spec = _spec(), family = FAMILY, logger = None, keep_fp32 = True
++    )
++    assert model is not None
++    assert model.scale_shift_table.dtype == torch.float32
++    assert all(
++        p.dtype == torch.bfloat16
++        for n, p in model.named_parameters()
++        if p.is_floating_point() and n != "scale_shift_table"
++    )
++
++
+ def test_refuses_a_weight_only_or_unrotated_native_build(tmp_path):
+     path, cfg_dir, _ = _write_hosted(tmp_path)
+     assert _load(path, cfg_dir, spec = native_spec("int8", FAMILY, act_int8 = False)) is None
