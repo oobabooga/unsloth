@@ -207,10 +207,12 @@ def p2_child(vae_key: str, mode: str, out_path: Path) -> int:
         import diffusers
 
         repo, cls, shape = VAES[vae_key]
-        if mode.startswith("imm") or mode in ("stock", "fused"):
+        if mode.startswith("imm") or mode.startswith("x_") or mode in ("stock", "fused"):
             torch.backends.miopen.immediate = True
         r["immediate"] = bool(getattr(torch.backends.miopen, "immediate", None))
-        dev, dt = ("cpu", torch.float32) if mode == "cpu" else ("cuda", torch.bfloat16)
+        dev, dt = ("cpu", torch.float32) if mode == "cpu" else ("cuda", torch.float32 if mode == "x_fp32" else torch.bfloat16)
+        if mode == "x_nocudnn":
+            torch.backends.cudnn.enabled = False
         vae = getattr(diffusers, cls).from_pretrained(repo, subfolder = "vae", torch_dtype = dt,
                                                       token = False).to(dev).eval()
         if mode == "fused":
@@ -322,6 +324,55 @@ def p2(out: dict, work: Path, timeout_s: float, out_dir_for_db: Path) -> None:
                 (keep / f.name).write_bytes(f.read_bytes())
     out["p2"] = r
 
+
+
+MIOPEN_BISECT = {  # immediate mode, one solver family off per arm (MIOpen debug switches), or MIOpen off / fp32
+    "x_no_igemm": {"MIOPEN_DEBUG_CONV_IMPLICIT_GEMM": "0"},
+    "x_no_wino": {"MIOPEN_DEBUG_CONV_WINOGRAD": "0"},
+    "x_no_direct": {"MIOPEN_DEBUG_CONV_DIRECT": "0"},
+    "x_no_gemm": {"MIOPEN_DEBUG_CONV_GEMM": "0"},
+    "x_no_fft": {"MIOPEN_DEBUG_CONV_FFT": "0"},
+    "x_nocudnn": {},
+    "x_fp32": {},
+}
+
+
+def p2x(out: dict, work: Path, timeout_s: float) -> None:
+    """FLUX.2 VAE decode vs CPU fp32 under each MIOpen solver family switched off: which one breaks the decode."""
+    import torch
+
+    vae_key = "flux2_vae_1024"
+    empty = work / "miopen_empty_x"
+    empty.mkdir(parents = True, exist_ok = True)
+    base = {k: v for k, v in os.environ.items() if not k.startswith("MIOPEN_")}
+    rows: dict = {}
+    for mode, env in [("cpu", {}), ("imm", {})] + list(MIOPEN_BISECT.items()):
+        jp = work / f"p2x_{mode}.json"
+        t0 = time.time()
+        try:
+            with open(work / f"p2x_{mode}.log", "w", encoding = "utf-8") as fh:
+                rc = subprocess.run([sys.executable, __file__, "--p2-child", vae_key, mode, str(jp)],
+                                    env = {**base, "MIOPEN_USER_DB_PATH": str(empty), **env}, stdout = fh,
+                                    stderr = subprocess.STDOUT, timeout = timeout_s).returncode
+        except subprocess.TimeoutExpired:
+            rc = "timeout"
+        row = json.loads(jp.read_text(encoding = "utf-8")) if jp.exists() else {"ok": False}
+        row["rc"], row["wall_s"], row["env_set"] = rc, round(time.time() - t0, 1), env
+        rows[mode] = row
+        out["p2x"] = rows
+    try:
+        cref = torch.load(work / "p2x_cpu.pt")
+        for mode in rows:
+            pt = work / f"p2x_{mode}.pt"
+            if mode != "cpu" and pt.exists():
+                x = torch.load(pt)
+                mse = float(((x.clamp(-1, 1) - cref.clamp(-1, 1)) / 2).pow(2).mean())
+                rows[mode]["vs_cpu_fp32"] = {"max_abs": float((x - cref).abs().max()),
+                                             "psnr_db": round(10 * __import__("math").log10(1 / max(mse, 1e-20)), 2),
+                                             "lpips": lpips_of(x, cref)}
+    except Exception as exc:  # noqa: BLE001
+        rows["compare_error"] = err(exc)
+    out["p2x"] = rows
 
 def lpips_of(x, ref):
     try:
@@ -531,7 +582,8 @@ def main() -> int:
                      ("vae_gn", lambda: gn_kernels(obs, a.checkout)),
                      ("vae_fused", lambda: vae_fused(obs, work, a.p2_timeout_s, a.checkout)),
                      ("mapping", lambda: mapping(obs, work)),
-                     ("p2", lambda: p2(obs, work, a.p2_timeout_s, a.out.parent / "miopen_db"))):
+                     ("p2", lambda: p2(obs, work, a.p2_timeout_s, a.out.parent / "miopen_db")),
+                     ("p2x", lambda: p2x(obs, work, a.p2_timeout_s))):
         if name in skip:
             obs[name] = {"_skipped": True}
             continue
