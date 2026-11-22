@@ -1,0 +1,198 @@
+name: "AMD CI: Windows ROCm LTX-2.3 VAE per-tap Conv3d A/B on gfx1151"
+
+on:
+  push:
+    branches: [amd-ci-nov22-pertap-full]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  BASE_SHA: "0c1fef29be09c2b738f2c3738b5a31738f1612be"
+  UPSTREAM: "https://github.com/unslothai/unsloth"
+
+jobs:
+
+  windows:
+    name: "LTX-2.3 VAE per-tap A/B (gfx1151 Windows, non-Docker)"
+    runs-on: [self-hosted, Windows, strix-halo, devlab-dispatch]
+    timeout-minutes: 600
+    concurrency: {group: amd-ci-gfx1151-gpu, cancel-in-progress: false}
+    defaults:
+      run:
+        shell: powershell
+    steps:
+      - uses: actions/checkout@v4
+        with: { persist-credentials: false }
+
+      - name: Preamble
+        run: |
+          .\amd_ci\lib\preamble.ps1 -Name "pertap-win"
+
+      - name: Locate the system Python
+        run: |
+          $ErrorActionPreference = "Continue"
+          $found = $null
+          foreach ($c in @("C:\Program Files\Python312\python.exe",
+                           "C:\Program Files\Python311\python.exe",
+                           "C:\Program Files\Python310\python.exe")) {
+            if (Test-Path -LiteralPath $c) { $found = $c; break }
+          }
+          if ($null -eq $found) { Write-Host "FATAL: no system Python"; exit 1 }
+          & $found --version
+          Add-Content -Path $env:GITHUB_ENV -Value "AMD_CI_PY=$found"
+
+      - name: Host gate
+        run: |
+          $ErrorActionPreference = "Continue"
+          & $env:AMD_CI_PY "$env:GITHUB_WORKSPACE\amd_ci\lib\gate.py" --no-torch `
+            --require windows --out "$env:AMD_CI_WORK\out\host.json"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Studio at BASE_SHA (install.ps1 --local), head tree = BASE_SHA + PR diff
+        timeout-minutes: 150
+        run: |
+          $ErrorActionPreference = "Continue"
+          Remove-Item Env:HF_TOKEN -ErrorAction SilentlyContinue
+          $repo = "$env:AMD_CI_WORK\repo"
+          $head = "$env:AMD_CI_WORK\head"
+          & git clone -q --filter=blob:none -c core.autocrlf=false "$env:UPSTREAM" $repo
+          & git -C $repo checkout -q --detach "$env:BASE_SHA"
+          if ($LASTEXITCODE -ne 0) { Write-Host "FATAL: checkout failed"; exit 1 }
+          & git -C $repo -c core.autocrlf=false worktree add -q --detach $head "$env:BASE_SHA"
+          & git -C $head apply --whitespace=nowarn "$env:GITHUB_WORKSPACE\amd_ci\patches\win_rocm_vae_pertap.diff"
+          if ($LASTEXITCODE -ne 0) { Write-Host "FATAL: patch did not apply"; exit 1 }
+          & git -C $head status --short | Write-Host
+          Add-Content -Path $env:GITHUB_ENV -Value "AMD_CI_REPO=$repo"
+          Add-Content -Path $env:GITHUB_ENV -Value "AMD_CI_HEAD=$head"
+          $env:UNSLOTH_STUDIO_HOME = "$env:AMD_CI_WORK\studio"
+          Add-Content -Path $env:GITHUB_ENV -Value "UNSLOTH_STUDIO_HOME=$env:UNSLOTH_STUDIO_HOME"
+          Push-Location $repo
+          & powershell -NoProfile -ExecutionPolicy Bypass -File ".\install.ps1" --local --skip-autostart --no-rollback *>&1 |
+            Tee-Object -FilePath "$env:AMD_CI_WORK\out\studio_install.log" | Select-Object -Last 40 | Out-String | Write-Host
+          $irc = $LASTEXITCODE
+          Pop-Location
+          Write-Host "install.ps1 exit $irc"
+          $py = "$env:UNSLOTH_STUDIO_HOME\unsloth_studio\Scripts\python.exe"
+          if (-not (Test-Path -LiteralPath $py)) { Write-Host "FATAL: no Studio venv at $py (installer exit $irc)"; exit 1 }
+          & $py -c "import torch, diffusers; print('torch', torch.__version__, 'hip', torch.version.hip, 'diffusers', diffusers.__version__)"
+          Add-Content -Path $env:GITHUB_ENV -Value "AMD_CI_PY=$py"
+          & $py "$env:GITHUB_WORKSPACE\amd_ci\lib\gate.py" --require windows rocm gpu --expect-arch gfx1151 `
+            --out "$env:AMD_CI_WORK\out\host_rocm.json"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Head CPU tests on the runner (targeted)
+        timeout-minutes: 20
+        run: |
+          $ErrorActionPreference = "Continue"
+          Push-Location "$env:AMD_CI_HEAD\studio\backend"
+          & $env:AMD_CI_PY -m pip --version | Out-Null
+          & $env:AMD_CI_PY -m pytest -q -p no:cacheprovider tests/test_video_vae_rocm_pertap.py *>&1 |
+            Out-File -Encoding utf8 "$env:AMD_CI_WORK\out\pytest_head.log"
+          Write-Host "pytest exit $LASTEXITCODE"
+          Pop-Location
+          Get-Content "$env:AMD_CI_WORK\out\pytest_head.log" -Tail 15 | Write-Host
+          exit 0
+
+      - name: LTX-2.3 VAE decode A/B
+        timeout-minutes: 420
+        run: |
+          $ErrorActionPreference = "Continue"
+          New-Item -ItemType Directory -Force -Path "$env:AMD_CI_WORK\out\vae" | Out-Null
+          $env:HF_HOME = "$env:AMD_CI_WORK\hf_home"
+          $env:HF_HUB_DISABLE_TELEMETRY = "1"
+          Remove-Item Env:HF_TOKEN -ErrorAction SilentlyContinue
+          & $env:AMD_CI_PY "$env:GITHUB_WORKSPACE\amd_ci\probes\pertap_ab_probe.py" --base $env:AMD_CI_REPO --head $env:AMD_CI_HEAD `
+            --out "$env:AMD_CI_WORK\out\vae\obs.json" --work "$env:AMD_CI_WORK\vae_work" --shapes s512x288x97,m1280x704x49,l1920x1088x121 --arms base,head,head_kill,base_aa,head_aa --cpu-ref s512x288x97,m1280x704x49 --cpu-ref-last l1920x1088x121 *>&1 |
+            Out-File -Encoding utf8 "$env:AMD_CI_WORK\out\vae\probe.log"
+          Write-Host "probe exit $LASTEXITCODE"
+          Get-Content "$env:AMD_CI_WORK\out\vae\probe.log" -Tail 40 | Write-Host
+          Copy-Item "$env:AMD_CI_WORK\vae_work\*.json" "$env:AMD_CI_WORK\out\vae\" -ErrorAction SilentlyContinue
+          Copy-Item "$env:AMD_CI_WORK\vae_work\*.log" "$env:AMD_CI_WORK\out\vae\" -ErrorAction SilentlyContinue
+          exit 0
+
+      - name: Stop anything this job started
+        if: always()
+        run: |
+          $ErrorActionPreference = "Continue"
+          $w = $env:AMD_CI_WORK
+          if (-not $w -or $w.Length -lt 8 -or -not (Test-Path -LiteralPath $w)) { Write-Output "nothing to stop"; exit 0 }
+          $w = (Resolve-Path -LiteralPath $w).Path.TrimEnd('\')
+          Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -and $_.CommandLine.Contains($w + '\') -and $_.ProcessId -ne $PID } |
+            ForEach-Object { Write-Output "stopping $($_.ProcessId) $($_.Name)"; Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+          exit 0
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: pertap-windows
+          path: ${{ env.AMD_CI_WORK }}/out
+          retention-days: 7
+          if-no-files-found: warn
+
+  linux:
+    name: "LTX-2.3 VAE per-tap no-regression (gfx1151 Linux)"
+    needs: [windows]
+    if: always()
+    runs-on: [self-hosted, Linux, strix-halo, devlab-dispatch]
+    timeout-minutes: 300
+    concurrency: {group: amd-ci-gfx1151-gpu, cancel-in-progress: false}
+    steps:
+      - uses: actions/checkout@v4
+        with: { persist-credentials: false }
+
+      - name: Preamble
+        run: |
+          source amd_ci/lib/preamble.sh "pertap-linux"
+
+      - name: Studio at BASE_SHA (install.sh --local), head tree = BASE_SHA + PR diff
+        timeout-minutes: 60
+        run: |
+          set -euo pipefail
+          unset HF_TOKEN || true
+          git clone -q --filter=blob:none "$UPSTREAM" "$AMD_CI_WORK/repo"
+          git -C "$AMD_CI_WORK/repo" checkout -q --detach "$BASE_SHA"
+          git -C "$AMD_CI_WORK/repo" worktree add -q --detach "$AMD_CI_WORK/head" "$BASE_SHA"
+          git -C "$AMD_CI_WORK/head" apply "$GITHUB_WORKSPACE/amd_ci/patches/win_rocm_vae_pertap.diff"
+          git -C "$AMD_CI_WORK/head" status --short
+          cd "$AMD_CI_WORK/repo"
+          export UNSLOTH_STUDIO_HOME="$AMD_CI_WORK/studio"
+          export UV_EXTRA_INDEX_URL="https://pypi.org/simple"
+          set +e
+          bash install.sh --local 2>&1 | tail -15
+          rc=${PIPESTATUS[0]}
+          set -e
+          [ "$rc" -eq 0 ] || exit "$rc"
+          V=""
+          for c in "$UNSLOTH_STUDIO_HOME"/unsloth_studio "$UNSLOTH_STUDIO_HOME"/.venv_t5_*; do
+            [ -x "$c/bin/python" ] && { V="$c"; break; }
+          done
+          [ -n "$V" ] || { echo "FATAL: no Studio venv"; exit 1; }
+          echo "AMD_CI_PY=$V/bin/python" >> "$GITHUB_ENV"
+          "$V/bin/python" "$GITHUB_WORKSPACE/amd_ci/lib/gate.py" --require rocm gpu --expect-arch gfx1151 --min-gpus 1 \
+            --out "$AMD_CI_WORK/out/host.json"
+
+      - name: LTX-2.3 VAE decode A/B (patch must not install)
+        timeout-minutes: 220
+        run: |
+          set +e
+          mkdir -p "$AMD_CI_WORK/out/vae"
+          export HF_HOME="$AMD_CI_WORK/hf_home" HF_HUB_DISABLE_TELEMETRY=1
+          unset HF_TOKEN
+          "$AMD_CI_PY" "$GITHUB_WORKSPACE/amd_ci/probes/pertap_ab_probe.py" --base "$AMD_CI_WORK/repo" --head "$AMD_CI_WORK/head" \
+            --out "$AMD_CI_WORK/out/vae/obs.json" --work "$AMD_CI_WORK/vae_work" --shapes s512x288x97,l1920x1088x121 --arms base,head,base_aa,head_aa --cpu-ref none \
+            > "$AMD_CI_WORK/out/vae/probe.log" 2>&1
+          echo "probe rc=$?"
+          tail -40 "$AMD_CI_WORK/out/vae/probe.log"
+          cp "$AMD_CI_WORK"/vae_work/*.json "$AMD_CI_WORK/out/vae/"
+          cp "$AMD_CI_WORK"/vae_work/*.log "$AMD_CI_WORK/out/vae/"
+          exit 0
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: pertap-linux
+          path: ${{ env.AMD_CI_WORK }}/out
+          retention-days: 7
+          if-no-files-found: warn
