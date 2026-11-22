@@ -192,6 +192,47 @@ def pertap_selfcheck(dev: str, dtype) -> dict:
     return res
 
 
+def layer_profile(vae, z, dev: str) -> list:
+    """Every decoder Conv3d call shape of one untiled decode, then native vs per-tap time per unique (conv, shape)."""
+    import torch
+
+    seen: dict = {}
+    hooks = []
+    for name, m in vae.decoder.named_modules():
+        if isinstance(m, torch.nn.Conv3d):
+            def pre(mod, args, name = name):
+                key = (name, tuple(args[0].shape))
+                seen[key] = seen.get(key, 0) + 1
+            hooks.append(m.register_forward_pre_hook(pre))
+    with torch.no_grad():
+        vae.use_tiling = False
+        vae.decode(z[:, :, :min(z.shape[2], 16)], return_dict = False)
+    for h in hooks:
+        h.remove()
+    mods = dict(vae.decoder.named_modules())
+    rows = []
+    for (name, shape), calls in seen.items():
+        m = mods[name]
+        x = torch.randn(shape, device = dev, dtype = m.weight.dtype)
+        res = {"conv": name, "in_shape": list(shape), "calls": calls, "k": list(m.kernel_size),
+               "cout": m.out_channels, "stride": list(m.stride)}
+        with torch.no_grad():
+            for label, fn in (("native", lambda: m._amd_native_forward(x) if hasattr(m, "_amd_native_forward") else m(x)),
+                              ("pertap", lambda: pertap_conv3d_forward(m, x))):
+                if not hasattr(m, "_amd_native_forward"):
+                    m._amd_native_forward = m.forward
+                ts, y = _time_calls(fn, dev, 3)
+                res[f"{label}_ms"] = round(1000 * min(ts[1:]), 2)
+                res[f"{label}_first_ms"] = round(1000 * ts[0], 2)
+                del y
+        res["speedup"] = round(res["native_ms"] / max(res["pertap_ms"], 1e-6), 3)
+        rows.append(res)
+        print("layerprof", json.dumps(res), flush = True)
+        del x
+        torch.cuda.empty_cache()
+    return rows
+
+
 # ----------------------------------------------------------------- children
 def child_qwen(arm: str, out_path: Path, checkout: str) -> None:
     import torch
@@ -305,6 +346,11 @@ def child_ltx(arm: str, shape_key: str, out_path: Path, checkout: str) -> None:
         r["load_s"] = round(time.perf_counter() - t0, 1)
         zp = work / f"ltx_latent_{shape_key}.pt"
         z = torch.load(zp).to(dev, dtype)
+        if arm == "layerprof":
+            r["layers"] = layer_profile(vae, z, dev)
+            r["ok"] = True
+            out_path.write_text(json.dumps(r, indent = 1), encoding = "utf-8")
+            return
         if arm.startswith("pertap"):
             r["pertap_selfcheck"] = pertap_selfcheck(dev, dtype)
             r["pertap_convs"] = install_pertap(vae.decoder)
@@ -415,6 +461,26 @@ def suite_linux(work: Path, checkout: str, out: dict, flush) -> None:
     out["qwen_quality"] = q
 
 
+def suite_ltx_large(work: Path, checkout: str, out: dict, flush, with_ab: bool) -> None:
+    import torch
+
+    sk = "l1920x1088x121"
+    g = torch.Generator(device = "cpu").manual_seed(0)
+    torch.save(torch.randn(*LTX_SHAPES[sk], generator = g), work / f"ltx_latent_{sk}.pt")
+    rows = out.setdefault("ltx", {})
+    arms = ["layerprof"] + (["studio", "pertap", "studio_aa", "pertap_aa"] if with_ab else [])
+    for arm in arms:
+        rows[f"{sk}/{arm}"] = run_arm(work, ["--child-ltx", arm, sk, "--checkout", checkout], 3600, f"ltx_{sk}_{arm}")
+        flush()
+    if with_ab:
+        try:
+            ref = torch.load(work / f"ltx_{sk}_studio.pt").float()
+            out["ltx_quality"] = {f"{sk}/{a}": {"vs_studio": compare(torch.load(work / f"ltx_{sk}_{a}.pt").float(), ref)}
+                                  for a in ("studio_aa", "pertap", "pertap_aa") if (work / f"ltx_{sk}_{a}.pt").exists()}
+        except Exception as exc:  # noqa: BLE001
+            out["ltx_quality"] = {"compare_error": err(exc)}
+
+
 def suite_windows(work: Path, checkout: str, out: dict, flush, shapes: list) -> None:
     import torch
 
@@ -460,7 +526,7 @@ def suite_windows(work: Path, checkout: str, out: dict, flush, shapes: list) -> 
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--suite", choices = ("linux", "windows"))
+    ap.add_argument("--suite", choices = ("linux", "windows", "windows_prof"))
     ap.add_argument("--checkout")
     ap.add_argument("--out")
     ap.add_argument("--work")
@@ -497,6 +563,9 @@ def main() -> int:
     flush()
     if a.suite == "linux":
         suite_linux(work, a.checkout, out, flush)
+        suite_ltx_large(work, a.checkout, out, flush, with_ab = True)
+    elif a.suite == "windows_prof":
+        suite_ltx_large(work, a.checkout, out, flush, with_ab = False)
     else:
         suite_windows(work, a.checkout, out, flush, [s for s in a.shapes.split(",") if s])
     out["finished"] = time.strftime("%Y-%m-%d %H:%M:%S")
