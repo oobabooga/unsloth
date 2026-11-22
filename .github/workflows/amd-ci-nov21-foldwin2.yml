@@ -30,14 +30,14 @@ name: "AMD CI: AMD levers probe on gfx1151 (Linux + Windows, nov21)"
 
 on:
   push:
-    branches: [amd-ci-nov21-foldwin]
+    branches: [amd-ci-nov21-foldwin2]
   workflow_dispatch:
 
 permissions:
   contents: read
 
 env:
-  PR: "18760"
+  PR: "18792"
   BASE_SHA: "f5dfe6812a5dcedbb5075410a7ed5d463cc984e9"
   UPSTREAM: "https://github.com/unslothai/unsloth"
   # Set to "1" for a PR already merged: compares the merge commit to its parent.
