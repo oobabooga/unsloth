@@ -1,0 +1,306 @@
+diff --git a/studio/backend/core/inference/flm_host.py b/studio/backend/core/inference/flm_host.py
+index da614f7a0..2f0b490e5 100644
+--- a/studio/backend/core/inference/flm_host.py
++++ b/studio/backend/core/inference/flm_host.py
+@@ -11,6 +11,7 @@ import hmac
+ import json
+ import os
+ import queue
++import re
+ import shlex
+ import subprocess
+ import sys
+@@ -70,6 +71,23 @@ def catalog_row(entry: dict[str, Any], models_dir: Optional[Path] = None) -> dic
+     }
+ 
+ 
++def json_object(output: str, key: str) -> Optional[dict[str, Any]]:
++    """The JSON object holding ``key`` in flm's output. ``Flm.run`` joins stdout and stderr,
++    so a line flm prints before or after the object is skipped instead of failing the parse."""
++    decoder = json.JSONDecoder()
++    first = output.find("{")
++    # The object starts at the first brace or, after a status line, at the start of a line.
++    starts = sorted({first, *(m.start() for m in re.finditer(r"^\{", output, re.M))} - {-1})
++    for start in starts:
++        try:
++            value, _end = decoder.raw_decode(output, start)
++        except ValueError:
++            continue
++        if isinstance(value, dict) and key in value:
++            return value
++    return None
++
++
+ def log(message: str, tag: str = "FlmHost") -> None:
+     """A line in lemond's format. Studio keeps (Process) lines only while a load is open, as
+     flm echoes prompts."""
+@@ -162,10 +180,10 @@ class Flm:
+ 
+     def catalog(self) -> list[dict[str, Any]]:
+         code, output = self.run("list", "--json", timeout = 120.0)
+-        start = output.find("{")
+-        if code or start < 0:
++        report = None if code else json_object(output, "models")
++        if report is None:
+             raise RuntimeError(f"flm list failed: {output.strip()[-300:]}")
+-        models = json.loads(output[start:]).get("models") or []
++        models = report.get("models") or []
+         return [catalog_row(entry, self.models_dir) for entry in models if isinstance(entry, dict)]
+ 
+ 
+diff --git a/studio/backend/core/inference/llama_cpp.py b/studio/backend/core/inference/llama_cpp.py
+index d88710a98..ed997c84c 100644
+--- a/studio/backend/core/inference/llama_cpp.py
++++ b/studio/backend/core/inference/llama_cpp.py
+@@ -16102,6 +16102,9 @@ class LlamaCppBackend:
+         except Exception:
+             return None
+         gpus = [] if child_has_no_gpu else list(detected_gpus or ())
++        # The carve-out verifier requires the complete GGUF size, not the later
++        # lazy-read-discounted size.
++        original_model_bytes = model_bytes
+         # _get_gpu_memory returns [] on a failed probe, which looks like a GPU-less host.
+         if not model_bytes or (not gpus and not child_has_no_gpu):
+             return None
+@@ -16133,7 +16136,33 @@ class LlamaCppBackend:
+             logger.debug("Lazy-read discount skipped in the host preflight: %s", e)
+         free_vram_mib = sum(max(0, row[1]) for row in gpus if row[0] not in shared)
+         heap_free_mib, heap_bytes = self._shared_heap_budget(gpus, shared, model_bytes, argv, _env)
+-        offload_bytes = model_bytes - free_vram_mib * 1024 * 1024
++        # The single Windows ROCm APU's BIOS carve-out may exceed free memory
++        # reported through Windows-visible RAM. The two readings describe the
++        # SAME GPU, so use their maximum, never their sum. The existing helper
++        # must verify whole-GPU placement and reject ambiguous/managed memory.
++        device_credit_bytes = free_vram_mib * 1024 * 1024
++        if (
++            sys.platform == "win32"
++            and not child_has_no_gpu
++            and len(gpus) == 1
++            and not shared
++            and not set(integrated_gpu_ids or ())
++            and self._amd_apu_wants_unified_memory([gpus[0][0]])
++        ):
++            try:
++                verified_carveout_bytes = self._windows_rocm_apu_carve_out_credit(
++                    original_model_bytes,
++                    model_path = model_path,
++                    caps = self.probe_server_capabilities(argv[0]),
++                    gpu_indices = [gpus[0][0]],
++                    extra_args = argv,
++                    env = _env,
++                )
++                device_credit_bytes = max(device_credit_bytes, int(verified_carveout_bytes))
++            except Exception:
++                # Fail closed: retain the original admission safeguard.
++                logger.debug("Windows APU carve-out credit unavailable.", exc_info = True)
++        offload_bytes = model_bytes - device_credit_bytes
+         # Skip card-resident loads so a cgroup budget never applies to a nonpositive need.
+         if 0 < offload_bytes and heap_bytes <= heap_free_mib * 1024 * 1024:
+             # A finite cgroup still limits host-backed GPU allocations.
+diff --git a/studio/backend/tests/test_npu_flm_host.py b/studio/backend/tests/test_npu_flm_host.py
+index 2ca59cafc..8c4cf373c 100644
+--- a/studio/backend/tests/test_npu_flm_host.py
++++ b/studio/backend/tests/test_npu_flm_host.py
+@@ -268,6 +268,43 @@ def test_flm_errors_printed_with_exit_zero_count_as_failures(tmp_path, monkeypat
+     assert [r["id"] for r in flm.catalog()][0] == "qwen3-0.6b-FLM"
+ 
+ 
++@pytest.mark.parametrize(
++    "stdout, stderr",
++    [
++        # flm prints the list with dump(4); a line after it used to read as "Extra data".
++        (json.dumps(CATALOG, indent = 4) + "\n", "[XRT] WARNING: device {0} busy\n"),
++        (json.dumps(CATALOG, indent = 4) + "\n[FLM]  done {ok}\n", ""),
++        ("[FLM]  NPU {dev04}\n" + json.dumps(CATALOG, indent = 4) + "\n", ""),
++    ],
++)
++def test_the_model_list_ignores_text_flm_prints_around_it(tmp_path, monkeypatch, stdout, stderr):
++    npu = tmp_path / "bin" / "flm" / "npu"
++    npu.mkdir(parents = True)
++    (npu / ("flm.exe" if sys.platform == "win32" else "flm")).write_text("")
++    flm = fh.Flm(tmp_path)
++
++    class Done:
++        returncode = 0
++
++    Done.stdout, Done.stderr = stdout, stderr
++    monkeypatch.setattr(fh.subprocess, "run", lambda *a, **k: Done())
++    assert [r["id"] for r in flm.catalog()] == [fh.catalog_row(e)["id"] for e in CATALOG["models"]]
++
++
++def test_a_model_list_without_json_names_flms_output(tmp_path, monkeypatch):
++    npu = tmp_path / "bin" / "flm" / "npu"
++    npu.mkdir(parents = True)
++    (npu / ("flm.exe" if sys.platform == "win32" else "flm")).write_text("")
++    flm = fh.Flm(tmp_path)
++
++    class Done:
++        returncode, stdout, stderr = 0, '{"models": [', "terminate called after throwing\n"
++
++    monkeypatch.setattr(fh.subprocess, "run", lambda *a, **k: Done())
++    with pytest.raises(RuntimeError, match = "flm list failed: .*terminate called"):
++        flm.catalog()
++
++
+ # Direct install and launcher.
+ 
+ 
+diff --git a/studio/backend/tests/test_windows_rocm_apu_host_shortfall.py b/studio/backend/tests/test_windows_rocm_apu_host_shortfall.py
+new file mode 100644
+index 000000000..89ee14e99
+--- /dev/null
++++ b/studio/backend/tests/test_windows_rocm_apu_host_shortfall.py
+@@ -0,0 +1,153 @@
++# SPDX-License-Identifier: AGPL-3.0-only
++"""Windows ROCm APU carve-out credit at the second host-shortfall preflight.
++
++The tests exercise the real LlamaCppBackend method with bounded input probes;
++they do not require a 97 GiB GGUF or mutate any device/driver configuration.
++"""
++
++from __future__ import annotations
++
++import sys
++from pathlib import Path
++from types import SimpleNamespace
++
++import pytest
++
++_TESTS_DIR = str(Path(__file__).resolve().parent)
++if _TESTS_DIR not in sys.path:
++    sys.path.insert(0, _TESTS_DIR)
++
++import core.inference.llama_cpp as llama_cpp_module  # noqa: E402
++from test_llama_cpp_placement import _backend, _restore_host_guard  # noqa: E402
++
++_GiB = 1024**3
++
++
++@pytest.fixture
++def apu_preflight(tmp_path, monkeypatch):
++    """The reporter's GGUF/lazy/device readings with isolated host probes."""
++    backend, gguf = _backend(tmp_path, vulkan = False, memory = [(0, 19_000, 96 * 1024)])
++    _restore_host_guard(backend)
++    monkeypatch.setattr(llama_cpp_module, "sys", SimpleNamespace(platform = "win32"))
++
++    backend._gguf_read_bytes = lambda _path: int(97.12 * _GiB)
++    backend._lazy_read_host_bytes = lambda *a, **kw: int(36.4 * _GiB)
++    backend._lazy_auto_resolves_off = lambda **kw: False
++    backend._shared_heap_budget = lambda *a, **kw: (0, 40 * _GiB)
++    backend._amd_apu_wants_unified_memory = lambda _indices: True
++    backend.probe_server_capabilities = lambda _binary: {}
++    backend._host_offload_warning_opted_out = lambda: False
++    backend._host_offload_shortfall_message = (
++        lambda offload, _avail: "host shortfall" if offload > 18 * _GiB else None
++    )
++    backend._available_system_memory_mib = lambda: 20_000
++    backend._cgroup_available_memory_mib = lambda: None
++    argv = [
++        "llama-server",
++        "-m",
++        str(gguf),
++        "--load-mode",
++        "none",
++        "--lazy-mode",
++        "on-direct",
++        "-ngl",
++        "49",
++        "--fit",
++        "off",
++    ]
++    return backend, argv
++
++
++def test_verified_carveout_prevents_false_shortfall(apu_preflight):
++    """Use complete model bytes in the verifier, preserving original argv."""
++    backend, argv = apu_preflight
++    calls = []
++    backend._windows_rocm_apu_carve_out_credit = lambda size, **kw: (
++        calls.append((size, kw)),
++        61 * _GiB,
++    )[1]
++    before = argv.copy()
++    assert (
++        backend._launch_host_shortfall_message(
++            argv,
++            [(0, 19_000, 96 * 1024)],
++            env = {},
++            avail_mib = 20_000,
++        )
++        is None
++    )
++    assert argv == before
++    assert len(calls) == 1
++    assert calls[0][0] == int(97.12 * _GiB)
++    assert calls[0][1]["gpu_indices"] == [0]
++    assert calls[0][1]["extra_args"] == before
++
++
++def test_carveout_is_max_not_sum(apu_preflight):
++    """A verified 35 GiB pool plus 19,000 MiB reading must not be added."""
++    backend, argv = apu_preflight
++    backend._windows_rocm_apu_carve_out_credit = lambda *a, **kw: 35 * _GiB
++    assert (
++        backend._launch_host_shortfall_message(
++            argv,
++            [(0, 19_000, 96 * 1024)],
++            env = {},
++            avail_mib = 20_000,
++        )
++        == "host shortfall"
++    )
++
++
++@pytest.mark.parametrize(
++    "case",
++    [
++        "linux",
++        "two_gpu",
++        "shared_vulkan",
++        "integrated_cuda",
++        "cpu_child",
++        "not_rocm_apu",
++    ],
++)
++def test_ineligible_launch_never_uses_carveout(apu_preflight, monkeypatch, case):
++    """No carve-out credit when GPU ownership cannot be verified."""
++    backend, argv = apu_preflight
++    probes = []
++    backend._windows_rocm_apu_carve_out_credit = lambda *a, **kw: (probes.append(True), 61 * _GiB)[
++        1
++    ]
++    kwargs = {"env": {}, "avail_mib": 20_000}
++    gpus = [(0, 19_000, 96 * 1024)]
++    if case == "linux":
++        monkeypatch.setattr(llama_cpp_module, "sys", SimpleNamespace(platform = "linux"))
++    elif case == "two_gpu":
++        gpus.append((1, 10_000, 20_000))
++    elif case == "shared_vulkan":
++        kwargs["shared_gpu_ids"] = [0]
++    elif case == "integrated_cuda":
++        kwargs["integrated_gpu_ids"] = [0]
++    elif case == "cpu_child":
++        kwargs["child_has_no_gpu"] = True
++    elif case == "not_rocm_apu":
++        backend._amd_apu_wants_unified_memory = lambda _indices: False
++    assert backend._launch_host_shortfall_message(argv, gpus, **kwargs) == "host shortfall"
++    assert not probes
++
++
++def test_failed_verification_keeps_host_guard(apu_preflight):
++    """Missing counters or registry attribution cannot suppress a warning."""
++    backend, argv = apu_preflight
++
++    def unavailable(*_args, **_kwargs):
++        raise RuntimeError("carve-out telemetry unavailable")
++
++    backend._windows_rocm_apu_carve_out_credit = unavailable
++    assert (
++        backend._launch_host_shortfall_message(
++            argv,
++            [(0, 19_000, 96 * 1024)],
++            env = {},
++            avail_mib = 20_000,
++        )
++        == "host shortfall"
++    )
