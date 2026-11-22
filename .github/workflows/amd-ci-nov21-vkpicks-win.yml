@@ -1,0 +1,110 @@
+name: "AMD CI: sd.cpp Vulkan AMD picks 0070 on gfx1151 (win, nov21)"
+
+on:
+  push:
+    branches: [amd-ci-nov21-vkpicks-win]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+
+  build:
+    name: "build sd.cpp Vulkan base + head (windows-2022)"
+    runs-on: windows-2022
+    timeout-minutes: 150
+    env:
+      VULKAN_VERSION: 1.4.328.1
+      VULKAN_SHA256: a8675df6d538079c2a719a9373994948091db785b48f142e024254e76348d16c
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
+      - name: Install Ninja
+        shell: powershell
+        run: choco install ninja --no-progress
+      - name: Setup MSVC
+        uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756  # v1.13.0
+        with:
+          arch: x64
+      - name: Vulkan SDK
+        shell: powershell
+        run: |
+          $installer = Join-Path $env:RUNNER_TEMP 'VulkanSDK-Installer.exe'
+          $sdkRoot = Join-Path $env:RUNNER_TEMP 'VulkanSDK'
+          curl.exe --fail --location --retry 3 --output $installer "https://sdk.lunarg.com/sdk/download/${env:VULKAN_VERSION}/windows/vulkansdk-windows-X64-${env:VULKAN_VERSION}.exe"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          if ((Get-FileHash -LiteralPath $installer -Algorithm SHA256).Hash -ne $env:VULKAN_SHA256) { throw 'Vulkan SDK SHA256 mismatch' }
+          $p = Start-Process -FilePath $installer -ArgumentList @('--root', "`"$sdkRoot`"", '--accept-licenses', '--default-answer', '--confirm-command', 'install') -Wait -PassThru
+          if ($p.ExitCode -ne 0) { exit $p.ExitCode }
+          Add-Content $env:GITHUB_ENV "VULKAN_SDK=$sdkRoot"
+          Add-Content $env:GITHUB_PATH "$sdkRoot\Bin"
+      - name: Build
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+          $W = Join-Path $env:RUNNER_TEMP 'w'
+          New-Item -ItemType Directory -Force $W | Out-Null
+          git clone -q --filter=blob:none https://github.com/unslothai/stable-diffusion.cpp "$W\src"
+          git -C "$W\src" checkout -q 27b9ddc
+          git -C "$W\src" submodule update --init --depth 1 ggml
+          foreach ($arm in @('base', 'head')) {
+            Copy-Item -Recurse "$W\src" "$W\$arm"
+            foreach ($p in (Get-ChildItem "$W\$arm\scripts\unsloth\ggml-patches\*.patch" | Sort-Object Name)) {
+              git -C "$W\$arm\ggml" apply $p.FullName
+              if ($LASTEXITCODE -ne 0) { throw "patch $($p.Name)" }
+            }
+            if ($arm -eq 'head') {
+              git -C "$W\$arm\ggml" apply "$env:GITHUB_WORKSPACE\amd_ci\vkpicks\0070-ggml-vulkan-amd-large-tile-split-k.patch"
+              if ($LASTEXITCODE -ne 0) { throw "patch 0070" }
+            }
+            cmake -S "$W\$arm" -B "$W\b_$arm" -G Ninja -DCMAKE_BUILD_TYPE=Release "-DCMAKE_CXX_FLAGS=/bigobj" -DSD_VULKAN=ON -DGGML_NATIVE=OFF -DGGML_BUILD_TESTS=ON -DSD_WEBP=OFF -DSD_WEBM=OFF -DSD_SERVER_BUILD_FRONTEND=OFF
+            if ($LASTEXITCODE -ne 0) { throw "cmake $arm" }
+            cmake --build "$W\b_$arm" -j 4 --target sd-cli test-backend-ops
+            if ($LASTEXITCODE -ne 0) { throw "build $arm" }
+            New-Item -ItemType Directory -Force "dist\$arm" | Out-Null
+            Copy-Item "$W\b_$arm\bin\*.exe" "dist\$arm\"
+            Get-ChildItem "$W\b_$arm\bin\*.dll" -ErrorAction SilentlyContinue | Copy-Item -Destination "dist\$arm\"
+          }
+          Get-ChildItem -Recurse dist | Select-Object FullName, Length
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
+        with:
+          name: vkpicks-bin-windows
+          path: dist
+          retention-days: 3
+
+  gfx1151:
+    name: "gfx1151 Windows proprietary: sd.cpp 0070 base vs head"
+    needs: build
+    runs-on: [self-hosted, Windows, strix-halo, devlab-dispatch]
+    timeout-minutes: 240
+    defaults:
+      run:
+        shell: powershell
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4.3.0
+        with:
+          name: vkpicks-bin-windows
+          path: ${{ runner.temp }}\bin
+      - name: Probe
+        run: |
+          $ErrorActionPreference = "Continue"
+          Write-Output "RUNNER_OS=[$env:RUNNER_OS] runner=[$env:RUNNER_NAME]"
+          $OUT = Join-Path $env:RUNNER_TEMP 'out'
+          New-Item -ItemType Directory -Force $OUT | Out-Null
+          $SYS = "C:\Program Files\Python312\python.exe"
+          $V = Join-Path $env:RUNNER_TEMP 'v'
+          & $SYS -m venv $V
+          & "$V\Scripts\python.exe" -m pip install -q pillow numpy
+          $PY = "$V\Scripts\python.exe"
+          if (-not (Test-Path $PY)) { $PY = $SYS }
+          & $PY amd_ci\vkpicks\vk_picks_e2e.py --base "$env:RUNNER_TEMP\bin\base" --head "$env:RUNNER_TEMP\bin\head" --models "$env:RUNNER_TEMP\models" --out $OUT --reps 2
+          Write-Output "probe rc=$LASTEXITCODE"
+          Remove-Item -Recurse -Force (Join-Path $env:RUNNER_TEMP 'models') -ErrorAction SilentlyContinue
+          exit 0
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
+        if: always()
+        with:
+          name: vkpicks-out-windows
+          path: ${{ runner.temp }}\out
+          retention-days: 7
