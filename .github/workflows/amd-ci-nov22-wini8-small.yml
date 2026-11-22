@@ -187,6 +187,16 @@ jobs:
             ForEach-Object { Write-Output "stopping $($_.ProcessId) $($_.Name)"; Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
           exit 0
 
+      - name: Copy cell logs and records into out
+        if: always()
+        run: |
+          $ErrorActionPreference = "Continue"
+          $src = Join-Path $env:AMD_CI_WORK "dbench"
+          if (Test-Path -LiteralPath $src) { Get-ChildItem -LiteralPath $src -Recurse -Include *.log,record.json,scores.json,scores.md -File |
+            ForEach-Object { $rel = $_.FullName.Substring($src.Length).TrimStart([char]92); $dst = Join-Path "$env:AMD_CI_WORK\out\dbench" $rel
+              New-Item -ItemType Directory -Force -Path (Split-Path $dst) | Out-Null; Copy-Item -LiteralPath $_.FullName -Destination $dst } }
+          exit 0
+
       - uses: actions/upload-artifact@v4
         if: always()
         with:
