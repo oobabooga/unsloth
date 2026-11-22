@@ -2,7 +2,7 @@ name: "AMD CI: sd.cpp Vulkan AMD picks 0070 on gfx1151 (win, nov21)"
 
 on:
   push:
-    branches: [amd-ci-nov21-vkpicks-win]
+    branches: [amd-ci-nov21-vkpicks2-win]
   workflow_dispatch:
 
 permissions:
