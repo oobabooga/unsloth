@@ -30,7 +30,7 @@ name: "AMD CI (Windows): validate PR 18760"
 
 on:
   push:
-    branches: [amd-ci-nov21-trainlev-win]
+    branches: [amd-ci-nov21-trainlev2-win]
   workflow_dispatch:
 
 permissions:
@@ -44,7 +44,7 @@ env:
   # Set by scaffold.py --patch: base = PATCH_BASE, head = PATCH_BASE plus this diff (relative to the checkout).
   PATCH_BASE: "ee62cb7857ded11ecfe68a11f123a03f803ff55e"
   PATCH_FILE: "amd_ci/patches/train_levers.diff"
-  PATCH_SHA256: "ac2ee760e510fffa33142eed8ef69dd86264a780422c39c99c83b347ac059c04"
+  PATCH_SHA256: "b7344a26dd407a6bc1ed330492af485e0db660a878e74fcb0f624546743cfbaa"
 
 jobs:
 
