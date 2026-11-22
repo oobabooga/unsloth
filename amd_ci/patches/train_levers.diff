@@ -1,7 +1,16 @@
 diff --git a/studio/backend/core/training/diffusion_dit_trainer.py b/studio/backend/core/training/diffusion_dit_trainer.py
-index bf1a2fca32..cbf84e9dcf 100644
+index bf1a2fca32..777841e2f7 100644
 --- a/studio/backend/core/training/diffusion_dit_trainer.py
 +++ b/studio/backend/core/training/diffusion_dit_trainer.py
+@@ -4523,7 +4523,7 @@ def _dequant_cache_wanted(
+     fp16_amp,
+     int8_base = False,
+ ) -> bool:
+-    """nf4 / int8 dequant cache on CUDA; off on the fp16 path, whose 16 GB cards it shares with the checkpointing budget
++    """nf4 / int8 dequant cache on CUDA and ROCm; off on the fp16 path, whose 16 GB cards it shares with the checkpointing budget
+     (on a T4 both planned from step 1's free memory and step 2 OOMed). int8 runs eager, so the cache is its only
+     relief from torchao's per-call weight cast."""
+     from core.training.diffusion_lora_fast import dequant_cache_enabled, int8_dequant_cache_enabled
 @@ -4531,7 +4531,6 @@ def _dequant_cache_wanted(
          (base_is_bnb or (int8_base and int8_dequant_cache_enabled()))
          and device == "cuda"
@@ -11,10 +20,54 @@ index bf1a2fca32..cbf84e9dcf 100644
      )
  
 diff --git a/studio/backend/core/training/diffusion_gc_budget.py b/studio/backend/core/training/diffusion_gc_budget.py
-index 0338a9065d..c4af191057 100644
+index 0338a9065d..6658678215 100644
 --- a/studio/backend/core/training/diffusion_gc_budget.py
 +++ b/studio/backend/core/training/diffusion_gc_budget.py
-@@ -606,7 +606,7 @@ def is_out_of_memory(exc: BaseException) -> bool:
+@@ -9,7 +9,7 @@ card idle. Step 1 measures the first block of each class; afterwards free memory
+ recompute (same kernels, same inputs, so loss and gradients are unchanged). An out-of-memory error halves the kept set
+ (every block checkpointed once nothing is left) and reruns the step from the same inputs.
+ 
+-``UNSLOTH_DIFFUSION_GC_MODE``: unset or ``auto`` uses this plan on CUDA (not ROCm); ``plain`` checkpoints every block
++``UNSLOTH_DIFFUSION_GC_MODE``: unset or ``auto`` uses this plan on CUDA and ROCm; ``plain`` checkpoints every block
+ and ``partial`` every Nth, as before.
+ 
+ The blocks that stay checkpointed keep their long attention outputs (a selective checkpoint policy), so the backward
+@@ -39,6 +39,16 @@ def gc_budget_mode() -> str:
+     return raw if raw in ("plain", "partial") else "auto"
+ 
+ 
++def _mem_get_info() -> tuple[int, int]:
++    """(free, total) for budgets: Studio's trusted reading (Windows ROCm's WDDM free over-report capped), else torch."""
++    try:
++        from utils.hardware import trusted_mem_get_info
++    except ImportError:  # the trainer outside Studio's backend
++        import torch
++        return torch.cuda.mem_get_info()
++    return trusted_mem_get_info()
++
++
+ def _is_rocm() -> bool:
+     try:
+         import torch
+@@ -313,7 +323,7 @@ class BudgetedCheckpoint:
+             return 0
+         try:
+             import torch
+-            free, _total = torch.cuda.mem_get_info()
++            free, _total = _mem_get_info()
+             avail = int(free) + int(torch.cuda.memory_reserved())
+         except Exception:  # noqa: BLE001 -- unknown: cache nothing
+             return 0
+@@ -469,7 +479,7 @@ def plan_from_device(
+         # The optimizer's first step allocates its moments, which every later step carries.
+         projected = int(fb_peak) + max(0, torch.cuda.memory_allocated() - int(alloc_before_step))
+         projected += max(0, int(held_bytes))
+-        free, total = torch.cuda.mem_get_info()
++        free, total = _mem_get_info()
+         kept = budget.plan(
+             projected, free, torch.cuda.memory_reserved(), total, max_canvas_area = max_canvas_area
+         )
+@@ -606,7 +616,7 @@ def is_out_of_memory(exc: BaseException) -> bool:
  def enable_budgeted_checkpointing(model: Any, device: str) -> Optional[BudgetedCheckpoint]:
      """Install the budgeted checkpoint on a diffusers model; None when the mode, device or model does not allow it
      (the caller then checkpoints every block as before)."""
@@ -23,3 +76,42 @@ index 0338a9065d..c4af191057 100644
          return None
      enable = getattr(model, "enable_gradient_checkpointing", None)
      if not callable(enable):
+diff --git a/studio/backend/core/training/diffusion_lora_fast.py b/studio/backend/core/training/diffusion_lora_fast.py
+index 7f1fd5e580..b8cd20a4be 100644
+--- a/studio/backend/core/training/diffusion_lora_fast.py
++++ b/studio/backend/core/training/diffusion_lora_fast.py
+@@ -18,6 +18,16 @@ from typing import Optional
+ 
+ import torch
+ 
++
++def _mem_get_info() -> tuple[int, int]:
++    """(free, total) for the cache budget: Studio's trusted reading (Windows ROCm's WDDM free capped), else torch."""
++    try:
++        from utils.hardware import trusted_mem_get_info
++    except ImportError:  # the trainer outside Studio's backend
++        return torch.cuda.mem_get_info()
++    return trusted_mem_get_info()
++
++
+ GIB = 1 << 30
+ _MARGIN_MIN_BYTES = 2 * GIB
+ _MARGIN_FRAC = 0.10
+@@ -375,7 +385,7 @@ def plan_dequant_cache(
+         except ValueError:
+             pass
+     try:
+-        free, total = torch.cuda.mem_get_info()
++        free, total = _mem_get_info()
+         allocated = torch.cuda.memory_allocated()
+         reserved = torch.cuda.memory_reserved()
+     except Exception:  # noqa: BLE001 -- no probe: only a pinned budget caches
+@@ -395,7 +405,7 @@ def plan_dequant_cache(
+ def rebalance_dequant_cache(cache) -> int:
+     """Evict if another process took memory since the plan, regrow when it returns. Returns bytes evicted."""
+     try:
+-        free, _total = torch.cuda.mem_get_info()
++        free, _total = _mem_get_info()
+         allocated = torch.cuda.memory_allocated()
+         reserved = torch.cuda.memory_reserved()
+     except Exception:  # noqa: BLE001 -- no probe: leave the cache as it is
