@@ -1,0 +1,120 @@
+name: "AMD CI: LTX-2.3 VAE Conv3d per-tap decode on gfx1151 Windows"
+
+on:
+  push:
+    branches: [amd-ci-nov22c-vae-win]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  BASE_SHA: "12cd6693a3413ae2bde214299a5d651760980048"
+  UPSTREAM: "https://github.com/unslothai/unsloth"
+
+jobs:
+
+  windows:
+    name: "LTX-2.3 VAE decode probe (gfx1151 Windows, non-Docker)"
+    runs-on: [self-hosted, Windows, strix-halo, devlab-dispatch]
+    timeout-minutes: 600
+    concurrency:
+      group: amd-ci-gfx1151-gpu-win-nov22c-vae
+      cancel-in-progress: false
+    defaults:
+      run:
+        shell: powershell
+    steps:
+      - uses: actions/checkout@v4
+        with: { persist-credentials: false }
+
+      - name: Preamble
+        run: |
+          .\amd_ci\lib\preamble.ps1 -Name "nov22c-vae-windows"
+
+      - name: Locate the system Python
+        run: |
+          $ErrorActionPreference = "Continue"
+          $found = $null
+          foreach ($c in @("C:\Program Files\Python312\python.exe",
+                           "C:\Program Files\Python311\python.exe",
+                           "C:\Program Files\Python310\python.exe")) {
+            if (Test-Path -LiteralPath $c) { $found = $c; break }
+          }
+          if ($null -eq $found) {
+            Write-Host "FATAL: no system Python found at any known location."
+            exit 1
+          }
+          & $found --version
+          Add-Content -Path $env:GITHUB_ENV -Value "AMD_CI_PY=$found"
+
+      - name: Host gate
+        run: |
+          $ErrorActionPreference = "Continue"
+          & $env:AMD_CI_PY "$env:GITHUB_WORKSPACE\amd_ci\lib\gate.py" --no-torch `
+            --require windows --out "$env:AMD_CI_WORK\out\host.json"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Studio at BASE_SHA (install.ps1 --local)
+        timeout-minutes: 150
+        run: |
+          $ErrorActionPreference = "Continue"
+          $repo = "$env:AMD_CI_WORK\repo"
+          & git clone -q --filter=blob:none -c core.autocrlf=false "$env:UPSTREAM" $repo
+          & git -C $repo checkout -q --detach "$env:BASE_SHA"
+          if ($LASTEXITCODE -ne 0) { Write-Host "FATAL: checkout failed"; exit 1 }
+          Add-Content -Path $env:GITHUB_ENV -Value "AMD_CI_REPO=$repo"
+          $env:UNSLOTH_STUDIO_HOME = "$env:AMD_CI_WORK\studio"
+          Add-Content -Path $env:GITHUB_ENV -Value "UNSLOTH_STUDIO_HOME=$env:UNSLOTH_STUDIO_HOME"
+          Push-Location $repo
+          & powershell -NoProfile -ExecutionPolicy Bypass -File ".\install.ps1" --local --skip-autostart --no-rollback *>&1 |
+            Tee-Object -FilePath "$env:AMD_CI_WORK\out\studio_install.log" | Select-Object -Last 40 | Out-String | Write-Host
+          $irc = $LASTEXITCODE
+          Pop-Location
+          Write-Host "install.ps1 exit $irc"
+          $py = "$env:UNSLOTH_STUDIO_HOME\unsloth_studio\Scripts\python.exe"
+          if (-not (Test-Path -LiteralPath $py)) {
+            Write-Host "FATAL: no Studio venv at $py (installer exit $irc)"
+            exit 1
+          }
+          & $py -c "import torch, diffusers; print('torch', torch.__version__, 'hip', torch.version.hip, 'diffusers', diffusers.__version__)"
+          Add-Content -Path $env:GITHUB_ENV -Value "AMD_CI_PY=$py"
+          & $py "$env:GITHUB_WORKSPACE\amd_ci\lib\gate.py" --require windows rocm gpu --expect-arch gfx1151 `
+            --out "$env:AMD_CI_WORK\out\host_rocm.json"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: LTX-2.3 VAE probe (Studio route vs per-tap Conv2d, 256/512 tile replay)
+        timeout-minutes: 400
+        run: |
+          $ErrorActionPreference = "Continue"
+          New-Item -ItemType Directory -Force -Path "$env:AMD_CI_WORK\out\vae" | Out-Null
+          $env:HF_HOME = "$env:AMD_CI_WORK\hf_home"
+          $env:HF_HUB_DISABLE_TELEMETRY = "1"
+          Remove-Item Env:HF_TOKEN -ErrorAction SilentlyContinue
+          & $env:AMD_CI_PY "$env:GITHUB_WORKSPACE\amd_ci\probes\amd_vae_probe.py" --suite windows --checkout $env:AMD_CI_REPO `
+            --out "$env:AMD_CI_WORK\out\vae\obs.json" --work "$env:AMD_CI_WORK\vae_work" *>&1 |
+            Out-File -Encoding utf8 "$env:AMD_CI_WORK\out\vae\probe.log"
+          Write-Host "probe exit $LASTEXITCODE"
+          Get-Content "$env:AMD_CI_WORK\out\vae\probe.log" -Tail 40 | Write-Host
+          Copy-Item "$env:AMD_CI_WORK\vae_work\*.json" "$env:AMD_CI_WORK\out\vae\" -ErrorAction SilentlyContinue
+          Copy-Item "$env:AMD_CI_WORK\vae_work\*.log" "$env:AMD_CI_WORK\out\vae\" -ErrorAction SilentlyContinue
+          exit 0
+
+      - name: Stop anything this job started (arms that never exited)
+        if: always()
+        run: |
+          $ErrorActionPreference = "Continue"
+          $w = $env:AMD_CI_WORK
+          if (-not $w -or $w.Length -lt 8 -or -not (Test-Path -LiteralPath $w)) { Write-Output "no AMD_CI_WORK root: nothing to stop"; exit 0 }
+          $w = (Resolve-Path -LiteralPath $w).Path.TrimEnd('\')
+          Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -and $_.CommandLine.Contains($w + '\') -and $_.ProcessId -ne $PID } |
+            ForEach-Object { Write-Output "stopping $($_.ProcessId) $($_.Name)"; Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+          exit 0
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: nov22c-vae-windows
+          path: ${{ env.AMD_CI_WORK }}/out
+          retention-days: 7
+          if-no-files-found: warn
