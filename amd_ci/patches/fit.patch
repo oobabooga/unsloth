@@ -1,0 +1,615 @@
+diff --git a/studio/backend/core/inference/video.py b/studio/backend/core/inference/video.py
+index 1430d0fe9a..42df9d2038 100644
+--- a/studio/backend/core/inference/video.py
++++ b/studio/backend/core/inference/video.py
+@@ -4222,6 +4222,65 @@ def _video_rocm_hosted_spec(
+         return None
+ 
+ 
++# "0" restores the previous hosted int8 handling: the torchao-gated source check and the dense bf16 DiT price.
++VIDEO_HOSTED_INT8_FIT_ENV = "UNSLOTH_VIDEO_HOSTED_INT8_FIT"
++
++
++def _video_hosted_int8_fit_enabled() -> bool:
++    raw = (os.environ.get(VIDEO_HOSTED_INT8_FIT_ENV) or "").strip().lower()
++    return raw not in ("0", "off", "false", "no")
++
++
++def _safetensors_name(name: Any) -> bool:
++    return str(name or "").lower().endswith(".safetensors")
++
++
++def _video_native_hosted_reads_without_torchao(fam: Any, transformer_quant: Optional[str]) -> bool:
++    """Whether the native read of ``fam``'s hosted int8 file needs no torchao: a ConvRot safetensors file read with
++    safetensors into native Linears (``load_native_from_hosted``), not a torchao pickle. Never raises."""
++    try:
++        if not _video_hosted_int8_fit_enabled():
++            return False
++        if normalize_transformer_quant(transformer_quant) != TQ_INT8:
++            return False
++        from .diffusion_native_hosted import native_hosted_family, native_hosted_pickle
++
++        if not native_hosted_family(fam) or native_hosted_pickle(fam):
++            return False
++        from safetensors import safe_open  # noqa: F401
++
++        return True
++    except Exception:  # noqa: BLE001 - unanswerable keeps the torchao-gated check
++        return False
++
++
++def _video_hosted_read_dit_gb(
++    fam: Any,
++    *,
++    target: Any,
++    transformer_quant: Optional[str],
++    kind: str,
++    native_hosted_planned: Optional[str],
++    source_dir: Optional[str],
++) -> Optional[float]:
++    """The hosted int8 file size (decimal GB) when an explicit int8 ROCm load reads it as the native W8A8 DiT instead
++    of the dense shards (staged in their place), else None. No runtime quant pass follows that read, so it peaks at
++    the file size, not at the dense bf16 DiT. Never raises."""
++    try:
++        if not _video_hosted_int8_fit_enabled() or native_hosted_planned != TQ_INT8:
++            return None
++        if kind != "pipeline" or getattr(fam, "modular_workflow", None):
++            return None
++        if _video_rocm_hosted_scheme(fam, transformer_quant, target) != TQ_INT8:
++            return None
++        if stored_denoiser_precision(source_dir) is not None:
++            return None
++        gb = video_family_prequant_resident_gb(fam, TQ_INT8)
++        return float(gb) if gb else None
++    except Exception:  # noqa: BLE001 - unanswerable: priced at the dense bf16 DiT
++        return None
++
++
+ def _video_native_cache_spec(
+     fam: Any,
+     *,
+@@ -6775,6 +6834,7 @@ class VideoBackend:
+                     kwargs.get("hf_token"),
+                     local_files_only = local_files_only,
+                     kind = kind,
++                    native_hosted = True,
+                 )
+             ):
+                 skip_transformer_weights = True
+@@ -8043,35 +8103,59 @@ class VideoBackend:
+         hf_token: Optional[str],
+         local_files_only: bool = False,
+         kind: str = "pipeline",
++        native_hosted: bool = False,
+     ) -> bool:
+         """``_denoiser_prequant_covered`` plus the Hub check, for the decisions that COMMIT.
+ 
+         The pure probe answers from the registry, which is right where it must not raise or touch
+         the network, but a renamed / gated task artifact still reads covered there. Unanswerable
+-        keeps the dense shards; ``local_files_only`` answers from the cache."""
++        keeps the dense shards; ``local_files_only`` answers from the cache. ``native_hosted``: the
++        file is read as native Linears (``load_native_from_hosted``), so a safetensors file needs no torchao."""
+         if not self._denoiser_prequant_covered(
+             fam, transformer_quant, base, h3_task, kind = kind, hf_token = hf_token
+         ):
+             return False
+         from .diffusion_prequant import restricted_prequant_load_supported
+ 
++        readable = None
+         if not restricted_prequant_load_supported(transformer_quant):
+-            # This decision commits (drops 66 GB) and also runs for explicit requests.
++            if not (
++                native_hosted and _video_native_hosted_reads_without_torchao(fam, transformer_quant)
++            ):
++                # This decision commits (drops 66 GB) and also runs for explicit requests.
++                logger.info(
++                    "video.denoiser_prequant: this install cannot deserialize a pre-quantized "
++                    "checkpoint, so the %s request keeps its dense denoiser shards",
++                    transformer_quant,
++                )
++                return False
++            # No usable torchao (the Windows ROCm stub): only the safetensors file the native read opens counts.
++            readable = _safetensors_name
+             logger.info(
+-                "video.denoiser_prequant: this install cannot deserialize a pre-quantized "
+-                "checkpoint, so the %s request keeps its dense denoiser shards",
++                "video.denoiser_prequant: this install cannot deserialize a torchao checkpoint, but the hosted "
++                "%s safetensors file is read as native Linears without torchao",
+                 transformer_quant,
+             )
+-            return False
+         if local_files_only:
+             repo = self._denoiser_prequant_cached_repo(
+-                fam, transformer_quant, base, h3_task, online = False, hf_token = hf_token
++                fam,
++                transformer_quant,
++                base,
++                h3_task,
++                online = False,
++                hf_token = hf_token,
++                readable = readable,
+             )
+         else:
+             try:
+                 from huggingface_hub import HfApi
+                 repo, _files = self._denoiser_prequant_hub_files(
+-                    fam, transformer_quant, base, HfApi(token = hf_token), h3_task
++                    fam,
++                    transformer_quant,
++                    base,
++                    HfApi(token = hf_token),
++                    h3_task,
++                    readable = readable,
+                 )
+             except Exception:  # noqa: BLE001 -- an unanswerable probe keeps the dense shards
+                 return False
+@@ -8578,10 +8662,12 @@ class VideoBackend:
+         base: Optional[str],
+         api: Any,
+         h3_task: Optional[str] = None,
++        readable: Optional[Callable[[str], bool]] = None,
+     ) -> tuple[Optional[str], list[tuple[str, int]]]:
+         """``(repo_id, [(rfilename, size)])`` for every hosted denoiser artifact, or ``(None, [])``, so preflight
+         counts the checkpoint that replaces the dropped dense shards. The header probe asks with ``api``'s own
+-        token, so a gated artifact is judged by the same credentials that would stage it."""
++        token, so a gated artifact is judged by the same credentials that would stage it. ``readable`` replaces the
++        torchao readability filter (strictly: none readable is no artifact)."""
+         api = hub_reachability.always_asked(
+             api
+         )  # picks the denoiser source: bounded, never skipped
+@@ -8619,6 +8705,10 @@ class VideoBackend:
+         files: list[tuple[str, int]] = []
+         for src in sources:
+             names = list(candidate_filenames_of(src))
++            if readable is not None:
++                names = [n for n in names if readable(n)]
++                if not names:
++                    return None, []
+             # the resolver's filter: readable names, unless that leaves none
+             names = [
+                 n for n in names if restricted_prequant_load_supported(transformer_quant, n)
+@@ -8626,7 +8716,8 @@ class VideoBackend:
+             wanted = prefer_cached_pickle_twins(
+                 src.location,
+                 names,
+-                readable = lambda n: restricted_prequant_load_supported(transformer_quant, n),
++                readable = readable
++                or (lambda n: restricted_prequant_load_supported(transformer_quant, n)),
+                 cache_dir = hub_cache_dir(),
+             )
+             found = next((n for n in wanted if n in by_name), None)
+@@ -8643,10 +8734,12 @@ class VideoBackend:
+         h3_task: Optional[str] = None,
+         online: Optional[bool] = None,
+         hf_token: Optional[str] = None,
++        readable: Optional[Callable[[str], bool]] = None,
+     ) -> Optional[str]:
+         """The hosted pre-quantized denoiser repo when its checkpoint is ALREADY cached, else None.
+ 
+-        Offline twin of ``_denoiser_prequant_hub_files``; online semantics per ``first_cached_as_resolved``."""
++        Offline twin of ``_denoiser_prequant_hub_files``; online semantics per ``first_cached_as_resolved``.
++        ``readable`` replaces the torchao readability filter."""
+         sources = VideoBackend._denoiser_prequant_source_list(
+             fam, transformer_quant, base, h3_task, hf_token = hf_token
+         )
+@@ -8663,16 +8756,13 @@ class VideoBackend:
+         )
+ 
+         cached: list[str] = []
++        can_open = readable or (lambda n: restricted_prequant_load_supported(transformer_quant, n))
+         for src in sources:
+             # only names the loader can open: a cached unreadable file must not drop the dense shards
+             ordered = prefer_cached_pickle_twins(
+                 src.location,
+-                [
+-                    n
+-                    for n in candidate_filenames_of(src)
+-                    if restricted_prequant_load_supported(transformer_quant, n)
+-                ],
+-                readable = lambda n: restricted_prequant_load_supported(transformer_quant, n),
++                [n for n in candidate_filenames_of(src) if can_open(n)],
++                readable = can_open,
+                 cache_dir = hub_cache_dir(),
+                 log = False,
+             )
+@@ -10366,6 +10456,9 @@ class VideoBackend:
+             if denoiser_gb is None:
+                 # a ModelOpt FP8 DiT is built as priced (no runtime quant follows)
+                 denoiser_gb = modelopt_dit_gb
++            if denoiser_gb is None:
++                # so is the hosted int8 DiT read as native W8A8 Linears (None unless that read is planned)
++                denoiser_gb = hosted_read_dit_gb
+             text_encoder_gb = components[1] * scale if components is not None else 0.0
+             # vae_force_fp32 VAE is already counted at fp32; scaling it double-counts (2.8 GB on Wan TI2V-5B).
+             vae_gb = components[2] if components is not None else 0.0
+@@ -10538,6 +10631,43 @@ class VideoBackend:
+             )
+             if not denoiser_seed_sources:
+                 denoiser_seed_scheme = None
++        # The staged hosted int8 file replaces the dense shards: price that file, not the dense bf16 DiT.
++        hosted_read_dit_gb: Optional[float] = (
++            _video_hosted_read_dit_gb(
++                fam,
++                target = target,
++                transformer_quant = transformer_quant,
++                kind = kind,
++                native_hosted_planned = _video_native_hosted_planned,
++                source_dir = _base_local_dir or repo_id,
++            )
++            if denoiser_seed_scheme is None
++            and modelopt_scan is None
++            and not baked_loras
++            and components is not None
++            else None
++        )
++        if hosted_read_dit_gb is not None:
++            logger.info(
++                "video.native_hosted: pricing the %s DiT at the hosted int8 file (%.2f GB) instead of the dense "
++                "bf16 shards (%.2f GB): it is read as native W8A8 Linears, with no runtime quantise",
++                getattr(fam, "name", None),
++                hosted_read_dit_gb,
++                components[0] * dtype_scale,
++            )
++
++        def _reprice_dense_after_hosted_miss(why: str) -> None:
++            """Back to the dense bf16 price, and the unified-memory guard on it, before any dense shard loads."""
++            nonlocal hosted_read_dit_gb, plan, bf16_plan, quant_replanned
++            logger.warning(
++                "video.native_hosted: %s; re-planning memory at the dense bf16 DiT size", why
++            )
++            hosted_read_dit_gb = None
++            plan, bf16_plan, quant_replanned = _plan_for_te_scale(settled_te_scale, log = False)
++            raise_on_unified_memory_shortfall(
++                plan, family = getattr(fam, "name", None), logger = logger
++            )
++
+         denoiser_seed_gb: Optional[float] = None
+         if denoiser_seed_scheme is not None and components is not None:
+             measured = video_family_prequant_resident_gb(fam, denoiser_seed_scheme)
+@@ -10915,6 +11045,9 @@ class VideoBackend:
+                 cancel_check = lambda: self._raise_if_video_load_superseded(_load_token),
+             )
+             self._raise_if_video_load_superseded(_load_token)
++        if hosted_read_dit_gb is not None and not native_cache_hits:
++            # Priced at the hosted int8 file, but the dense shards load and quantise at runtime: price those.
++            _reprice_dense_after_hosted_miss("the hosted int8 DiT was not read")
+         pipe_kwargs.update(native_cache_hits)
+         # Injection is best-effort (a missing checkpoint falls back to the dense encoder), but the scoped pre-download
+         # already dropped those shards and from_pretrained cannot re-fetch from a local snapshot dir, so top them up
+@@ -11416,6 +11549,10 @@ class VideoBackend:
+                 "video.transformer_quant: the cached native denoiser(s) do not match this load's "
+                 "build; loading the dense denoiser shards instead"
+             )
++            if hosted_read_dit_gb is not None:
++                _reprice_dense_after_hosted_miss(
++                    "the hosted int8 DiT does not match this load's build"
++                )
+             dense_cls = getattr(diffusers, fam.transformer_class)
+             for component in native_cache_hits:
+                 pipe.register_modules(
+diff --git a/studio/backend/tests/test_video_hosted_int8_fit.py b/studio/backend/tests/test_video_hosted_int8_fit.py
+new file mode 100644
+index 0000000000..535bd00e8f
+--- /dev/null
++++ b/studio/backend/tests/test_video_hosted_int8_fit.py
+@@ -0,0 +1,320 @@
++# SPDX-License-Identifier: AGPL-3.0-only
++# Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
++
++"""An explicit int8 LTX-2.5 load on ROCm RDNA that reads the hosted INT8 ConvRot DiT as native W8A8 Linears:
++
++* the source check that commits the hosted file in place of the dense shards does not need torchao (the Windows ROCm
++  torchao stub cannot deserialize a torchao checkpoint, but this read never uses torchao);
++* the memory plan, and so the unified-memory guard, prices that file instead of the dense bf16 DiT.
++
++Dense loads, AUTO, CUDA, pickle families and the kill switch keep the previous answers."""
++
++from __future__ import annotations
++
++import inspect
++import sys
++import types
++from pathlib import Path
++
++import pytest
++
++torch = pytest.importorskip("torch")
++pytest.importorskip("diffusers")
++
++BACKEND = Path(__file__).resolve().parents[1]
++if str(BACKEND) not in sys.path:
++    sys.path.insert(0, str(BACKEND))
++
++from core.inference import diffusion_native_hosted as NH  # noqa: E402
++from core.inference import diffusion_prequant as PQ  # noqa: E402
++from core.inference import diffusion_transformer_quant as tq  # noqa: E402
++from core.inference import video as V  # noqa: E402
++from core.inference.diffusion_device import DiffusionDeviceTarget  # noqa: E402
++from core.inference.diffusion_memory import (  # noqa: E402
++    DeviceMemory,
++    plan_diffusion_memory,
++    unified_memory_shortfall_message,
++)
++from core.inference.video_families import detect_video_family  # noqa: E402
++
++LTX = ("Lightricks/LTX-2.5-Diffusers", "ltx-2.5")
++WAN = ("Wan-AI/Wan2.2-T2V-A14B-Diffusers", "wan2.2-t2v-a14b")
++CONVROT = "LTX-2.5-INT8-ConvRot.safetensors"
++GPU_BF16 = types.SimpleNamespace(device = "cuda", dtype = torch.bfloat16, ordinal = 0)
++ENVS = (
++    V.VIDEO_HOSTED_INT8_FIT_ENV,
++    tq.ROCM_VIDEO_HOSTED_INT8_ENV,
++    NH.NATIVE_HOSTED_ENV,
++    "UNSLOTH_NATIVE_INT8_ACT",
++    "UNSLOTH_NATIVE_INT8_ROT",
++)
++
++
++def _fam(pair = LTX):
++    fam = detect_video_family(pair[0], override = pair[1])
++    assert fam is not None
++    return fam
++
++
++@pytest.fixture(autouse = True)
++def _clean_env(monkeypatch):
++    for env in ENVS:
++        monkeypatch.delenv(env, raising = False)
++
++
++def _host(monkeypatch, *, rocm: bool):
++    monkeypatch.setattr(tq, "torch_is_rocm", lambda: rocm)
++    monkeypatch.setattr(tq, "is_stubbed", lambda name: False)
++    monkeypatch.setattr(tq, "rocm_rdna_w8a8_ready", lambda ordinal = None: True)
++    monkeypatch.setattr(tq, "_rdna_compile_tier_proven", lambda target: True)
++
++
++# ---------------------------------------------------------------------------------------------------------------------
++# Source check: the native hosted read needs no torchao.
++
++
++@pytest.mark.parametrize(
++    "pair, scheme, expect",
++    [
++        (LTX, "int8", True),
++        (LTX, "fp8", False),
++        (LTX, "auto", False),
++        (LTX, None, False),
++        (WAN, "int8", False),
++    ],
++)
++def test_native_hosted_read_needs_no_torchao_only_for_convrot_safetensors(pair, scheme, expect):
++    # Wan A14B's hosted int8 file is a torchao pickle: reading it needs a real torchao.
++    assert V._video_native_hosted_reads_without_torchao(_fam(pair), scheme) is expect
++
++
++@pytest.mark.parametrize(
++    "env, value", [(V.VIDEO_HOSTED_INT8_FIT_ENV, "0"), (NH.NATIVE_HOSTED_ENV, "0")]
++)
++def test_native_hosted_torchao_free_kill_switches(monkeypatch, env, value):
++    monkeypatch.setenv(env, value)
++    assert V._video_native_hosted_reads_without_torchao(_fam(), "int8") is False
++
++
++class _Sibling:
++    def __init__(self, name, size):
++        self.rfilename = name
++        self.size = size
++
++
++class _Api:
++    token = None
++
++    def __init__(self, names):
++        self._names = names
++
++    def model_info(
++        self,
++        repo,
++        files_metadata = True,
++    ):
++        return types.SimpleNamespace(siblings = [_Sibling(n, 25_110_000_000) for n in self._names])
++
++
++def _verified(
++    monkeypatch,
++    *,
++    native_hosted,
++    torchao,
++    hub_names = (CONVROT,),
++    local = False,
++):
++    """``_denoiser_prequant_verified`` for LTX-2.5 int8 with torchao readable or not (the Windows ROCm stub)."""
++    seen = {}
++    monkeypatch.setattr(
++        V.VideoBackend, "_denoiser_prequant_covered", staticmethod(lambda *a, **k: True)
++    )
++    monkeypatch.setattr(
++        PQ, "restricted_prequant_load_supported", lambda scheme = None, filename = None: torchao
++    )
++    real_hub = V.VideoBackend._denoiser_prequant_hub_files
++
++    def _hub(
++        fam,
++        quant,
++        base,
++        api,
++        h3_task = None,
++        readable = None,
++    ):
++        seen["readable"] = readable
++        return real_hub(fam, quant, base, _Api(hub_names), h3_task, readable = readable)
++
++    monkeypatch.setattr(V.VideoBackend, "_denoiser_prequant_hub_files", staticmethod(_hub))
++
++    def _cached(
++        fam,
++        quant,
++        base,
++        h3_task = None,
++        online = None,
++        hf_token = None,
++        readable = None,
++    ):
++        seen["readable"] = readable
++        return "unsloth/LTX-2.5-FP8"
++
++    monkeypatch.setattr(V.VideoBackend, "_denoiser_prequant_cached_repo", staticmethod(_cached))
++    monkeypatch.setattr(PQ, "hosted_prequant_refusal", lambda *a, **k: None)
++    backend = V.VideoBackend.__new__(V.VideoBackend)
++    ok = backend._denoiser_prequant_verified(
++        _fam(),
++        "int8",
++        LTX[0],
++        None,
++        None,
++        local_files_only = local,
++        native_hosted = native_hosted,
++    )
++    return ok, seen.get("readable")
++
++
++def test_stubbed_torchao_still_commits_the_native_hosted_convrot_file(monkeypatch):
++    ok, readable = _verified(monkeypatch, native_hosted = True, torchao = False)
++    assert ok is True
++    # Only the safetensors file the native read opens counts; a torchao pickle twin never does.
++    assert readable is not None and readable(CONVROT) and not readable("LTX-2.5-INT8.pt")
++
++
++def test_stubbed_torchao_offline_uses_the_same_safetensors_filter(monkeypatch):
++    ok, readable = _verified(monkeypatch, native_hosted = True, torchao = False, local = True)
++    assert ok is True and readable is not None and not readable("transformer_int8.pt")
++
++
++def test_stubbed_torchao_with_only_a_pickle_hosted_keeps_the_dense_shards(monkeypatch):
++    ok, _ = _verified(
++        monkeypatch, native_hosted = True, torchao = False, hub_names = ("LTX-2.5-INT8.pt",)
++    )
++    assert ok is False
++
++
++def test_stubbed_torchao_seed_check_is_unchanged(monkeypatch):
++    # A torchao seed (not the native read) still needs torchao.
++    ok, _ = _verified(monkeypatch, native_hosted = False, torchao = False)
++    assert ok is False
++
++
++def test_stubbed_torchao_kill_switch_restores_the_refusal(monkeypatch):
++    monkeypatch.setenv(V.VIDEO_HOSTED_INT8_FIT_ENV, "0")
++    ok, _ = _verified(monkeypatch, native_hosted = True, torchao = False)
++    assert ok is False
++
++
++def test_real_torchao_keeps_the_existing_filter(monkeypatch):
++    ok, readable = _verified(monkeypatch, native_hosted = True, torchao = True)
++    assert ok is True and readable is None
++
++
++# ---------------------------------------------------------------------------------------------------------------------
++# Pricing: the planned hosted read is priced at the hosted int8 file.
++
++
++def _dit_gb(**overrides):
++    kwargs = dict(
++        target = GPU_BF16,
++        transformer_quant = "int8",
++        kind = "pipeline",
++        native_hosted_planned = "int8",
++        source_dir = None,
++    )
++    kwargs.update(overrides)
++    return V._video_hosted_read_dit_gb(_fam(kwargs.pop("pair", LTX)), **kwargs)
++
++
++def test_rocm_explicit_int8_hosted_read_is_priced_at_the_file(monkeypatch):
++    _host(monkeypatch, rocm = True)
++    assert _dit_gb() == pytest.approx(25.11)
++
++
++@pytest.mark.parametrize(
++    "overrides",
++    [
++        {"native_hosted_planned": None},  # dense shards staged: dense price
++        {"transformer_quant": "auto"},
++        {"transformer_quant": None},
++        {"transformer_quant": "fp8"},
++        {"kind": "gguf"},
++        {"pair": WAN},
++    ],
++)
++def test_everything_else_keeps_the_dense_price(monkeypatch, overrides):
++    _host(monkeypatch, rocm = True)
++    assert _dit_gb(**overrides) is None
++
++
++def test_cuda_keeps_the_dense_price(monkeypatch):
++    _host(monkeypatch, rocm = False)
++    assert _dit_gb() is None
++
++
++@pytest.mark.parametrize(
++    "env", [V.VIDEO_HOSTED_INT8_FIT_ENV, tq.ROCM_VIDEO_HOSTED_INT8_ENV, "UNSLOTH_NATIVE_INT8_ACT"]
++)
++def test_pricing_kill_switches(monkeypatch, env):
++    _host(monkeypatch, rocm = True)
++    monkeypatch.setenv(env, "0")
++    assert _dit_gb() is None
++
++
++def test_a_stored_precision_checkpoint_keeps_the_dense_price(monkeypatch):
++    _host(monkeypatch, rocm = True)
++    monkeypatch.setattr(V, "stored_denoiser_precision", lambda source: "fp8")
++    assert _dit_gb(source_dir = "C:/models/ltx") is None
++
++
++def test_load_pipeline_prices_the_hosted_read_and_reguards_a_miss():
++    src = inspect.getsource(V.VideoBackend.load_pipeline)
++    assert "denoiser_gb = hosted_read_dit_gb" in src
++    assert "_video_hosted_read_dit_gb(" in src
++    # A hosted miss (no read, or a read discarded as the wrong build) re-plans dense and re-runs the guard first.
++    assert src.count("_reprice_dense_after_hosted_miss(") == 3
++    begin = inspect.getsource(V.VideoBackend)
++    assert "native_hosted = True," in begin
++
++
++# ---------------------------------------------------------------------------------------------------------------------
++# The guard arithmetic on the failing Windows gfx1151 host (77 GB free reported, 61 GB usable).
++
++MIB_PER_GB = 1000.0**3 / (1024.0 * 1024.0)
++GIB = 1024
++
++
++def _ltx25_plan(memory, dit_gb):
++    from core.inference.video_ltx25 import LTX25_WORKER_RESIDENT_GB
++
++    fam = _fam()
++    dit, te, vae = fam.bf16_components_gb
++    companions = te + vae + LTX25_WORKER_RESIDENT_GB
++    return plan_diffusion_memory(
++        target = DiffusionDeviceTarget(
++            device = "cuda",
++            dtype = torch.bfloat16,
++            backend = "cuda",
++            vendor = "amd",
++            supports_model_cpu_offload = True,
++            supports_default_torch_compile = True,
++            supports_pinned_transfer = True,
++        ),
++        device_memory = memory,
++        model_dense_mib = int((dit_gb + companions) * MIB_PER_GB),
++        runtime_headroom_mib = 4 * GIB,
++        companion_dense_mib = int(companions * MIB_PER_GB),
++        text_encoder_dense_mib = int(te * MIB_PER_GB),
++    )
++
++
++def test_windows_gfx1151_dense_is_refused_and_the_hosted_int8_dit_fits():
++    # 80 GB total / 77 GB free reproduces the refusal's "only about 61 GB is usable".
++    memory = DeviceMemory("cuda", "cuda", "unified_memory", free_mib = 77 * GIB, total_mib = 80 * GIB)
++    dense = _ltx25_plan(memory, _fam().bf16_components_gb[0])
++    hosted = _ltx25_plan(memory, 25.11)
++    assert round(dense.estimates["safe_device_budget_mib"] / GIB) == 61
++    assert "needs about 73 GB" in unified_memory_shortfall_message(dense, family = "ltx-2.5")
++    # The guard itself is unchanged: the dense DiT is still refused on this device.
++    assert unified_memory_shortfall_message(dense, family = "ltx-2.5") is not None
++    assert unified_memory_shortfall_message(hosted, family = "ltx-2.5") is None
