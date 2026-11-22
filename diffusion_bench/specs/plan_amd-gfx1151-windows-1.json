@@ -1,0 +1,431 @@
+{
+ "name": "amd_nov21_winab:amd-gfx1151-windows-1",
+ "description": "plan.py VM amd-gfx1151-windows-1 (amd:gfx1151-windows)",
+ "defaults": {},
+ "cells": [
+  {
+   "backend": "studio",
+   "kind": "image",
+   "width": 1024,
+   "height": 1024,
+   "steps": 16,
+   "guidance": 1.0,
+   "prompts": "image_24",
+   "n": 1,
+   "warmup": 0,
+   "options": {
+    "transformer_quant": "none",
+    "text_encoder_quant": "none",
+    "generate": {},
+    "speed_mode": "default",
+    "target": {
+     "name": "amd:gfx1151-windows",
+     "vm_id": "amd-gfx1151-windows-1",
+     "lane": null,
+     "account": null,
+     "simulated_budget_gib": null,
+     "concurrent_with": null
+    },
+    "arm": {
+     "stack": "studio",
+     "block": 0,
+     "order": "trial",
+     "aa_of": null,
+     "label": "s_bf16",
+     "comparison": "flux-3-klein_amd-gfx1151-windows",
+     "purpose": "trial",
+     "format": "bf16",
+     "tier": "default"
+    }
+   },
+   "env": {},
+   "model": "unsloth/flux-3-image-klein",
+   "variant": "bf16",
+   "card": "flux.3-klein",
+   "venv": {
+    "profile": "studio"
+   },
+   "short_n": 0,
+   "tag": "trial__amd-gfx1151-windows-1",
+   "family": "flux.3-klein"
+  },
+  {
+   "backend": "studio",
+   "kind": "image",
+   "width": 1024,
+   "height": 1024,
+   "steps": 16,
+   "guidance": 1.0,
+   "prompts": "image_24",
+   "n": 1,
+   "warmup": 1,
+   "options": {
+    "transformer_quant": "none",
+    "text_encoder_quant": "none",
+    "generate": {},
+    "speed_mode": "default",
+    "target": {
+     "name": "amd:gfx1151-windows",
+     "vm_id": "amd-gfx1151-windows-1",
+     "lane": null,
+     "account": null,
+     "simulated_budget_gib": null,
+     "concurrent_with": null
+    },
+    "arm": {
+     "stack": "studio",
+     "block": 1,
+     "order": "ABBA",
+     "aa_of": null,
+     "label": "s_bf16",
+     "comparison": "flux-3-klein_amd-gfx1151-windows",
+     "purpose": "timing",
+     "format": "bf16",
+     "tier": "default"
+    }
+   },
+   "env": {},
+   "model": "unsloth/flux-3-image-klein",
+   "variant": "bf16",
+   "card": "flux.3-klein",
+   "venv": {
+    "profile": "studio"
+   },
+   "short_n": 1,
+   "tag": "flux-3-klein_amd-gfx1151-windows__s_bf16__k1p0",
+   "family": "flux.3-klein"
+  },
+  {
+   "backend": "studio",
+   "kind": "image",
+   "width": 1024,
+   "height": 1024,
+   "steps": 16,
+   "guidance": 1.0,
+   "prompts": "image_24",
+   "n": 1,
+   "warmup": 1,
+   "options": {
+    "transformer_quant": "none",
+    "text_encoder_quant": "none",
+    "generate": {},
+    "speed_mode": "default",
+    "target": {
+     "name": "amd:gfx1151-windows",
+     "vm_id": "amd-gfx1151-windows-1",
+     "lane": null,
+     "account": null,
+     "simulated_budget_gib": null,
+     "concurrent_with": null
+    },
+    "arm": {
+     "stack": "studio",
+     "block": 1,
+     "order": "ABBA",
+     "aa_of": "flux-3-klein_amd-gfx1151-windows__s_bf16__k1p0",
+     "label": "s_bf16",
+     "comparison": "flux-3-klein_amd-gfx1151-windows",
+     "purpose": "timing",
+     "format": "bf16",
+     "tier": "default"
+    }
+   },
+   "env": {},
+   "model": "unsloth/flux-3-image-klein",
+   "variant": "bf16",
+   "card": "flux.3-klein",
+   "venv": {
+    "profile": "studio"
+   },
+   "short_n": 1,
+   "tag": "flux-3-klein_amd-gfx1151-windows__s_bf16__k1p1",
+   "family": "flux.3-klein"
+  },
+  {
+   "backend": "studio",
+   "kind": "image",
+   "width": 1024,
+   "height": 1024,
+   "steps": 16,
+   "guidance": 1.0,
+   "prompts": "image_24",
+   "n": 1,
+   "warmup": 1,
+   "options": {
+    "transformer_quant": "none",
+    "text_encoder_quant": "none",
+    "generate": {},
+    "speed_mode": "default",
+    "target": {
+     "name": "amd:gfx1151-windows",
+     "vm_id": "amd-gfx1151-windows-1",
+     "lane": null,
+     "account": null,
+     "simulated_budget_gib": null,
+     "concurrent_with": null
+    },
+    "arm": {
+     "stack": "studio",
+     "block": 1,
+     "order": "ABBA",
+     "aa_of": "flux-3-klein_amd-gfx1151-windows__s_bf16__k1p0",
+     "label": "s_bf16",
+     "comparison": "flux-3-klein_amd-gfx1151-windows",
+     "purpose": "timing",
+     "format": "bf16",
+     "tier": "default"
+    }
+   },
+   "env": {},
+   "model": "unsloth/flux-3-image-klein",
+   "variant": "bf16",
+   "card": "flux.3-klein",
+   "venv": {
+    "profile": "studio"
+   },
+   "short_n": 1,
+   "tag": "flux-3-klein_amd-gfx1151-windows__s_bf16__k1p2",
+   "family": "flux.3-klein"
+  },
+  {
+   "backend": "studio",
+   "kind": "image",
+   "width": 1024,
+   "height": 1024,
+   "steps": 25,
+   "guidance": 1.0,
+   "prompts": "image_24",
+   "n": 1,
+   "warmup": 1,
+   "options": {
+    "transformer_quant": "none",
+    "text_encoder_quant": "none",
+    "generate": {},
+    "speed_mode": "default",
+    "target": {
+     "name": "amd:gfx1151-windows",
+     "vm_id": "amd-gfx1151-windows-1",
+     "lane": null,
+     "account": null,
+     "simulated_budget_gib": null,
+     "concurrent_with": null
+    },
+    "arm": {
+     "stack": "studio",
+     "block": 1,
+     "order": "ABBA",
+     "aa_of": null,
+     "label": "s_bf16",
+     "comparison": "qwen-image-2-1_amd-gfx1151-windows",
+     "purpose": "timing",
+     "format": "bf16",
+     "tier": "default"
+    }
+   },
+   "env": {},
+   "model": "Qwen/Qwen-Image-2.1",
+   "variant": "bf16",
+   "card": "qwen-image-2.1",
+   "venv": {
+    "profile": "studio"
+   },
+   "short_n": 1,
+   "tag": "qwen-image-2-1_amd-gfx1151-windows__s_bf16__k1p0",
+   "family": "qwen-image-2.1"
+  },
+  {
+   "backend": "studio",
+   "kind": "image",
+   "width": 1024,
+   "height": 1024,
+   "steps": 25,
+   "guidance": 1.0,
+   "prompts": "image_24",
+   "n": 1,
+   "warmup": 1,
+   "options": {
+    "transformer_quant": "none",
+    "text_encoder_quant": "none",
+    "generate": {},
+    "speed_mode": "default",
+    "target": {
+     "name": "amd:gfx1151-windows",
+     "vm_id": "amd-gfx1151-windows-1",
+     "lane": null,
+     "account": null,
+     "simulated_budget_gib": null,
+     "concurrent_with": null
+    },
+    "arm": {
+     "stack": "studio",
+     "block": 1,
+     "order": "ABBA",
+     "aa_of": "qwen-image-2-1_amd-gfx1151-windows__s_bf16__k1p0",
+     "label": "s_bf16",
+     "comparison": "qwen-image-2-1_amd-gfx1151-windows",
+     "purpose": "timing",
+     "format": "bf16",
+     "tier": "default"
+    }
+   },
+   "env": {},
+   "model": "Qwen/Qwen-Image-2.1",
+   "variant": "bf16",
+   "card": "qwen-image-2.1",
+   "venv": {
+    "profile": "studio"
+   },
+   "short_n": 1,
+   "tag": "qwen-image-2-1_amd-gfx1151-windows__s_bf16__k1p1",
+   "family": "qwen-image-2.1"
+  },
+  {
+   "backend": "studio",
+   "kind": "image",
+   "width": 1024,
+   "height": 1024,
+   "steps": 25,
+   "guidance": 1.0,
+   "prompts": "image_24",
+   "n": 1,
+   "warmup": 1,
+   "options": {
+    "transformer_quant": "none",
+    "text_encoder_quant": "none",
+    "generate": {},
+    "speed_mode": "default",
+    "target": {
+     "name": "amd:gfx1151-windows",
+     "vm_id": "amd-gfx1151-windows-1",
+     "lane": null,
+     "account": null,
+     "simulated_budget_gib": null,
+     "concurrent_with": null
+    },
+    "arm": {
+     "stack": "studio",
+     "block": 1,
+     "order": "ABBA",
+     "aa_of": "qwen-image-2-1_amd-gfx1151-windows__s_bf16__k1p0",
+     "label": "s_bf16",
+     "comparison": "qwen-image-2-1_amd-gfx1151-windows",
+     "purpose": "timing",
+     "format": "bf16",
+     "tier": "default"
+    }
+   },
+   "env": {},
+   "model": "Qwen/Qwen-Image-2.1",
+   "variant": "bf16",
+   "card": "qwen-image-2.1",
+   "venv": {
+    "profile": "studio"
+   },
+   "short_n": 1,
+   "tag": "qwen-image-2-1_amd-gfx1151-windows__s_bf16__k1p2",
+   "family": "qwen-image-2.1"
+  }
+ ],
+ "plan_vm": {
+  "vm_id": "amd-gfx1151-windows-1",
+  "target": "amd:gfx1151-windows",
+  "purpose": "timing"
+ },
+ "downloads": {},
+ "prefetch": {
+  "unsloth/flux-3-image-klein:*": {
+   "repo": "unsloth/flux-3-image-klein",
+   "file": null
+  },
+  "Qwen/Qwen-Image-2.1:*": {
+   "repo": "Qwen/Qwen-Image-2.1",
+   "file": null
+  }
+ },
+ "comparisons": [
+  {
+   "id": "flux-3-klein_amd-gfx1151-windows",
+   "family": "flux.3-klein",
+   "target": "amd:gfx1151-windows",
+   "budget_gib": null,
+   "purpose": "timing",
+   "arms": [
+    "s_bf16"
+   ],
+   "runs": {
+    "s_bf16": [
+     "flux-3-klein_amd-gfx1151-windows__s_bf16__k1p0",
+     "flux-3-klein_amd-gfx1151-windows__s_bf16__k1p1",
+     "flux-3-klein_amd-gfx1151-windows__s_bf16__k1p2"
+    ]
+   },
+   "order": [
+    "flux-3-klein_amd-gfx1151-windows__s_bf16__k1p0",
+    "flux-3-klein_amd-gfx1151-windows__s_bf16__k1p1",
+    "flux-3-klein_amd-gfx1151-windows__s_bf16__k1p2"
+   ],
+   "aa_pairs": [
+    [
+     "flux-3-klein_amd-gfx1151-windows__s_bf16__k1p0",
+     "flux-3-klein_amd-gfx1151-windows__s_bf16__k1p1"
+    ],
+    [
+     "flux-3-klein_amd-gfx1151-windows__s_bf16__k1p0",
+     "flux-3-klein_amd-gfx1151-windows__s_bf16__k1p2"
+    ]
+   ],
+   "valid_if": "same vm_id and lane; SM clocks within 3% between the paired runs",
+   "est_min": 10.3,
+   "prefetch": [
+    "unsloth/flux-3-image-klein:*"
+   ],
+   "parity_pairs": [],
+   "vm_id": "amd-gfx1151-windows-1",
+   "lane": 0
+  },
+  {
+   "id": "qwen-image-2-1_amd-gfx1151-windows",
+   "family": "qwen-image-2.1",
+   "target": "amd:gfx1151-windows",
+   "budget_gib": null,
+   "purpose": "timing",
+   "arms": [
+    "s_bf16"
+   ],
+   "runs": {
+    "s_bf16": [
+     "qwen-image-2-1_amd-gfx1151-windows__s_bf16__k1p0",
+     "qwen-image-2-1_amd-gfx1151-windows__s_bf16__k1p1",
+     "qwen-image-2-1_amd-gfx1151-windows__s_bf16__k1p2"
+    ]
+   },
+   "order": [
+    "qwen-image-2-1_amd-gfx1151-windows__s_bf16__k1p0",
+    "qwen-image-2-1_amd-gfx1151-windows__s_bf16__k1p1",
+    "qwen-image-2-1_amd-gfx1151-windows__s_bf16__k1p2"
+   ],
+   "aa_pairs": [
+    [
+     "qwen-image-2-1_amd-gfx1151-windows__s_bf16__k1p0",
+     "qwen-image-2-1_amd-gfx1151-windows__s_bf16__k1p1"
+    ],
+    [
+     "qwen-image-2-1_amd-gfx1151-windows__s_bf16__k1p0",
+     "qwen-image-2-1_amd-gfx1151-windows__s_bf16__k1p2"
+    ]
+   ],
+   "valid_if": "same vm_id and lane; SM clocks within 3% between the paired runs",
+   "est_min": 10.3,
+   "prefetch": [
+    "Qwen/Qwen-Image-2.1:*"
+   ],
+   "parity_pairs": [],
+   "vm_id": "amd-gfx1151-windows-1",
+   "lane": 0
+  }
+ ],
+ "revisions": {
+  "unsloth_sha": "8b7cde79ebf5a901b2fd936bbee214fb8c7562c7",
+  "bline_ref": "v0.46.2"
+ }
+}
