@@ -1,0 +1,1402 @@
+{
+ "name": "amd_nov22_rhi:amd-gfx1151-linux-1",
+ "description": "plan.py VM amd-gfx1151-linux-1 (amd:gfx1151-linux)",
+ "defaults": {},
+ "cells": [
+  {
+   "backend": "studio",
+   "kind": "video",
+   "width": 512,
+   "height": 320,
+   "steps": 8,
+   "guidance": 1.0,
+   "negative_prompt": "pc game, console game, video game, cartoon, childish, ugly",
+   "prompts": "video_3",
+   "n": 1,
+   "warmup": 0,
+   "options": {
+    "generate": {},
+    "speed_mode": "default",
+    "local_files_only": false,
+    "transformer_quant": "auto",
+    "target": {
+     "name": "amd:gfx1151-linux",
+     "vm_id": "amd-gfx1151-linux-1",
+     "lane": null,
+     "account": null,
+     "simulated_budget_gib": null,
+     "concurrent_with": null
+    },
+    "arm": {
+     "stack": "studio",
+     "block": 0,
+     "order": "trial",
+     "aa_of": null,
+     "label": "s_int8_auto",
+     "comparison": "ltx-2-5_amd-gfx1151-linux",
+     "purpose": "trial",
+     "format": "int8",
+     "tier": "default"
+    }
+   },
+   "env": {},
+   "frames": 17,
+   "fps": 24,
+   "model": "Lightricks/LTX-2.5-Diffusers",
+   "variant": "int8",
+   "card": "ltx-2.5",
+   "venv": {
+    "profile": "studio"
+   },
+   "short_n": 0,
+   "tag": "trial__amd-gfx1151-linux-1",
+   "family": "ltx-2.5"
+  },
+  {
+   "backend": "studio",
+   "kind": "video",
+   "width": 512,
+   "height": 320,
+   "steps": 8,
+   "guidance": 1.0,
+   "negative_prompt": "pc game, console game, video game, cartoon, childish, ugly",
+   "prompts": "video_3",
+   "n": 1,
+   "warmup": 1,
+   "options": {
+    "generate": {},
+    "speed_mode": "default",
+    "local_files_only": false,
+    "transformer_quant": "auto",
+    "target": {
+     "name": "amd:gfx1151-linux",
+     "vm_id": "amd-gfx1151-linux-1",
+     "lane": null,
+     "account": null,
+     "simulated_budget_gib": null,
+     "concurrent_with": null
+    },
+    "arm": {
+     "stack": "studio",
+     "block": 1,
+     "order": "ABBA",
+     "aa_of": null,
+     "label": "s_int8_auto",
+     "comparison": "ltx-2-5_amd-gfx1151-linux",
+     "purpose": "timing",
+     "format": "int8",
+     "tier": "default"
+    }
+   },
+   "env": {},
+   "frames": 17,
+   "fps": 24,
+   "model": "Lightricks/LTX-2.5-Diffusers",
+   "variant": "int8",
+   "card": "ltx-2.5",
+   "venv": {
+    "profile": "studio"
+   },
+   "short_n": 0,
+   "tag": "ltx-2-5_amd-gfx1151-linux__s_int8_auto__k1p0",
+   "family": "ltx-2.5"
+  },
+  {
+   "backend": "studio",
+   "kind": "video",
+   "width": 512,
+   "height": 320,
+   "steps": 8,
+   "guidance": 1.0,
+   "negative_prompt": "pc game, console game, video game, cartoon, childish, ugly",
+   "prompts": "video_3",
+   "n": 1,
+   "warmup": 1,
+   "options": {
+    "generate": {},
+    "speed_mode": "default",
+    "local_files_only": false,
+    "transformer_quant": "none",
+    "target": {
+     "name": "amd:gfx1151-linux",
+     "vm_id": "amd-gfx1151-linux-1",
+     "lane": null,
+     "account": null,
+     "simulated_budget_gib": null,
+     "concurrent_with": null
+    },
+    "arm": {
+     "stack": "studio",
+     "block": 1,
+     "order": "ABBA",
+     "aa_of": null,
+     "label": "s_int8_bf16dit",
+     "comparison": "ltx-2-5_amd-gfx1151-linux",
+     "purpose": "timing",
+     "format": "int8",
+     "tier": "default"
+    }
+   },
+   "env": {},
+   "frames": 17,
+   "fps": 24,
+   "model": "Lightricks/LTX-2.5-Diffusers",
+   "variant": "int8",
+   "card": "ltx-2.5",
+   "venv": {
+    "profile": "studio"
+   },
+   "short_n": 0,
+   "tag": "ltx-2-5_amd-gfx1151-linux__s_int8_bf16dit__k1p1",
+   "family": "ltx-2.5"
+  },
+  {
+   "backend": "studio",
+   "kind": "video",
+   "width": 512,
+   "height": 320,
+   "steps": 8,
+   "guidance": 1.0,
+   "negative_prompt": "pc game, console game, video game, cartoon, childish, ugly",
+   "prompts": "video_3",
+   "n": 1,
+   "warmup": 1,
+   "options": {
+    "generate": {},
+    "speed_mode": "default",
+    "local_files_only": false,
+    "transformer_quant": "int8",
+    "target": {
+     "name": "amd:gfx1151-linux",
+     "vm_id": "amd-gfx1151-linux-1",
+     "lane": null,
+     "account": null,
+     "simulated_budget_gib": null,
+     "concurrent_with": null
+    },
+    "arm": {
+     "stack": "studio",
+     "block": 1,
+     "order": "ABBA",
+     "aa_of": null,
+     "label": "s_int8_int8",
+     "comparison": "ltx-2-5_amd-gfx1151-linux",
+     "purpose": "timing",
+     "format": "int8",
+     "tier": "default"
+    }
+   },
+   "env": {},
+   "frames": 17,
+   "fps": 24,
+   "model": "Lightricks/LTX-2.5-Diffusers",
+   "variant": "int8",
+   "card": "ltx-2.5",
+   "venv": {
+    "profile": "studio"
+   },
+   "short_n": 0,
+   "tag": "ltx-2-5_amd-gfx1151-linux__s_int8_int8__k1p2",
+   "family": "ltx-2.5"
+  },
+  {
+   "backend": "studio",
+   "kind": "video",
+   "width": 512,
+   "height": 320,
+   "steps": 8,
+   "guidance": 1.0,
+   "negative_prompt": "pc game, console game, video game, cartoon, childish, ugly",
+   "prompts": "video_3",
+   "n": 1,
+   "warmup": 1,
+   "options": {
+    "generate": {},
+    "speed_mode": "default",
+    "local_files_only": false,
+    "transformer_quant": "int8",
+    "target": {
+     "name": "amd:gfx1151-linux",
+     "vm_id": "amd-gfx1151-linux-1",
+     "lane": null,
+     "account": null,
+     "simulated_budget_gib": null,
+     "concurrent_with": null
+    },
+    "arm": {
+     "stack": "studio",
+     "block": 1,
+     "order": "ABBA",
+     "aa_of": null,
+     "label": "s_int8_int8ks",
+     "comparison": "ltx-2-5_amd-gfx1151-linux",
+     "purpose": "timing",
+     "format": "int8",
+     "tier": "default"
+    }
+   },
+   "env": {
+    "UNSLOTH_ROCM_VIDEO_HOSTED_INT8": "0"
+   },
+   "frames": 17,
+   "fps": 24,
+   "model": "Lightricks/LTX-2.5-Diffusers",
+   "variant": "int8",
+   "card": "ltx-2.5",
+   "venv": {
+    "profile": "studio"
+   },
+   "short_n": 0,
+   "tag": "ltx-2-5_amd-gfx1151-linux__s_int8_int8ks__k1p3",
+   "family": "ltx-2.5"
+  },
+  {
+   "backend": "studio",
+   "kind": "video",
+   "width": 512,
+   "height": 320,
+   "steps": 8,
+   "guidance": 1.0,
+   "negative_prompt": "pc game, console game, video game, cartoon, childish, ugly",
+   "prompts": "video_3",
+   "n": 1,
+   "warmup": 1,
+   "options": {
+    "generate": {},
+    "speed_mode": "default",
+    "local_files_only": false,
+    "transformer_quant": "int8",
+    "target": {
+     "name": "amd:gfx1151-linux",
+     "vm_id": "amd-gfx1151-linux-1",
+     "lane": null,
+     "account": null,
+     "simulated_budget_gib": null,
+     "concurrent_with": null
+    },
+    "arm": {
+     "stack": "studio",
+     "block": 1,
+     "order": "ABBA",
+     "aa_of": "ltx-2-5_amd-gfx1151-linux__s_int8_int8ks__k1p3",
+     "label": "s_int8_int8ks",
+     "comparison": "ltx-2-5_amd-gfx1151-linux",
+     "purpose": "timing",
+     "format": "int8",
+     "tier": "default"
+    }
+   },
+   "env": {
+    "UNSLOTH_ROCM_VIDEO_HOSTED_INT8": "0"
+   },
+   "frames": 17,
+   "fps": 24,
+   "model": "Lightricks/LTX-2.5-Diffusers",
+   "variant": "int8",
+   "card": "ltx-2.5",
+   "venv": {
+    "profile": "studio"
+   },
+   "short_n": 0,
+   "tag": "ltx-2-5_amd-gfx1151-linux__s_int8_int8ks__k1p4",
+   "family": "ltx-2.5"
+  },
+  {
+   "backend": "studio",
+   "kind": "video",
+   "width": 512,
+   "height": 320,
+   "steps": 8,
+   "guidance": 1.0,
+   "negative_prompt": "pc game, console game, video game, cartoon, childish, ugly",
+   "prompts": "video_3",
+   "n": 1,
+   "warmup": 1,
+   "options": {
+    "generate": {},
+    "speed_mode": "default",
+    "local_files_only": false,
+    "transformer_quant": "int8",
+    "target": {
+     "name": "amd:gfx1151-linux",
+     "vm_id": "amd-gfx1151-linux-1",
+     "lane": null,
+     "account": null,
+     "simulated_budget_gib": null,
+     "concurrent_with": null
+    },
+    "arm": {
+     "stack": "studio",
+     "block": 1,
+     "order": "ABBA",
+     "aa_of": "ltx-2-5_amd-gfx1151-linux__s_int8_int8__k1p2",
+     "label": "s_int8_int8",
+     "comparison": "ltx-2-5_amd-gfx1151-linux",
+     "purpose": "timing",
+     "format": "int8",
+     "tier": "default"
+    }
+   },
+   "env": {},
+   "frames": 17,
+   "fps": 24,
+   "model": "Lightricks/LTX-2.5-Diffusers",
+   "variant": "int8",
+   "card": "ltx-2.5",
+   "venv": {
+    "profile": "studio"
+   },
+   "short_n": 0,
+   "tag": "ltx-2-5_amd-gfx1151-linux__s_int8_int8__k1p5",
+   "family": "ltx-2.5"
+  },
+  {
+   "backend": "studio",
+   "kind": "video",
+   "width": 512,
+   "height": 320,
+   "steps": 8,
+   "guidance": 1.0,
+   "negative_prompt": "pc game, console game, video game, cartoon, childish, ugly",
+   "prompts": "video_3",
+   "n": 1,
+   "warmup": 1,
+   "options": {
+    "generate": {},
+    "speed_mode": "default",
+    "local_files_only": false,
+    "transformer_quant": "none",
+    "target": {
+     "name": "amd:gfx1151-linux",
+     "vm_id": "amd-gfx1151-linux-1",
+     "lane": null,
+     "account": null,
+     "simulated_budget_gib": null,
+     "concurrent_with": null
+    },
+    "arm": {
+     "stack": "studio",
+     "block": 1,
+     "order": "ABBA",
+     "aa_of": "ltx-2-5_amd-gfx1151-linux__s_int8_bf16dit__k1p1",
+     "label": "s_int8_bf16dit",
+     "comparison": "ltx-2-5_amd-gfx1151-linux",
+     "purpose": "timing",
+     "format": "int8",
+     "tier": "default"
+    }
+   },
+   "env": {},
+   "frames": 17,
+   "fps": 24,
+   "model": "Lightricks/LTX-2.5-Diffusers",
+   "variant": "int8",
+   "card": "ltx-2.5",
+   "venv": {
+    "profile": "studio"
+   },
+   "short_n": 0,
+   "tag": "ltx-2-5_amd-gfx1151-linux__s_int8_bf16dit__k1p6",
+   "family": "ltx-2.5"
+  },
+  {
+   "backend": "studio",
+   "kind": "video",
+   "width": 512,
+   "height": 320,
+   "steps": 8,
+   "guidance": 1.0,
+   "negative_prompt": "pc game, console game, video game, cartoon, childish, ugly",
+   "prompts": "video_3",
+   "n": 1,
+   "warmup": 1,
+   "options": {
+    "generate": {},
+    "speed_mode": "default",
+    "local_files_only": false,
+    "transformer_quant": "auto",
+    "target": {
+     "name": "amd:gfx1151-linux",
+     "vm_id": "amd-gfx1151-linux-1",
+     "lane": null,
+     "account": null,
+     "simulated_budget_gib": null,
+     "concurrent_with": null
+    },
+    "arm": {
+     "stack": "studio",
+     "block": 1,
+     "order": "ABBA",
+     "aa_of": "ltx-2-5_amd-gfx1151-linux__s_int8_auto__k1p0",
+     "label": "s_int8_auto",
+     "comparison": "ltx-2-5_amd-gfx1151-linux",
+     "purpose": "timing",
+     "format": "int8",
+     "tier": "default"
+    }
+   },
+   "env": {},
+   "frames": 17,
+   "fps": 24,
+   "model": "Lightricks/LTX-2.5-Diffusers",
+   "variant": "int8",
+   "card": "ltx-2.5",
+   "venv": {
+    "profile": "studio"
+   },
+   "short_n": 0,
+   "tag": "ltx-2-5_amd-gfx1151-linux__s_int8_auto__k1p7",
+   "family": "ltx-2.5"
+  },
+  {
+   "backend": "studio",
+   "kind": "video",
+   "width": 512,
+   "height": 320,
+   "steps": 8,
+   "guidance": 1.0,
+   "negative_prompt": "pc game, console game, video game, cartoon, childish, ugly",
+   "prompts": "video_3",
+   "n": 1,
+   "warmup": 1,
+   "options": {
+    "generate": {},
+    "speed_mode": "default",
+    "local_files_only": false,
+    "transformer_quant": "auto",
+    "target": {
+     "name": "amd:gfx1151-linux",
+     "vm_id": "amd-gfx1151-linux-1",
+     "lane": null,
+     "account": null,
+     "simulated_budget_gib": null,
+     "concurrent_with": null
+    },
+    "arm": {
+     "stack": "studio",
+     "block": 2,
+     "order": "ABBA",
+     "aa_of": null,
+     "label": "s_int8_auto",
+     "comparison": "ltx-2-5_amd-gfx1151-linux",
+     "purpose": "timing",
+     "format": "int8",
+     "tier": "default"
+    }
+   },
+   "env": {},
+   "frames": 17,
+   "fps": 24,
+   "model": "Lightricks/LTX-2.5-Diffusers",
+   "variant": "int8",
+   "card": "ltx-2.5",
+   "venv": {
+    "profile": "studio"
+   },
+   "short_n": 0,
+   "tag": "ltx-2-5_amd-gfx1151-linux__s_int8_auto__k2p0",
+   "family": "ltx-2.5"
+  },
+  {
+   "backend": "studio",
+   "kind": "video",
+   "width": 512,
+   "height": 320,
+   "steps": 8,
+   "guidance": 1.0,
+   "negative_prompt": "pc game, console game, video game, cartoon, childish, ugly",
+   "prompts": "video_3",
+   "n": 1,
+   "warmup": 1,
+   "options": {
+    "generate": {},
+    "speed_mode": "default",
+    "local_files_only": false,
+    "transformer_quant": "none",
+    "target": {
+     "name": "amd:gfx1151-linux",
+     "vm_id": "amd-gfx1151-linux-1",
+     "lane": null,
+     "account": null,
+     "simulated_budget_gib": null,
+     "concurrent_with": null
+    },
+    "arm": {
+     "stack": "studio",
+     "block": 2,
+     "order": "ABBA",
+     "aa_of": null,
+     "label": "s_int8_bf16dit",
+     "comparison": "ltx-2-5_amd-gfx1151-linux",
+     "purpose": "timing",
+     "format": "int8",
+     "tier": "default"
+    }
+   },
+   "env": {},
+   "frames": 17,
+   "fps": 24,
+   "model": "Lightricks/LTX-2.5-Diffusers",
+   "variant": "int8",
+   "card": "ltx-2.5",
+   "venv": {
+    "profile": "studio"
+   },
+   "short_n": 0,
+   "tag": "ltx-2-5_amd-gfx1151-linux__s_int8_bf16dit__k2p1",
+   "family": "ltx-2.5"
+  },
+  {
+   "backend": "studio",
+   "kind": "video",
+   "width": 512,
+   "height": 320,
+   "steps": 8,
+   "guidance": 1.0,
+   "negative_prompt": "pc game, console game, video game, cartoon, childish, ugly",
+   "prompts": "video_3",
+   "n": 1,
+   "warmup": 1,
+   "options": {
+    "generate": {},
+    "speed_mode": "default",
+    "local_files_only": false,
+    "transformer_quant": "int8",
+    "target": {
+     "name": "amd:gfx1151-linux",
+     "vm_id": "amd-gfx1151-linux-1",
+     "lane": null,
+     "account": null,
+     "simulated_budget_gib": null,
+     "concurrent_with": null
+    },
+    "arm": {
+     "stack": "studio",
+     "block": 2,
+     "order": "ABBA",
+     "aa_of": null,
+     "label": "s_int8_int8",
+     "comparison": "ltx-2-5_amd-gfx1151-linux",
+     "purpose": "timing",
+     "format": "int8",
+     "tier": "default"
+    }
+   },
+   "env": {},
+   "frames": 17,
+   "fps": 24,
+   "model": "Lightricks/LTX-2.5-Diffusers",
+   "variant": "int8",
+   "card": "ltx-2.5",
+   "venv": {
+    "profile": "studio"
+   },
+   "short_n": 0,
+   "tag": "ltx-2-5_amd-gfx1151-linux__s_int8_int8__k2p2",
+   "family": "ltx-2.5"
+  },
+  {
+   "backend": "studio",
+   "kind": "video",
+   "width": 512,
+   "height": 320,
+   "steps": 8,
+   "guidance": 1.0,
+   "negative_prompt": "pc game, console game, video game, cartoon, childish, ugly",
+   "prompts": "video_3",
+   "n": 1,
+   "warmup": 1,
+   "options": {
+    "generate": {},
+    "speed_mode": "default",
+    "local_files_only": false,
+    "transformer_quant": "int8",
+    "target": {
+     "name": "amd:gfx1151-linux",
+     "vm_id": "amd-gfx1151-linux-1",
+     "lane": null,
+     "account": null,
+     "simulated_budget_gib": null,
+     "concurrent_with": null
+    },
+    "arm": {
+     "stack": "studio",
+     "block": 2,
+     "order": "ABBA",
+     "aa_of": null,
+     "label": "s_int8_int8ks",
+     "comparison": "ltx-2-5_amd-gfx1151-linux",
+     "purpose": "timing",
+     "format": "int8",
+     "tier": "default"
+    }
+   },
+   "env": {
+    "UNSLOTH_ROCM_VIDEO_HOSTED_INT8": "0"
+   },
+   "frames": 17,
+   "fps": 24,
+   "model": "Lightricks/LTX-2.5-Diffusers",
+   "variant": "int8",
+   "card": "ltx-2.5",
+   "venv": {
+    "profile": "studio"
+   },
+   "short_n": 0,
+   "tag": "ltx-2-5_amd-gfx1151-linux__s_int8_int8ks__k2p3",
+   "family": "ltx-2.5"
+  },
+  {
+   "backend": "studio",
+   "kind": "video",
+   "width": 512,
+   "height": 320,
+   "steps": 8,
+   "guidance": 1.0,
+   "negative_prompt": "pc game, console game, video game, cartoon, childish, ugly",
+   "prompts": "video_3",
+   "n": 1,
+   "warmup": 1,
+   "options": {
+    "generate": {},
+    "speed_mode": "default",
+    "local_files_only": false,
+    "transformer_quant": "int8",
+    "target": {
+     "name": "amd:gfx1151-linux",
+     "vm_id": "amd-gfx1151-linux-1",
+     "lane": null,
+     "account": null,
+     "simulated_budget_gib": null,
+     "concurrent_with": null
+    },
+    "arm": {
+     "stack": "studio",
+     "block": 2,
+     "order": "ABBA",
+     "aa_of": "ltx-2-5_amd-gfx1151-linux__s_int8_int8ks__k2p3",
+     "label": "s_int8_int8ks",
+     "comparison": "ltx-2-5_amd-gfx1151-linux",
+     "purpose": "timing",
+     "format": "int8",
+     "tier": "default"
+    }
+   },
+   "env": {
+    "UNSLOTH_ROCM_VIDEO_HOSTED_INT8": "0"
+   },
+   "frames": 17,
+   "fps": 24,
+   "model": "Lightricks/LTX-2.5-Diffusers",
+   "variant": "int8",
+   "card": "ltx-2.5",
+   "venv": {
+    "profile": "studio"
+   },
+   "short_n": 0,
+   "tag": "ltx-2-5_amd-gfx1151-linux__s_int8_int8ks__k2p4",
+   "family": "ltx-2.5"
+  },
+  {
+   "backend": "studio",
+   "kind": "video",
+   "width": 512,
+   "height": 320,
+   "steps": 8,
+   "guidance": 1.0,
+   "negative_prompt": "pc game, console game, video game, cartoon, childish, ugly",
+   "prompts": "video_3",
+   "n": 1,
+   "warmup": 1,
+   "options": {
+    "generate": {},
+    "speed_mode": "default",
+    "local_files_only": false,
+    "transformer_quant": "int8",
+    "target": {
+     "name": "amd:gfx1151-linux",
+     "vm_id": "amd-gfx1151-linux-1",
+     "lane": null,
+     "account": null,
+     "simulated_budget_gib": null,
+     "concurrent_with": null
+    },
+    "arm": {
+     "stack": "studio",
+     "block": 2,
+     "order": "ABBA",
+     "aa_of": "ltx-2-5_amd-gfx1151-linux__s_int8_int8__k2p2",
+     "label": "s_int8_int8",
+     "comparison": "ltx-2-5_amd-gfx1151-linux",
+     "purpose": "timing",
+     "format": "int8",
+     "tier": "default"
+    }
+   },
+   "env": {},
+   "frames": 17,
+   "fps": 24,
+   "model": "Lightricks/LTX-2.5-Diffusers",
+   "variant": "int8",
+   "card": "ltx-2.5",
+   "venv": {
+    "profile": "studio"
+   },
+   "short_n": 0,
+   "tag": "ltx-2-5_amd-gfx1151-linux__s_int8_int8__k2p5",
+   "family": "ltx-2.5"
+  },
+  {
+   "backend": "studio",
+   "kind": "video",
+   "width": 512,
+   "height": 320,
+   "steps": 8,
+   "guidance": 1.0,
+   "negative_prompt": "pc game, console game, video game, cartoon, childish, ugly",
+   "prompts": "video_3",
+   "n": 1,
+   "warmup": 1,
+   "options": {
+    "generate": {},
+    "speed_mode": "default",
+    "local_files_only": false,
+    "transformer_quant": "none",
+    "target": {
+     "name": "amd:gfx1151-linux",
+     "vm_id": "amd-gfx1151-linux-1",
+     "lane": null,
+     "account": null,
+     "simulated_budget_gib": null,
+     "concurrent_with": null
+    },
+    "arm": {
+     "stack": "studio",
+     "block": 2,
+     "order": "ABBA",
+     "aa_of": "ltx-2-5_amd-gfx1151-linux__s_int8_bf16dit__k2p1",
+     "label": "s_int8_bf16dit",
+     "comparison": "ltx-2-5_amd-gfx1151-linux",
+     "purpose": "timing",
+     "format": "int8",
+     "tier": "default"
+    }
+   },
+   "env": {},
+   "frames": 17,
+   "fps": 24,
+   "model": "Lightricks/LTX-2.5-Diffusers",
+   "variant": "int8",
+   "card": "ltx-2.5",
+   "venv": {
+    "profile": "studio"
+   },
+   "short_n": 0,
+   "tag": "ltx-2-5_amd-gfx1151-linux__s_int8_bf16dit__k2p6",
+   "family": "ltx-2.5"
+  },
+  {
+   "backend": "studio",
+   "kind": "video",
+   "width": 512,
+   "height": 320,
+   "steps": 8,
+   "guidance": 1.0,
+   "negative_prompt": "pc game, console game, video game, cartoon, childish, ugly",
+   "prompts": "video_3",
+   "n": 1,
+   "warmup": 1,
+   "options": {
+    "generate": {},
+    "speed_mode": "default",
+    "local_files_only": false,
+    "transformer_quant": "auto",
+    "target": {
+     "name": "amd:gfx1151-linux",
+     "vm_id": "amd-gfx1151-linux-1",
+     "lane": null,
+     "account": null,
+     "simulated_budget_gib": null,
+     "concurrent_with": null
+    },
+    "arm": {
+     "stack": "studio",
+     "block": 2,
+     "order": "ABBA",
+     "aa_of": "ltx-2-5_amd-gfx1151-linux__s_int8_auto__k2p0",
+     "label": "s_int8_auto",
+     "comparison": "ltx-2-5_amd-gfx1151-linux",
+     "purpose": "timing",
+     "format": "int8",
+     "tier": "default"
+    }
+   },
+   "env": {},
+   "frames": 17,
+   "fps": 24,
+   "model": "Lightricks/LTX-2.5-Diffusers",
+   "variant": "int8",
+   "card": "ltx-2.5",
+   "venv": {
+    "profile": "studio"
+   },
+   "short_n": 0,
+   "tag": "ltx-2-5_amd-gfx1151-linux__s_int8_auto__k2p7",
+   "family": "ltx-2.5"
+  },
+  {
+   "backend": "studio",
+   "kind": "image",
+   "width": 1024,
+   "height": 1024,
+   "steps": 8,
+   "guidance": 0.0,
+   "prompts": "image_24",
+   "n": 1,
+   "warmup": 1,
+   "options": {
+    "transformer_quant": "none",
+    "text_encoder_quant": "none",
+    "generate": {},
+    "speed_mode": "default",
+    "local_files_only": false,
+    "target": {
+     "name": "amd:gfx1151-linux",
+     "vm_id": "amd-gfx1151-linux-1",
+     "lane": null,
+     "account": null,
+     "simulated_budget_gib": null,
+     "concurrent_with": null
+    },
+    "arm": {
+     "stack": "studio",
+     "block": 1,
+     "order": "ABBA",
+     "aa_of": null,
+     "label": "s_bf16_bf16",
+     "comparison": "z-image-turbo_amd-gfx1151-linux",
+     "purpose": "timing",
+     "format": "bf16",
+     "tier": "default"
+    }
+   },
+   "env": {},
+   "model": "Tongyi-MAI/Z-Image-Turbo",
+   "variant": "bf16",
+   "card": "z-image-turbo",
+   "venv": {
+    "profile": "studio"
+   },
+   "short_n": 0,
+   "tag": "z-image-turbo_amd-gfx1151-linux__s_bf16_bf16__k1p0",
+   "family": "z-image-turbo"
+  },
+  {
+   "backend": "studio",
+   "kind": "image",
+   "width": 1024,
+   "height": 1024,
+   "steps": 8,
+   "guidance": 0.0,
+   "prompts": "image_24",
+   "n": 1,
+   "warmup": 1,
+   "options": {
+    "transformer_quant": "int8",
+    "generate": {},
+    "speed_mode": "default",
+    "local_files_only": false,
+    "target": {
+     "name": "amd:gfx1151-linux",
+     "vm_id": "amd-gfx1151-linux-1",
+     "lane": null,
+     "account": null,
+     "simulated_budget_gib": null,
+     "concurrent_with": null
+    },
+    "arm": {
+     "stack": "studio",
+     "block": 1,
+     "order": "ABBA",
+     "aa_of": null,
+     "label": "s_int8_int8",
+     "comparison": "z-image-turbo_amd-gfx1151-linux",
+     "purpose": "timing",
+     "format": "int8",
+     "tier": "default"
+    }
+   },
+   "env": {},
+   "model": "Tongyi-MAI/Z-Image-Turbo",
+   "variant": "int8",
+   "card": "z-image-turbo",
+   "venv": {
+    "profile": "studio"
+   },
+   "short_n": 0,
+   "tag": "z-image-turbo_amd-gfx1151-linux__s_int8_int8__k1p1",
+   "family": "z-image-turbo"
+  },
+  {
+   "backend": "studio",
+   "kind": "image",
+   "width": 1024,
+   "height": 1024,
+   "steps": 8,
+   "guidance": 0.0,
+   "prompts": "image_24",
+   "n": 1,
+   "warmup": 1,
+   "options": {
+    "transformer_quant": "int8",
+    "generate": {},
+    "speed_mode": "default",
+    "local_files_only": false,
+    "target": {
+     "name": "amd:gfx1151-linux",
+     "vm_id": "amd-gfx1151-linux-1",
+     "lane": null,
+     "account": null,
+     "simulated_budget_gib": null,
+     "concurrent_with": null
+    },
+    "arm": {
+     "stack": "studio",
+     "block": 1,
+     "order": "ABBA",
+     "aa_of": "z-image-turbo_amd-gfx1151-linux__s_int8_int8__k1p1",
+     "label": "s_int8_int8",
+     "comparison": "z-image-turbo_amd-gfx1151-linux",
+     "purpose": "timing",
+     "format": "int8",
+     "tier": "default"
+    }
+   },
+   "env": {},
+   "model": "Tongyi-MAI/Z-Image-Turbo",
+   "variant": "int8",
+   "card": "z-image-turbo",
+   "venv": {
+    "profile": "studio"
+   },
+   "short_n": 0,
+   "tag": "z-image-turbo_amd-gfx1151-linux__s_int8_int8__k1p2",
+   "family": "z-image-turbo"
+  },
+  {
+   "backend": "studio",
+   "kind": "image",
+   "width": 1024,
+   "height": 1024,
+   "steps": 8,
+   "guidance": 0.0,
+   "prompts": "image_24",
+   "n": 1,
+   "warmup": 1,
+   "options": {
+    "transformer_quant": "none",
+    "text_encoder_quant": "none",
+    "generate": {},
+    "speed_mode": "default",
+    "local_files_only": false,
+    "target": {
+     "name": "amd:gfx1151-linux",
+     "vm_id": "amd-gfx1151-linux-1",
+     "lane": null,
+     "account": null,
+     "simulated_budget_gib": null,
+     "concurrent_with": null
+    },
+    "arm": {
+     "stack": "studio",
+     "block": 1,
+     "order": "ABBA",
+     "aa_of": "z-image-turbo_amd-gfx1151-linux__s_bf16_bf16__k1p0",
+     "label": "s_bf16_bf16",
+     "comparison": "z-image-turbo_amd-gfx1151-linux",
+     "purpose": "timing",
+     "format": "bf16",
+     "tier": "default"
+    }
+   },
+   "env": {},
+   "model": "Tongyi-MAI/Z-Image-Turbo",
+   "variant": "bf16",
+   "card": "z-image-turbo",
+   "venv": {
+    "profile": "studio"
+   },
+   "short_n": 0,
+   "tag": "z-image-turbo_amd-gfx1151-linux__s_bf16_bf16__k1p3",
+   "family": "z-image-turbo"
+  },
+  {
+   "backend": "studio",
+   "kind": "image",
+   "width": 1024,
+   "height": 1024,
+   "steps": 8,
+   "guidance": 0.0,
+   "prompts": "image_24",
+   "n": 1,
+   "warmup": 1,
+   "options": {
+    "transformer_quant": "none",
+    "text_encoder_quant": "none",
+    "generate": {},
+    "speed_mode": "default",
+    "local_files_only": false,
+    "target": {
+     "name": "amd:gfx1151-linux",
+     "vm_id": "amd-gfx1151-linux-1",
+     "lane": null,
+     "account": null,
+     "simulated_budget_gib": null,
+     "concurrent_with": null
+    },
+    "arm": {
+     "stack": "studio",
+     "block": 2,
+     "order": "ABBA",
+     "aa_of": null,
+     "label": "s_bf16_bf16",
+     "comparison": "z-image-turbo_amd-gfx1151-linux",
+     "purpose": "timing",
+     "format": "bf16",
+     "tier": "default"
+    }
+   },
+   "env": {},
+   "model": "Tongyi-MAI/Z-Image-Turbo",
+   "variant": "bf16",
+   "card": "z-image-turbo",
+   "venv": {
+    "profile": "studio"
+   },
+   "short_n": 0,
+   "tag": "z-image-turbo_amd-gfx1151-linux__s_bf16_bf16__k2p0",
+   "family": "z-image-turbo"
+  },
+  {
+   "backend": "studio",
+   "kind": "image",
+   "width": 1024,
+   "height": 1024,
+   "steps": 8,
+   "guidance": 0.0,
+   "prompts": "image_24",
+   "n": 1,
+   "warmup": 1,
+   "options": {
+    "transformer_quant": "int8",
+    "generate": {},
+    "speed_mode": "default",
+    "local_files_only": false,
+    "target": {
+     "name": "amd:gfx1151-linux",
+     "vm_id": "amd-gfx1151-linux-1",
+     "lane": null,
+     "account": null,
+     "simulated_budget_gib": null,
+     "concurrent_with": null
+    },
+    "arm": {
+     "stack": "studio",
+     "block": 2,
+     "order": "ABBA",
+     "aa_of": null,
+     "label": "s_int8_int8",
+     "comparison": "z-image-turbo_amd-gfx1151-linux",
+     "purpose": "timing",
+     "format": "int8",
+     "tier": "default"
+    }
+   },
+   "env": {},
+   "model": "Tongyi-MAI/Z-Image-Turbo",
+   "variant": "int8",
+   "card": "z-image-turbo",
+   "venv": {
+    "profile": "studio"
+   },
+   "short_n": 0,
+   "tag": "z-image-turbo_amd-gfx1151-linux__s_int8_int8__k2p1",
+   "family": "z-image-turbo"
+  },
+  {
+   "backend": "studio",
+   "kind": "image",
+   "width": 1024,
+   "height": 1024,
+   "steps": 8,
+   "guidance": 0.0,
+   "prompts": "image_24",
+   "n": 1,
+   "warmup": 1,
+   "options": {
+    "transformer_quant": "int8",
+    "generate": {},
+    "speed_mode": "default",
+    "local_files_only": false,
+    "target": {
+     "name": "amd:gfx1151-linux",
+     "vm_id": "amd-gfx1151-linux-1",
+     "lane": null,
+     "account": null,
+     "simulated_budget_gib": null,
+     "concurrent_with": null
+    },
+    "arm": {
+     "stack": "studio",
+     "block": 2,
+     "order": "ABBA",
+     "aa_of": "z-image-turbo_amd-gfx1151-linux__s_int8_int8__k2p1",
+     "label": "s_int8_int8",
+     "comparison": "z-image-turbo_amd-gfx1151-linux",
+     "purpose": "timing",
+     "format": "int8",
+     "tier": "default"
+    }
+   },
+   "env": {},
+   "model": "Tongyi-MAI/Z-Image-Turbo",
+   "variant": "int8",
+   "card": "z-image-turbo",
+   "venv": {
+    "profile": "studio"
+   },
+   "short_n": 0,
+   "tag": "z-image-turbo_amd-gfx1151-linux__s_int8_int8__k2p2",
+   "family": "z-image-turbo"
+  },
+  {
+   "backend": "studio",
+   "kind": "image",
+   "width": 1024,
+   "height": 1024,
+   "steps": 8,
+   "guidance": 0.0,
+   "prompts": "image_24",
+   "n": 1,
+   "warmup": 1,
+   "options": {
+    "transformer_quant": "none",
+    "text_encoder_quant": "none",
+    "generate": {},
+    "speed_mode": "default",
+    "local_files_only": false,
+    "target": {
+     "name": "amd:gfx1151-linux",
+     "vm_id": "amd-gfx1151-linux-1",
+     "lane": null,
+     "account": null,
+     "simulated_budget_gib": null,
+     "concurrent_with": null
+    },
+    "arm": {
+     "stack": "studio",
+     "block": 2,
+     "order": "ABBA",
+     "aa_of": "z-image-turbo_amd-gfx1151-linux__s_bf16_bf16__k2p0",
+     "label": "s_bf16_bf16",
+     "comparison": "z-image-turbo_amd-gfx1151-linux",
+     "purpose": "timing",
+     "format": "bf16",
+     "tier": "default"
+    }
+   },
+   "env": {},
+   "model": "Tongyi-MAI/Z-Image-Turbo",
+   "variant": "bf16",
+   "card": "z-image-turbo",
+   "venv": {
+    "profile": "studio"
+   },
+   "short_n": 0,
+   "tag": "z-image-turbo_amd-gfx1151-linux__s_bf16_bf16__k2p3",
+   "family": "z-image-turbo"
+  }
+ ],
+ "plan_vm": {
+  "vm_id": "amd-gfx1151-linux-1",
+  "target": "amd:gfx1151-linux",
+  "purpose": "timing"
+ },
+ "downloads": {},
+ "prefetch": {
+  "Lightricks/LTX-2.5-Diffusers:*": {
+   "repo": "Lightricks/LTX-2.5-Diffusers",
+   "file": null
+  },
+  "Tongyi-MAI/Z-Image-Turbo:*": {
+   "repo": "Tongyi-MAI/Z-Image-Turbo",
+   "file": null
+  }
+ },
+ "comparisons": [
+  {
+   "id": "ltx-2-5_amd-gfx1151-linux",
+   "family": "ltx-2.5",
+   "target": "amd:gfx1151-linux",
+   "budget_gib": null,
+   "purpose": "timing",
+   "arms": [
+    "s_int8_auto",
+    "s_int8_bf16dit",
+    "s_int8_int8",
+    "s_int8_int8ks"
+   ],
+   "runs": {
+    "s_int8_auto": [
+     "ltx-2-5_amd-gfx1151-linux__s_int8_auto__k1p0",
+     "ltx-2-5_amd-gfx1151-linux__s_int8_auto__k1p7",
+     "ltx-2-5_amd-gfx1151-linux__s_int8_auto__k2p0",
+     "ltx-2-5_amd-gfx1151-linux__s_int8_auto__k2p7"
+    ],
+    "s_int8_bf16dit": [
+     "ltx-2-5_amd-gfx1151-linux__s_int8_bf16dit__k1p1",
+     "ltx-2-5_amd-gfx1151-linux__s_int8_bf16dit__k1p6",
+     "ltx-2-5_amd-gfx1151-linux__s_int8_bf16dit__k2p1",
+     "ltx-2-5_amd-gfx1151-linux__s_int8_bf16dit__k2p6"
+    ],
+    "s_int8_int8": [
+     "ltx-2-5_amd-gfx1151-linux__s_int8_int8__k1p2",
+     "ltx-2-5_amd-gfx1151-linux__s_int8_int8__k1p5",
+     "ltx-2-5_amd-gfx1151-linux__s_int8_int8__k2p2",
+     "ltx-2-5_amd-gfx1151-linux__s_int8_int8__k2p5"
+    ],
+    "s_int8_int8ks": [
+     "ltx-2-5_amd-gfx1151-linux__s_int8_int8ks__k1p3",
+     "ltx-2-5_amd-gfx1151-linux__s_int8_int8ks__k1p4",
+     "ltx-2-5_amd-gfx1151-linux__s_int8_int8ks__k2p3",
+     "ltx-2-5_amd-gfx1151-linux__s_int8_int8ks__k2p4"
+    ]
+   },
+   "order": [
+    "ltx-2-5_amd-gfx1151-linux__s_int8_auto__k1p0",
+    "ltx-2-5_amd-gfx1151-linux__s_int8_bf16dit__k1p1",
+    "ltx-2-5_amd-gfx1151-linux__s_int8_int8__k1p2",
+    "ltx-2-5_amd-gfx1151-linux__s_int8_int8ks__k1p3",
+    "ltx-2-5_amd-gfx1151-linux__s_int8_int8ks__k1p4",
+    "ltx-2-5_amd-gfx1151-linux__s_int8_int8__k1p5",
+    "ltx-2-5_amd-gfx1151-linux__s_int8_bf16dit__k1p6",
+    "ltx-2-5_amd-gfx1151-linux__s_int8_auto__k1p7",
+    "ltx-2-5_amd-gfx1151-linux__s_int8_auto__k2p0",
+    "ltx-2-5_amd-gfx1151-linux__s_int8_bf16dit__k2p1",
+    "ltx-2-5_amd-gfx1151-linux__s_int8_int8__k2p2",
+    "ltx-2-5_amd-gfx1151-linux__s_int8_int8ks__k2p3",
+    "ltx-2-5_amd-gfx1151-linux__s_int8_int8ks__k2p4",
+    "ltx-2-5_amd-gfx1151-linux__s_int8_int8__k2p5",
+    "ltx-2-5_amd-gfx1151-linux__s_int8_bf16dit__k2p6",
+    "ltx-2-5_amd-gfx1151-linux__s_int8_auto__k2p7"
+   ],
+   "aa_pairs": [
+    [
+     "ltx-2-5_amd-gfx1151-linux__s_int8_int8ks__k1p3",
+     "ltx-2-5_amd-gfx1151-linux__s_int8_int8ks__k1p4"
+    ],
+    [
+     "ltx-2-5_amd-gfx1151-linux__s_int8_int8__k1p2",
+     "ltx-2-5_amd-gfx1151-linux__s_int8_int8__k1p5"
+    ],
+    [
+     "ltx-2-5_amd-gfx1151-linux__s_int8_bf16dit__k1p1",
+     "ltx-2-5_amd-gfx1151-linux__s_int8_bf16dit__k1p6"
+    ],
+    [
+     "ltx-2-5_amd-gfx1151-linux__s_int8_auto__k1p0",
+     "ltx-2-5_amd-gfx1151-linux__s_int8_auto__k1p7"
+    ],
+    [
+     "ltx-2-5_amd-gfx1151-linux__s_int8_int8ks__k2p3",
+     "ltx-2-5_amd-gfx1151-linux__s_int8_int8ks__k2p4"
+    ],
+    [
+     "ltx-2-5_amd-gfx1151-linux__s_int8_int8__k2p2",
+     "ltx-2-5_amd-gfx1151-linux__s_int8_int8__k2p5"
+    ],
+    [
+     "ltx-2-5_amd-gfx1151-linux__s_int8_bf16dit__k2p1",
+     "ltx-2-5_amd-gfx1151-linux__s_int8_bf16dit__k2p6"
+    ],
+    [
+     "ltx-2-5_amd-gfx1151-linux__s_int8_auto__k2p0",
+     "ltx-2-5_amd-gfx1151-linux__s_int8_auto__k2p7"
+    ]
+   ],
+   "valid_if": "same vm_id and lane; SM clocks within 3% between the paired runs",
+   "est_min": 313.1,
+   "prefetch": [
+    "Lightricks/LTX-2.5-Diffusers:*"
+   ],
+   "parity_pairs": [],
+   "vm_id": "amd-gfx1151-linux-1",
+   "lane": 0
+  },
+  {
+   "id": "z-image-turbo_amd-gfx1151-linux",
+   "family": "z-image-turbo",
+   "target": "amd:gfx1151-linux",
+   "budget_gib": null,
+   "purpose": "timing",
+   "arms": [
+    "s_bf16_bf16",
+    "s_int8_int8"
+   ],
+   "runs": {
+    "s_bf16_bf16": [
+     "z-image-turbo_amd-gfx1151-linux__s_bf16_bf16__k1p0",
+     "z-image-turbo_amd-gfx1151-linux__s_bf16_bf16__k1p3",
+     "z-image-turbo_amd-gfx1151-linux__s_bf16_bf16__k2p0",
+     "z-image-turbo_amd-gfx1151-linux__s_bf16_bf16__k2p3"
+    ],
+    "s_int8_int8": [
+     "z-image-turbo_amd-gfx1151-linux__s_int8_int8__k1p1",
+     "z-image-turbo_amd-gfx1151-linux__s_int8_int8__k1p2",
+     "z-image-turbo_amd-gfx1151-linux__s_int8_int8__k2p1",
+     "z-image-turbo_amd-gfx1151-linux__s_int8_int8__k2p2"
+    ]
+   },
+   "order": [
+    "z-image-turbo_amd-gfx1151-linux__s_bf16_bf16__k1p0",
+    "z-image-turbo_amd-gfx1151-linux__s_int8_int8__k1p1",
+    "z-image-turbo_amd-gfx1151-linux__s_int8_int8__k1p2",
+    "z-image-turbo_amd-gfx1151-linux__s_bf16_bf16__k1p3",
+    "z-image-turbo_amd-gfx1151-linux__s_bf16_bf16__k2p0",
+    "z-image-turbo_amd-gfx1151-linux__s_int8_int8__k2p1",
+    "z-image-turbo_amd-gfx1151-linux__s_int8_int8__k2p2",
+    "z-image-turbo_amd-gfx1151-linux__s_bf16_bf16__k2p3"
+   ],
+   "aa_pairs": [
+    [
+     "z-image-turbo_amd-gfx1151-linux__s_int8_int8__k1p1",
+     "z-image-turbo_amd-gfx1151-linux__s_int8_int8__k1p2"
+    ],
+    [
+     "z-image-turbo_amd-gfx1151-linux__s_bf16_bf16__k1p0",
+     "z-image-turbo_amd-gfx1151-linux__s_bf16_bf16__k1p3"
+    ],
+    [
+     "z-image-turbo_amd-gfx1151-linux__s_int8_int8__k2p1",
+     "z-image-turbo_amd-gfx1151-linux__s_int8_int8__k2p2"
+    ],
+    [
+     "z-image-turbo_amd-gfx1151-linux__s_bf16_bf16__k2p0",
+     "z-image-turbo_amd-gfx1151-linux__s_bf16_bf16__k2p3"
+    ]
+   ],
+   "valid_if": "same vm_id and lane; SM clocks within 3% between the paired runs",
+   "est_min": 21.1,
+   "prefetch": [
+    "Tongyi-MAI/Z-Image-Turbo:*"
+   ],
+   "parity_pairs": [],
+   "vm_id": "amd-gfx1151-linux-1",
+   "lane": 0
+  }
+ ],
+ "revisions": {
+  "unsloth_sha": "3a719a563664c3e958abcd299dd95e956cdcbacc",
+  "bline_ref": "v0.46.2"
+ }
+}

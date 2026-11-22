@@ -1,0 +1,509 @@
+diff --git a/studio/backend/core/inference/diffusion_transformer_quant.py b/studio/backend/core/inference/diffusion_transformer_quant.py
+index 9555b25556..1b037c1452 100644
+--- a/studio/backend/core/inference/diffusion_transformer_quant.py
++++ b/studio/backend/core/inference/diffusion_transformer_quant.py
+@@ -1468,6 +1468,27 @@ def rdna_explicit_int8_reason(target: Any, family: Optional[str]) -> Optional[st
+     return "an explicit int8 request on RDNA is measured compiled"
+ 
+ 
++# "0" keeps an explicit int8 video DiT on ROCm weight-only and quantised from the dense shards at load.
++ROCM_VIDEO_HOSTED_INT8_ENV = "UNSLOTH_ROCM_VIDEO_HOSTED_INT8"
++
++
++def rocm_video_hosted_int8_enabled() -> bool:
++    raw = (_os.environ.get(ROCM_VIDEO_HOSTED_INT8_ENV) or "").strip().lower()
++    return raw not in ("0", "off", "false", "no")
++
++
++def rdna_video_explicit_w8a8_reason(
++    target: Any, family: Optional[str], requested: Optional[str]
++) -> Optional[str]:
++    """Why an EXPLICIT int8 video request runs W8A8 on this ROCm RDNA card (the family's ``rdna_explicit_w8a8``),
++    else None. AUTO is never changed. Kill switches UNSLOTH_ROCM_VIDEO_HOSTED_INT8=0, UNSLOTH_NATIVE_INT8_ACT=0."""
++    if normalize_transformer_quant(requested) != TQ_INT8 or not rocm_video_hosted_int8_enabled():
++        return None
++    if not _rocm_cuda(target):
++        return None
++    return rdna_explicit_w8a8_reason(target, family)
++
++
+ def select_transformer_quant_scheme(
+     target: Any,
+     requested: Optional[str],
+diff --git a/studio/backend/core/inference/video.py b/studio/backend/core/inference/video.py
+index 2737a6c4e4..d4e17875f9 100644
+--- a/studio/backend/core/inference/video.py
++++ b/studio/backend/core/inference/video.py
+@@ -227,6 +227,7 @@ from .diffusion_transformer_quant import (
+     explain_unusable_scheme,
+     native_int8_act,
+     native_offload_host,
++    rdna_video_explicit_w8a8_reason,
+     native_quant_host,
+     native_quant_scheme,
+     NATIVE_OFFLOAD_SCHEMES,
+@@ -4125,6 +4126,75 @@ def _finish_cast_writes(pipe: Any) -> None:
+         pass
+ 
+ 
++def _video_int8_act(target: Any, fam: Any, transformer_quant: Optional[str]) -> bool:
++    """W8A8 for the native int8 build: the host default, or an explicit int8 pick on ROCm RDNA where the family
++    measured W8A8 faster (``rdna_video_explicit_w8a8_reason``). Never raises."""
++    if native_int8_act(target):
++        return True
++    try:
++        return (
++            rdna_video_explicit_w8a8_reason(target, getattr(fam, "name", None), transformer_quant)
++            is not None
++        )
++    except Exception:  # noqa: BLE001 - unanswerable keeps the host default
++        return False
++
++
++def _video_rocm_hosted_scheme(
++    fam: Any, transformer_quant: Optional[str], target: Any
++) -> Optional[str]:
++    """``int8`` when an explicit int8 load on ROCm RDNA builds the W8A8 ConvRot native DiT the family's hosted int8
++    safetensors already holds, resident or offloaded, else None. The load re-checks the file; never raises."""
++    try:
++        from .diffusion_native_hosted import native_hosted_family, native_hosted_pickle
++        from .diffusion_native_quant import int8_rotation_group
++
++        if not native_hosted_family(fam) or native_hosted_pickle(fam):
++            return None
++        if getattr(target, "device", None) != "cuda":
++            return None
++        # ROCm RDNA explicit int8 only: every other host keeps its existing routes (CUDA reads it when offloaded).
++        if (
++            rdna_video_explicit_w8a8_reason(target, getattr(fam, "name", None), transformer_quant)
++            is None
++        ):
++            return None
++        if native_quant_scheme(target, TQ_INT8, family = fam.name) != TQ_INT8:
++            return None
++        if int(int8_rotation_group() or 0) <= 0:
++            return None
++        return TQ_INT8
++    except Exception:  # noqa: BLE001 -- unanswerable: the dense shards and runtime build, as before
++        return None
++
++
++def _video_rocm_hosted_spec(
++    fam: Any,
++    *,
++    target: Any,
++    transformer_quant: Optional[str],
++    plan: Any,
++    kind: str,
++    source_dir: Optional[str],
++) -> Optional[dict]:
++    """Spec of the RESIDENT native W8A8 build an explicit int8 ROCm load reads from the hosted file, else None (an
++    offloaded plan uses ``_video_native_cache_spec``). Never raises."""
++    try:
++        if kind != "pipeline" or getattr(fam, "modular_workflow", None) or plan is None:
++            return None
++        if not plan_keeps_transformer_resident(plan):
++            return None
++        if _video_rocm_hosted_scheme(fam, transformer_quant, target) != TQ_INT8:
++            return None
++        if stored_denoiser_precision(source_dir) is not None:
++            return None
++        from .diffusion_native_cache import native_spec
++
++        return native_spec(TQ_INT8, fam.name, act_int8 = True)
++    except Exception:  # noqa: BLE001
++        return None
++
++
+ def _video_native_cache_spec(
+     fam: Any,
+     *,
+@@ -4163,7 +4233,7 @@ def _video_native_cache_spec(
+         return native_spec(
+             scheme,
+             fam.name,
+-            act_int8 = scheme == TQ_INT8 and native_int8_act(target),
++            act_int8 = scheme == TQ_INT8 and _video_int8_act(target, fam, transformer_quant),
+         )
+     except Exception:  # noqa: BLE001 -- unanswerable: no cache, the dense build runs
+         return None
+@@ -8145,6 +8215,17 @@ class VideoBackend:
+                     hf_token = hf_token,
+                 )
+                 if scheme is None:
++                    # ROCm seeds no torchao checkpoint; an explicit int8 pick still reads the hosted int8 file.
++                    hosted = _video_rocm_hosted_scheme(fam, transformer_quant, target)
++                    if native_hosted is not None and hosted is not None:
++                        native_hosted.append(hosted)
++                        logger.info(
++                            "video.denoiser_prequant: an explicit %s pick on this ROCm GPU reads the hosted "
++                            "%s checkpoint as native W8A8 Linears instead of quantising the dense denoiser shards",
++                            hosted,
++                            hosted,
++                        )
++                        return DENOISER_SEED_DECLINED
+                     return None
+                 resident = self._state
+                 reclaimable = _pipeline_device_mib(
+@@ -10755,16 +10836,35 @@ class VideoBackend:
+         )
+         self._raise_if_video_load_superseded(_load_token)
+         native_from_hosted = False
++        # A resident explicit int8 DiT on ROCm: the hosted file is read as the same native W8A8 build (no cache write).
++        rocm_hosted_spec = (
++            _video_rocm_hosted_spec(
++                fam,
++                target = target,
++                transformer_quant = transformer_quant,
++                plan = plan,
++                kind = kind,
++                source_dir = _base_local_dir or repo_id,
++            )
++            if native_cache_spec is None
++            and _video_native_hosted_planned is not None
++            and kind == "pipeline"
++            and not denoiser_injected
++            and not baked_loras
++            and modelopt_scan is None
++            else None
++        )
++        hosted_read_spec = native_cache_spec if native_cache_spec is not None else rocm_hosted_spec
+         if (
+             not native_cache_hits
+-            and native_cache_spec is not None
++            and hosted_read_spec is not None
+             and _video_native_hosted_planned is not None
+-            and _video_native_hosted_planned == native_cache_spec.get("scheme")
++            and _video_native_hosted_planned == hosted_read_spec.get("scheme")
+         ):
+             # The planner staged the hosted int8 file instead of the dense shards: read it as the native build.
+             native_cache_hits = _read_native_quant_from_hosted(
+                 fam,
+-                native_cache_spec,
++                hosted_read_spec,
+                 base = fetch_base,
+                 source = _base_local_dir or fetch_base,
+                 config_kwargs = native_config_kwargs,
+@@ -11244,7 +11344,8 @@ class VideoBackend:
+         native_kwargs = (
+             {
+                 "offload": video_offload,
+-                "act_int8": native_scheme == TQ_INT8 and native_int8_act(target),
++                "act_int8": native_scheme == TQ_INT8
++                and _video_int8_act(target, fam, transformer_quant),
+             }
+             if native_scheme is not None
+             else {}
+@@ -11264,6 +11365,23 @@ class VideoBackend:
+                 source_dir = _base_local_dir or repo_id,
+             )
+             == native_cache_spec
++        ) or (
++            # The resident ROCm read: still resident, still the explicit W8A8 build the file holds.
++            bool(native_cache_hits)
++            and native_from_hosted
++            and rocm_hosted_spec is not None
++            and not video_offload
++            and native_scheme == rocm_hosted_spec.get("scheme")
++            and bool(native_kwargs.get("act_int8"))
++            and _video_rocm_hosted_spec(
++                fam,
++                target = target,
++                transformer_quant = transformer_quant,
++                plan = plan,
++                kind = kind,
++                source_dir = _base_local_dir or repo_id,
++            )
++            == rocm_hosted_spec
+         )
+         if native_cache_hits and not native_cached:
+             # Not the build this load makes after all: put the dense experts back and let the quant below run.
+diff --git a/studio/backend/core/inference/video_families.py b/studio/backend/core/inference/video_families.py
+index b23308f81b..6a865e7618 100644
+--- a/studio/backend/core/inference/video_families.py
++++ b/studio/backend/core/inference/video_families.py
+@@ -667,6 +667,12 @@ _FAMILIES: tuple[VideoFamily, ...] = (
+             preview_factors = "ltx2",
+             # The split single-file repo next to the Diffusers pack (safetensors, no remote code).
+             trusted_repos = ("lightricks/ltx-2.5",),
++            # An explicit int8 pick on gfx1151 (ROCm 7.13, 512x320x17, 8 steps, 4 repeats) runs W8A8 read from the
++            # hosted ConvRot file; AUTO keeps bf16 there. Weight-only quantised at load measured 18.89 s/clip.
++            rdna_explicit_w8a8 = (
++                "int8 W8A8 measured 16.17 vs 18.89 s/clip against weight-only int8 on gfx1151 (512x320x17, "
++                "8 steps), LPIPS 0.126 vs 0.138 against bf16"
++            ),
+         ),
+         pipeline_class = "LTX2Pipeline",
+         transformer_class = "LTX2VideoTransformer3DModel",
+diff --git a/studio/backend/tests/test_diffusion_flux3_rdna_shared_quant.py b/studio/backend/tests/test_diffusion_flux3_rdna_shared_quant.py
+index 258755548d..1b9bcd9bad 100644
+--- a/studio/backend/tests/test_diffusion_flux3_rdna_shared_quant.py
++++ b/studio/backend/tests/test_diffusion_flux3_rdna_shared_quant.py
+@@ -194,10 +194,12 @@ def _target(device = "cuda", dtype = None):
+     return types.SimpleNamespace(device = device, dtype = torch.bfloat16 if dtype is None else dtype)
+ 
+ 
+-def test_explicit_w8a8_ships_for_flux3_klein_only():
+-    assert set(tq._FAMILY_RDNA_EXPLICIT_W8A8) == {"flux.3-klein"}
+-    # AUTO keeps bf16 for it
++def test_explicit_w8a8_ships_for_the_measured_families_only():
++    # flux.3-klein (image) and ltx-2.5 (video, read from its hosted ConvRot file)
++    assert set(tq._FAMILY_RDNA_EXPLICIT_W8A8) == {"flux.3-klein", "ltx-2.5"}
++    # AUTO keeps bf16 for both
+     assert "flux.3-klein" not in tq._FAMILY_RDNA_AUTO_W8A8
++    assert "ltx-2.5" not in tq._FAMILY_RDNA_AUTO_W8A8
+ 
+ 
+ def test_explicit_w8a8_reason_follows_the_explicit_compile_gates(rocm, monkeypatch):
+diff --git a/studio/backend/tests/test_video_rocm_hosted_int8.py b/studio/backend/tests/test_video_rocm_hosted_int8.py
+new file mode 100644
+index 0000000000..447cf245b9
+--- /dev/null
++++ b/studio/backend/tests/test_video_rocm_hosted_int8.py
+@@ -0,0 +1,246 @@
++# SPDX-License-Identifier: AGPL-3.0-only
++# Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
++
++"""An explicit int8 LTX-2.5 pick on ROCm RDNA reads the hosted INT8 ConvRot DiT as native W8A8 Linears instead of
++quantising the dense shards weight-only at load. AUTO, CUDA and the kill switches keep the previous routes."""
++
++from __future__ import annotations
++
++import sys
++import types
++from pathlib import Path
++
++import pytest
++
++torch = pytest.importorskip("torch")
++pytest.importorskip("diffusers")
++
++BACKEND = Path(__file__).resolve().parents[1]
++if str(BACKEND) not in sys.path:
++    sys.path.insert(0, str(BACKEND))
++
++from core.inference import diffusion_native_hosted as NH  # noqa: E402
++from core.inference import diffusion_transformer_quant as tq  # noqa: E402
++from core.inference import video as V  # noqa: E402
++from core.inference.diffusion_memory import OFFLOAD_GROUP, OFFLOAD_NONE  # noqa: E402
++from core.inference.video_families import detect_video_family  # noqa: E402
++
++LTX = ("Lightricks/LTX-2.5-Diffusers", "ltx-2.5")
++WAN = ("Wan-AI/Wan2.2-T2V-A14B-Diffusers", "wan2.2-t2v-a14b")
++TI2V = ("Wan-AI/Wan2.2-TI2V-5B-Diffusers", "wan2.2-ti2v-5b")
++GPU_BF16 = types.SimpleNamespace(device = "cuda", dtype = torch.bfloat16, ordinal = 0)
++RESIDENT = types.SimpleNamespace(offload_policy = OFFLOAD_NONE)
++STREAMED = types.SimpleNamespace(offload_policy = OFFLOAD_GROUP, stream_transformer = True)
++ENVS = (
++    tq.ROCM_VIDEO_HOSTED_INT8_ENV,
++    NH.NATIVE_HOSTED_ENV,
++    "UNSLOTH_NATIVE_INT8_ACT",
++    "UNSLOTH_NATIVE_INT8_ROT",
++)
++
++
++def _fam(pair = LTX):
++    fam = detect_video_family(pair[0], override = pair[1])
++    assert fam is not None
++    return fam
++
++
++def _host(
++    monkeypatch,
++    *,
++    rocm: bool,
++    ready: bool = True,
++    proven: bool = True,
++):
++    monkeypatch.setattr(tq, "torch_is_rocm", lambda: rocm)
++    monkeypatch.setattr(tq, "is_stubbed", lambda name: False)
++    monkeypatch.setattr(tq, "rocm_rdna_w8a8_ready", lambda ordinal = None: ready)
++    monkeypatch.setattr(tq, "_rdna_compile_tier_proven", lambda target: proven)
++    for env in ENVS:
++        monkeypatch.delenv(env, raising = False)
++
++
++@pytest.fixture
++def rocm(monkeypatch):
++    _host(monkeypatch, rocm = True)
++
++
++@pytest.fixture
++def nvidia(monkeypatch):
++    _host(monkeypatch, rocm = False)
++
++
++def test_ltx25_carries_the_rdna_explicit_w8a8_evidence():
++    assert "16.17 vs 18.89 s/clip" in str(tq._FAMILY_RDNA_EXPLICIT_W8A8.get("ltx-2.5"))
++    # AUTO is untouched: no AUTO W8A8 row, so gfx1151 AUTO keeps bf16.
++    assert "ltx-2.5" not in tq._FAMILY_RDNA_AUTO_W8A8
++
++
++@pytest.mark.parametrize(
++    "requested, expect",
++    [("int8", "int8"), ("auto", None), (None, None), ("fp8", None), ("off", None)],
++)
++def test_rocm_gate_takes_explicit_int8_only(rocm, requested, expect):
++    assert V._video_rocm_hosted_scheme(_fam(), requested, GPU_BF16) == expect
++
++
++@pytest.mark.parametrize(
++    "env, value",
++    [
++        (tq.ROCM_VIDEO_HOSTED_INT8_ENV, "0"),
++        (tq.ROCM_VIDEO_HOSTED_INT8_ENV, "off"),
++        ("UNSLOTH_NATIVE_INT8_ACT", "0"),
++        (NH.NATIVE_HOSTED_ENV, "0"),
++        ("UNSLOTH_NATIVE_INT8_ROT", "0"),
++    ],
++)
++def test_rocm_kill_switches(rocm, monkeypatch, env, value):
++    monkeypatch.setenv(env, value)
++    assert V._video_rocm_hosted_scheme(_fam(), "int8", GPU_BF16) is None
++
++
++def test_rocm_kill_switch_restores_weight_only(rocm, monkeypatch):
++    assert V._video_int8_act(GPU_BF16, _fam(), "int8") is True
++    monkeypatch.setenv(tq.ROCM_VIDEO_HOSTED_INT8_ENV, "0")
++    assert V._video_int8_act(GPU_BF16, _fam(), "int8") is False
++
++
++@pytest.mark.parametrize("ready, proven", [(False, True), (True, False)])
++def test_rocm_without_the_measured_w8a8_tier_keeps_weight_only(monkeypatch, ready, proven):
++    _host(monkeypatch, rocm = True, ready = ready, proven = proven)
++    assert V._video_rocm_hosted_scheme(_fam(), "int8", GPU_BF16) is None
++    assert V._video_int8_act(GPU_BF16, _fam(), "int8") is False
++
++
++@pytest.mark.parametrize("pair", [WAN, TI2V])
++def test_rocm_other_video_families_are_unchanged(rocm, pair):
++    # Wan A14B's hosted file is a torchao pickle; TI2V-5B has no hosted native file and no W8A8 evidence.
++    assert V._video_rocm_hosted_scheme(_fam(pair), "int8", GPU_BF16) is None
++    assert V._video_int8_act(GPU_BF16, _fam(pair), "int8") is False
++
++
++@pytest.mark.parametrize("requested", ["int8", "auto", None, "fp8"])
++@pytest.mark.parametrize("act", [None, "0", "1"])
++def test_cuda_is_unchanged(nvidia, monkeypatch, requested, act):
++    if act is not None:
++        monkeypatch.setenv("UNSLOTH_NATIVE_INT8_ACT", act)
++    assert V._video_rocm_hosted_scheme(_fam(), requested, GPU_BF16) is None
++    assert V._video_int8_act(GPU_BF16, _fam(), requested) is tq.native_int8_act(GPU_BF16)
++
++
++def test_rocm_auto_and_weight_only_defaults_are_unchanged(rocm):
++    assert tq.native_int8_act(GPU_BF16) is False
++    assert V._video_int8_act(GPU_BF16, _fam(), "auto") is False
++    assert V._video_int8_act(GPU_BF16, _fam(), None) is False
++
++
++def test_resident_spec_is_the_hosted_w8a8_build(rocm):
++    spec = V._video_rocm_hosted_spec(
++        _fam(),
++        target = GPU_BF16,
++        transformer_quant = "int8",
++        plan = RESIDENT,
++        kind = "pipeline",
++        source_dir = None,
++    )
++    assert spec is not None
++    assert spec["scheme"] == "int8" and spec["act_int8"] is True and spec["rot_group"] == 256
++    # An offloaded plan keeps the offload spec, which now also asks for W8A8 on this pick.
++    assert (
++        V._video_rocm_hosted_spec(
++            _fam(),
++            target = GPU_BF16,
++            transformer_quant = "int8",
++            plan = STREAMED,
++            kind = "pipeline",
++            source_dir = None,
++        )
++        is None
++    )
++    off = V._video_native_cache_spec(
++        _fam(),
++        target = GPU_BF16,
++        transformer_quant = "int8",
++        plan = STREAMED,
++        kind = "pipeline",
++        source_dir = None,
++    )
++    assert off is not None and off["act_int8"] is True and spec == off
++    for quant in ("auto", None):
++        assert (
++            V._video_rocm_hosted_spec(
++                _fam(),
++                target = GPU_BF16,
++                transformer_quant = quant,
++                plan = RESIDENT,
++                kind = "pipeline",
++                source_dir = None,
++            )
++            is None
++        )
++
++
++def test_hosted_metadata_check_accepts_the_rocm_spec_and_refuses_weight_only(rocm):
++    from core.inference.diffusion_convrot import (
++        CONVROT_KIND,
++        ROTATION_FQNS_KEY,
++        ROTATION_GROUP_KEY,
++        ROTATION_KEY,
++    )
++
++    spec = V._video_rocm_hosted_spec(
++        _fam(),
++        target = GPU_BF16,
++        transformer_quant = "int8",
++        plan = RESIDENT,
++        kind = "pipeline",
++        source_dir = None,
++    )
++    meta = {
++        "scheme": "int8",
++        "quant_backend": "torchao",
++        "family": "ltx-2.5",
++        "component": "transformer",
++        "torch_dtype": "bfloat16",
++        ROTATION_KEY: CONVROT_KIND,
++        ROTATION_GROUP_KEY: 256,
++        ROTATION_FQNS_KEY: [],
++        "min_features": spec["min_features"],
++        "exclude_name_tokens": [t for t in spec["exclude_name_tokens"] if t != "lora_"],
++    }
++    assert NH.metadata_refusal(meta, spec, family = "ltx-2.5", component = "transformer") is None
++    weight_only = dict(spec, act_int8 = False, rot_group = 0)
++    assert NH.metadata_refusal(meta, weight_only, family = "ltx-2.5", component = "transformer")
++
++
++def _plan(monkeypatch, requested):
++    monkeypatch.setattr(V, "resolve_diffusion_device_target", lambda **k: GPU_BF16)
++    backend = V.VideoBackend.__new__(V.VideoBackend)
++    backend._state = None
++    out: list = []
++    got = backend._video_planned_auto_denoiser_scheme(
++        _fam(),
++        base = LTX[0],
++        kind = "pipeline",
++        transformer_quant = requested,
++        speed_mode = None,
++        native_hosted = out,
++    )
++    return got, out
++
++
++def test_rocm_planner_stages_the_hosted_file_for_explicit_int8(rocm, monkeypatch):
++    # ROCm seeds no torchao checkpoint (dense_transformer_supported is False there).
++    assert not tq.dense_transformer_supported(GPU_BF16)
++    got, out = _plan(monkeypatch, "int8")
++    assert got == V.DENOISER_SEED_DECLINED and out == ["int8"]
++
++
++@pytest.mark.parametrize("requested", ["auto", None])
++def test_rocm_planner_keeps_auto_dense(rocm, monkeypatch, requested):
++    assert _plan(monkeypatch, requested) == (None, [])
++
++
++def test_rocm_planner_kill_switch(rocm, monkeypatch):
++    monkeypatch.setenv(tq.ROCM_VIDEO_HOSTED_INT8_ENV, "0")
++    assert _plan(monkeypatch, "int8") == (None, [])
