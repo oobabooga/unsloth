@@ -1,0 +1,232 @@
+name: "AMD CI: Wan 5B attention fwd+bwd (Studio SDPA vs FeatherAttn, AOTriton 0.15b) on gfx1151 (Linux)"
+
+# Measurement only: no secret is referenced, every download is public. Studio = unsloth origin/main 12cd6693a341.
+
+on:
+  push:
+    branches: [amd-ci-nov22c-attn-train]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  UPSTREAM: "https://github.com/unslothai/unsloth"
+  BASE_SHA: "12cd6693a3413ae2bde214299a5d651760980048"
+  AITER_REPO: "https://github.com/ROCm/aiter"
+  AITER_SHA: "c16d44b93a528b2a4bfd6d8d3409116d465872a9"
+  FEATHER_REPO: "https://github.com/woct0rdho/feather-attn"
+  FEATHER_SHA: "6ef1671c079504ef41c300fac926c1e2a6d60ab6"
+  AOT_URL: "https://github.com/ROCm/aotriton/releases/download/0.15b"
+
+jobs:
+
+  bench:
+    name: "amd:gfx1151-linux attention train bench (exclusive GPU)"
+    runs-on: [self-hosted, Linux, strix-halo, devlab-dispatch]
+    timeout-minutes: 300
+    concurrency:
+      group: amd-ci-gfx1151-gpu
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+        with: { persist-credentials: false }
+
+      - name: Preamble
+        run: |
+          source amd_ci/lib/preamble.sh "attn-train"
+
+      - name: Disk, memory, cores
+        run: |
+          set +e
+          df -h "$RUNNER_TEMP"; free -g; nproc
+          exit 0
+
+      - name: Studio install (install.sh --local at BASE_SHA)
+        timeout-minutes: 60
+        run: |
+          set -euo pipefail
+          git clone -q --filter=blob:none "$UPSTREAM" "$AMD_CI_WORK/repo"
+          git -C "$AMD_CI_WORK/repo" checkout -q --detach "$BASE_SHA"
+          cd "$AMD_CI_WORK/repo"
+          export UNSLOTH_STUDIO_HOME="$AMD_CI_WORK/studio"
+          echo "UNSLOTH_STUDIO_HOME=$UNSLOTH_STUDIO_HOME" >> "$GITHUB_ENV"
+          export UV_EXTRA_INDEX_URL="https://pypi.org/simple"
+          set +e
+          bash install.sh --local 2>&1 | tail -15
+          rc=${PIPESTATUS[0]}
+          set -e
+          [ "$rc" -eq 0 ] || exit "$rc"
+          V=""
+          for c in "$UNSLOTH_STUDIO_HOME"/unsloth_studio "$UNSLOTH_STUDIO_HOME"/.venv_t5_*; do
+            [ -x "$c/bin/python" ] && { V="$c"; break; }
+          done
+          [ -n "$V" ] || { echo "FATAL: no Studio venv"; exit 1; }
+          echo "AMD_CI_PY=$V/bin/python" >> "$GITHUB_ENV"
+          "$V/bin/python" "$GITHUB_WORKSPACE/amd_ci/lib/gate.py" --require rocm gpu \
+            --expect-arch gfx1151 --min-gpus 1 --out "$AMD_CI_WORK/out/host.json"
+          "$V/bin/python" -c "import torch, diffusers, triton; print('studio torch', torch.__version__, 'hip', torch.version.hip, 'diffusers', diffusers.__version__, 'triton', triton.__version__)" | tee "$AMD_CI_WORK/out/stack.txt"
+
+      - name: AOTriton inventory of Studio's torch wheel
+        run: |
+          set +e
+          O="$AMD_CI_WORK/out"
+          TL=$("$AMD_CI_PY" -c "import torch, os; print(os.path.join(os.path.dirname(torch.__file__), 'lib'))")
+          echo "TORCH_LIB=$TL" >> "$GITHUB_ENV"
+          {
+            echo "torch lib: $TL"
+            ls -la "$TL" | grep -i aotriton
+            echo "--- images"
+            ls "$TL/aotriton.images" 2>&1 | head -20
+            echo "--- NEEDED aotriton"
+            for so in "$TL"/libtorch_hip.so "$TL"/libtorch_cuda.so; do [ -f "$so" ] && { echo "$so"; readelf -d "$so" | grep -i -E "aotriton|RUNPATH|RPATH"; }; done
+            echo "--- version strings"
+            for f in "$TL"/libaotriton*; do [ -f "$f" ] && { echo "$f"; readelf -d "$f" | grep SONAME; strings "$f" | grep -E -i "aotriton.*0\.1[0-9]|^0\.1[0-9][.0-9]*b?$" | sort -u | head -10; }; done
+            echo "--- static check in libtorch_hip"
+            strings "$TL/libtorch_hip.so" 2>/dev/null | grep -i -E "aotriton" | sort -u | head -15
+          } > "$O/aotriton_inventory.txt" 2>&1
+          cat "$O/aotriton_inventory.txt"
+          exit 0
+
+      - name: Build deps (rocm[devel], AITER JIT, CK headers, FeatherAttn)
+        timeout-minutes: 120
+        run: |
+          set +e
+          O="$AMD_CI_WORK/out"
+          "$AMD_CI_PY" -m pip --version > /dev/null 2>&1 || "$AMD_CI_PY" -m ensurepip -q
+          "$AMD_CI_PY" -m pip list --format=freeze 2>/dev/null | grep -i -E "^(torch|torchvision|torchaudio|triton|pytorch-triton-rocm|rocm|rocm-sdk-core|rocm-sdk-libraries[^=]*)==" > "$O/pins.txt"
+          cat "$O/pins.txt"
+          RV=$("$AMD_CI_PY" -c "import importlib.metadata as m; print(m.version('rocm'))")
+          for IDX in https://repo.amd.com/rocm/whl/gfx1151/ https://rocm.nightlies.amd.com/v2/gfx1151/; do
+            "$AMD_CI_PY" -m pip install "rocm[devel]==$RV" -c "$O/pins.txt" --extra-index-url "$IDX" >> "$O/rocm_devel.log" 2>&1 && { echo "rocm[devel]==$RV from $IDX"; break; }
+          done
+          VBIN=$(dirname "$AMD_CI_PY")
+          ROOT=$("$VBIN/rocm-sdk" path --root 2>>"$O/rocm_devel.log")
+          [ -n "$ROOT" ] || ROOT=$("$AMD_CI_PY" -m rocm_sdk path --root 2>>"$O/rocm_devel.log")
+          echo "ROCm SDK root: '$ROOT'"
+          export ROCM_HOME="$ROOT" ROCM_PATH="$ROOT" HIP_PATH="$ROOT" PATH="$ROOT/bin:$ROOT/lib/llvm/bin:$PATH"
+          { echo "ROCM_HOME=$ROOT"; echo "ROCM_PATH=$ROOT"; echo "HIP_PATH=$ROOT"; echo "PATH=$ROOT/bin:$ROOT/lib/llvm/bin:$PATH"; } >> "$GITHUB_ENV"
+          echo "hipcc: $(command -v hipcc)"; hipcc --version 2>&1 | head -3
+          "$AMD_CI_PY" -m pip install -q -c "$O/pins.txt" setuptools wheel packaging psutil ninja einops pandas pyyaml \
+            "pybind11>=3.0.1" setuptools_scm vcs_versioning "flydsl==0.3.1" > "$O/aiter_deps.log" 2>&1
+          echo "aiter deps rc=$?"
+          git clone -q "$AITER_REPO" "$AMD_CI_WORK/src/aiter"
+          git -C "$AMD_CI_WORK/src/aiter" checkout -q "$AITER_SHA"
+          (cd "$AMD_CI_WORK/src/aiter" && git submodule update --init --recursive > "$O/aiter_submodules.log" 2>&1)
+          export AITER_JIT_DIR="$AMD_CI_WORK/aiter_jit" GPU_ARCHS=gfx1151 MAX_JOBS=$(nproc)
+          mkdir -p "$AITER_JIT_DIR"
+          { echo "AITER_JIT_DIR=$AITER_JIT_DIR"; echo "GPU_ARCHS=gfx1151"; echo "ENABLE_CK=0"; } >> "$GITHUB_ENV"
+          T0=$(date +%s)
+          (cd "$AMD_CI_WORK/src/aiter" && "$AMD_CI_PY" -m pip install -v --no-build-isolation --no-deps -c "$O/pins.txt" \
+            --config-settings editable_mode=compat -e . > "$O/aiter_build.log" 2>&1)
+          echo "aiter install rc=$? in $(( $(date +%s) - T0 )) s"; tail -2 "$O/aiter_build.log"
+          # CK headers: the SDK's own if it ships ck_tile, else a sparse rocm-libraries checkout
+          if [ -f "$ROOT/include/ck_tile/core.hpp" ]; then
+            CKR="$AMD_CI_WORK/src/ck_sdk"; mkdir -p "$CKR"; ln -s "$ROOT/include" "$CKR/include"; echo "CK: SDK headers"
+          else
+            git clone -q --depth 1 --filter=blob:none --sparse https://github.com/ROCm/rocm-libraries "$AMD_CI_WORK/src/rocm-libraries"
+            git -C "$AMD_CI_WORK/src/rocm-libraries" sparse-checkout set projects/composablekernel/include > /dev/null 2>&1
+            CKR="$AMD_CI_WORK/src/rocm-libraries/projects/composablekernel"
+            echo "CK: rocm-libraries $(git -C "$AMD_CI_WORK/src/rocm-libraries" log -1 --format=%H)"
+          fi
+          ls "$CKR/include/ck_tile/core.hpp"
+          git clone -q "$FEATHER_REPO" "$AMD_CI_WORK/src/feather-attn"
+          git -C "$AMD_CI_WORK/src/feather-attn" checkout -q "$FEATHER_SHA"
+          export FEATHER_ATTN_CK_ROOT="$CKR" PYTORCH_ROCM_ARCH=gfx1151
+          T0=$(date +%s)
+          (cd "$AMD_CI_WORK/src/feather-attn" && "$AMD_CI_PY" -m pip install -v --no-build-isolation --no-deps . > "$O/feather_build.log" 2>&1)
+          rc=$?
+          if [ "$rc" -ne 0 ]; then
+            echo "feather build rc=$rc; retry without -Werror"; grep -m8 -E "error" "$O/feather_build.log" | cut -c1-300
+            sed -i 's/"-Werror",//' "$AMD_CI_WORK/src/feather-attn/setup.py"
+            (cd "$AMD_CI_WORK/src/feather-attn" && "$AMD_CI_PY" -m pip install -v --no-build-isolation --no-deps . > "$O/feather_build2.log" 2>&1)
+            rc=$?; echo "feather_werror_dropped=1" >> "$O/feather_notes.txt"
+            grep -m8 -E "error" "$O/feather_build2.log" | cut -c1-300
+          fi
+          echo "feather install rc=$rc in $(( $(date +%s) - T0 )) s"
+          cd "$AMD_CI_WORK"
+          "$AMD_CI_PY" -c "import feather_attn; print('feather ok', feather_attn.__file__)" 2>&1 | tail -3
+          "$AMD_CI_PY" -m pip list 2>/dev/null | grep -i -E "^(torch|triton|rocm|amd-aiter|feather|diffusers)" | tee "$O/pkgs_after.txt"
+          exit 0
+
+      - name: Bench A (Studio's shipping AOTriton; all arms)
+        timeout-minutes: 75
+        run: |
+          set +e
+          unset CI
+          export TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL=1
+          cd "$AMD_CI_WORK"
+          rocm-smi --showmeminfo vram 2>/dev/null | tail -5
+          timeout 4200 "$AMD_CI_PY" "$GITHUB_WORKSPACE/bench/attn_train_bench.py" --tag shipping \
+            --out "$AMD_CI_WORK/out/bench_shipping.json" > "$AMD_CI_WORK/out/bench_shipping.log" 2>&1
+          echo "bench rc=$?"; tail -20 "$AMD_CI_WORK/out/bench_shipping.log"
+          exit 0
+
+      - name: Bench B (AOTriton 0.15b swapped in; SDPA arms), then restore and re-run (A/B/A)
+        timeout-minutes: 80
+        run: |
+          set +e
+          unset CI
+          export TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL=1
+          O="$AMD_CI_WORK/out"; D="$AMD_CI_WORK/aot015"; mkdir -p "$D"
+          cd "$AMD_CI_WORK"
+          curl -sSfL -o "$D/shared.tgz" "$AOT_URL/aotriton-0.15b-manylinux_2_28_x86_64-rocm7.14-shared.tar.gz" && \
+          curl -sSfL -o "$D/images.tgz" "$AOT_URL/aotriton-0.15b-images-amd-gfx115x.tar.gz"
+          echo "download rc=$?"
+          tar xzf "$D/shared.tgz" -C "$D" && tar xzf "$D/images.tgz" -C "$D"
+          NEW=$(find "$D" -name 'libaotriton_v2.so.0.15*' -type f | head -1)
+          IMG=$(find "$D" -type d -name aotriton.images | head -1)
+          OLD=$(find "$TORCH_LIB" -maxdepth 1 -name 'libaotriton_v2.so*' -type f | head -1)
+          echo "new=$NEW img=$IMG old=$OLD" | tee "$O/aot_swap.txt"
+          ls "$IMG" | tee -a "$O/aot_swap.txt"
+          if [ -z "$NEW" ] || [ -z "$IMG" ] || [ -z "$OLD" ] || [ ! -d "$TORCH_LIB/aotriton.images" ]; then
+            echo "SWAP_NOT_POSSIBLE (bundled AOTriton not a separate shared lib + images, or download failed)" | tee -a "$O/aot_swap.txt"
+            exit 0
+          fi
+          mkdir -p "$D/backup"
+          cp -a "$OLD" "$D/backup/" && cp -a "$TORCH_LIB/aotriton.images" "$D/backup/"
+          cp -f "$NEW" "$OLD"
+          rm -rf "${TORCH_LIB:?}/aotriton.images"
+          cp -a "$IMG" "$TORCH_LIB/aotriton.images"
+          echo "swapped: $(basename "$OLD") <- $(basename "$NEW")" | tee -a "$O/aot_swap.txt"
+          timeout 3000 "$AMD_CI_PY" "$GITHUB_WORKSPACE/bench/attn_train_bench.py" --tag aot015 --arms studio,studio_A2,sdpa_contig \
+            --out "$O/bench_aot015.json" > "$O/bench_aot015.log" 2>&1
+          echo "bench aot015 rc=$?"; tail -20 "$O/bench_aot015.log"
+          cp -f "$D/backup/$(basename "$OLD")" "$OLD"
+          rm -rf "${TORCH_LIB:?}/aotriton.images"
+          cp -a "$D/backup/aotriton.images" "$TORCH_LIB/aotriton.images"
+          echo "restored" | tee -a "$O/aot_swap.txt"
+          timeout 3000 "$AMD_CI_PY" "$GITHUB_WORKSPACE/bench/attn_train_bench.py" --tag restored --arms studio,studio_A2,sdpa_contig --no-ref \
+            --out "$O/bench_restored.json" > "$O/bench_restored.log" 2>&1
+          echo "bench restored rc=$?"; tail -5 "$O/bench_restored.log"
+          exit 0
+
+      - name: Stop anything this job started
+        if: always()
+        run: |
+          set +e
+          W="${AMD_CI_WORK:-}"
+          case "$W" in /?*/?*) ;; *) echo "no usable AMD_CI_WORK root ('$W'): nothing to stop"; exit 0 ;; esac
+          [ -d "$W" ] || exit 0
+          W="${W%/}"
+          for sig in TERM KILL; do
+            for d in /proc/[0-9]*; do
+              pid=${d#/proc/}
+              [ "$pid" = "$$" ] && continue
+              cwd=$(readlink "$d/cwd" 2>/dev/null)
+              case "$cwd" in
+                "$W"|"$W"/*) echo "$sig pid $pid (cwd $cwd)"; kill -$sig "$pid" 2>/dev/null ;;
+              esac
+            done
+            sleep 5
+          done
+          exit 0
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: attn-train
+          path: |
+            ${{ env.AMD_CI_WORK }}/out
+          retention-days: 14
+          if-no-files-found: warn
