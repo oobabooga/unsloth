@@ -1,0 +1,129 @@
+name: "AMD CI: gfx1151 training contiguous q/k/v, base vs head (Linux)"
+
+# Measurement only: no secret is referenced, every download is public. base = unsloth origin/main BASE_SHA,
+# head = BASE_SHA + patch/head.diff. Each arm is a fresh process; arms interleave.
+
+on:
+  push:
+    branches: [amd-ci-rtc-train-contig]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  UPSTREAM: "https://github.com/unslothai/unsloth"
+  BASE_SHA: "2bdf8913307d3300d7d624589318dcdc63383a58"
+  PLAN: "flux2k_1024:base,head,kill,base"
+  MICRO: "1"
+  STEPS: "20"
+
+jobs:
+
+  bench:
+    name: "amd:gfx1151-linux train contiguous qkv (exclusive GPU)"
+    runs-on: [self-hosted, Linux, strix-halo, devlab-dispatch]
+    timeout-minutes: 330
+    concurrency:
+      group: amd-ci-gfx1151-gpu
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+        with: { persist-credentials: false }
+
+      - name: Preamble
+        run: |
+          source amd_ci/lib/preamble.sh "rtc"
+
+      - name: Disk, memory, cores
+        run: |
+          set +e
+          df -h "$RUNNER_TEMP"; free -g; nproc
+          exit 0
+
+      - name: Studio install (install.sh --local at BASE_SHA) and head tree
+        timeout-minutes: 60
+        run: |
+          set -euo pipefail
+          git clone -q --filter=blob:none "$UPSTREAM" "$AMD_CI_WORK/repo"
+          git -C "$AMD_CI_WORK/repo" checkout -q --detach "$BASE_SHA"
+          git -C "$AMD_CI_WORK/repo" worktree add -q --detach "$AMD_CI_WORK/head" "$BASE_SHA"
+          git -C "$AMD_CI_WORK/head" apply "$GITHUB_WORKSPACE/patch/head.diff"
+          git -C "$AMD_CI_WORK/head" status --short
+          cd "$AMD_CI_WORK/repo"
+          export UNSLOTH_STUDIO_HOME="$AMD_CI_WORK/studio"
+          echo "UNSLOTH_STUDIO_HOME=$UNSLOTH_STUDIO_HOME" >> "$GITHUB_ENV"
+          export UV_EXTRA_INDEX_URL="https://pypi.org/simple"
+          set +e
+          bash install.sh --local 2>&1 | tail -15
+          rc=${PIPESTATUS[0]}
+          set -e
+          [ "$rc" -eq 0 ] || exit "$rc"
+          V=""
+          for c in "$UNSLOTH_STUDIO_HOME"/unsloth_studio "$UNSLOTH_STUDIO_HOME"/.venv_t5_*; do
+            [ -x "$c/bin/python" ] && { V="$c"; break; }
+          done
+          [ -n "$V" ] || { echo "FATAL: no Studio venv"; exit 1; }
+          echo "AMD_CI_PY=$V/bin/python" >> "$GITHUB_ENV"
+          "$V/bin/python" "$GITHUB_WORKSPACE/amd_ci/lib/gate.py" --require rocm gpu \
+            --expect-arch gfx1151 --min-gpus 1 --out "$AMD_CI_WORK/out/host.json"
+          "$V/bin/python" -c "import torch, diffusers, triton; print('studio torch', torch.__version__, 'hip', torch.version.hip, 'diffusers', diffusers.__version__, 'triton', triton.__version__)" | tee "$AMD_CI_WORK/out/stack.txt"
+
+      - name: Head CPU tests (gating, threshold, kill switch)
+        timeout-minutes: 15
+        env:
+          HIP_VISIBLE_DEVICES: ""
+          ROCR_VISIBLE_DEVICES: ""
+        run: |
+          set +e
+          cd "$AMD_CI_WORK/head/studio/backend"
+          "$AMD_CI_PY" -m pip install -q pytest > /dev/null 2>&1
+          "$AMD_CI_PY" -m pytest -q -p no:cacheprovider tests/test_diffusion_rocm_train_contiguous_qkv.py \
+            tests/test_diffusion_attention_rocm_contiguous_kv.py tests/test_diffusion_rocm_tag_detect.py \
+            > "$AMD_CI_WORK/out/head_pytest.log" 2>&1
+          echo "pytest rc=$?"; tail -5 "$AMD_CI_WORK/out/head_pytest.log"
+          exit 0
+
+      - name: Bench
+        timeout-minutes: 240
+        run: |
+          set +e
+          unset CI
+          export TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL=1
+          cd "$AMD_CI_WORK"
+          M=""; [ "$MICRO" = "1" ] && M="--micro"
+          timeout 14000 "$AMD_CI_PY" "$GITHUB_WORKSPACE/bench/train_contig_bench.py" $M --plan "$PLAN" --steps "$STEPS" \
+            --base "$AMD_CI_WORK/repo" --head "$AMD_CI_WORK/head" --work "$AMD_CI_WORK/bench" \
+            --out "$AMD_CI_WORK/out/bench.json" > "$AMD_CI_WORK/out/bench.log" 2>&1
+          echo "bench rc=$?"; tail -40 "$AMD_CI_WORK/out/bench.log"
+          exit 0
+
+      - name: Stop anything this job started
+        if: always()
+        run: |
+          set +e
+          W="${AMD_CI_WORK:-}"
+          case "$W" in /?*/?*) ;; *) echo "no usable AMD_CI_WORK root ('$W'): nothing to stop"; exit 0 ;; esac
+          [ -d "$W" ] || exit 0
+          W="${W%/}"
+          for sig in TERM KILL; do
+            for d in /proc/[0-9]*; do
+              pid=${d#/proc/}
+              [ "$pid" = "$$" ] && continue
+              cwd=$(readlink "$d/cwd" 2>/dev/null)
+              case "$cwd" in
+                "$W"|"$W"/*) echo "$sig pid $pid (cwd $cwd)"; kill -$sig "$pid" 2>/dev/null ;;
+              esac
+            done
+            sleep 5
+          done
+          exit 0
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: rtc-train-contig
+          path: |
+            ${{ env.AMD_CI_WORK }}/out
+          retention-days: 14
+          if-no-files-found: warn

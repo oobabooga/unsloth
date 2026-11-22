@@ -1,0 +1,166 @@
+{
+ "shapes": {
+  "qwen21_1024": {
+   "B": 1,
+   "Sq": 4096,
+   "Sk": 4127,
+   "H": 32,
+   "D": 128,
+   "layout": "packed",
+   "source": "derived: Qwen/Qwen-Image-2.1 transformer/config.json num_attention_heads=32, attention_head_dim=128, patch_size=1; vae/config.json scale_factor_spatial=16. 1024x1024 -> (1024/16)^2 = 4096 image tokens. Single-stream DiT with block-causal mask and prefix KV cache (diffusers transformer_qwenimage21.py): the dominant per-step call is target-image queries over [text prefix + image] keys, so Sq=4096, Sk=4096+31=4127. Text = 31 tokens (model-card example prompt, 23 prompt tokens + 8 user/assistant template tokens after the system prefix is dropped, measured with the repo tokenizer); first step also has a 31-token causal text prefill call."
+  },
+  "qwen21_1328": {
+   "B": 1,
+   "Sq": 6724,
+   "Sk": 6755,
+   "H": 32,
+   "D": 128,
+   "layout": "packed",
+   "source": "derived: Qwen/Qwen-Image-2.1 transformer/config.json num_attention_heads=32, attention_head_dim=128, patch_size=1; vae/config.json scale_factor_spatial=16. 1328 is rounded down to 1312 by the pipeline (multiple of vae_scale_factor*2=32), 1312x1312 -> (1312/16)^2 = 6724 image tokens. Single-stream DiT with block-causal mask and prefix KV cache (diffusers transformer_qwenimage21.py): the dominant per-step call is target-image queries over [text prefix + image] keys, so Sq=6724, Sk=6724+31=6755. Text = 31 tokens (model-card example prompt, 23 prompt tokens + 8 user/assistant template tokens after the system prefix is dropped, measured with the repo tokenizer); first step also has a 31-token causal text prefill call."
+  },
+  "qwen21_2048": {
+   "B": 1,
+   "Sq": 16384,
+   "Sk": 16415,
+   "H": 32,
+   "D": 128,
+   "layout": "packed",
+   "source": "derived: Qwen/Qwen-Image-2.1 transformer/config.json num_attention_heads=32, attention_head_dim=128, patch_size=1; vae/config.json scale_factor_spatial=16. 2048x2048 -> (2048/16)^2 = 16384 image tokens. Single-stream DiT with block-causal mask and prefix KV cache (diffusers transformer_qwenimage21.py): the dominant per-step call is target-image queries over [text prefix + image] keys, so Sq=16384, Sk=16384+31=16415. Text = 31 tokens (model-card example prompt, 23 prompt tokens + 8 user/assistant template tokens after the system prefix is dropped, measured with the repo tokenizer); first step also has a 31-token causal text prefill call. 2048x2048 is the model card's native 1:1 size (extra entry)."
+  },
+  "ltx25_480p": {
+   "B": 1,
+   "Sq": 6240,
+   "Sk": 6240,
+   "H": 32,
+   "D": 128,
+   "layout": "packed",
+   "source": "derived: Lightricks/LTX-2.5-Diffusers transformer/config.json num_attention_heads=32, attention_head_dim=128, patch_size=1, patch_size_t=1; vae/config.json spatial_compression_ratio=32, temporal_compression_ratio=8. 832x480x121f (pipeline default num_frames=121 @24fps; 480p as 832x480) -> 15x26x16 = 6240 video tokens (attn1 video self-attn). Text is cross-attention (attn2), not joined."
+  },
+  "ltx25_720p": {
+   "B": 1,
+   "Sq": 14080,
+   "Sk": 14080,
+   "H": 32,
+   "D": 128,
+   "layout": "packed",
+   "source": "derived: Lightricks/LTX-2.5-Diffusers transformer/config.json num_attention_heads=32, attention_head_dim=128, patch_size=1, patch_size_t=1; vae/config.json spatial_compression_ratio=32, temporal_compression_ratio=8. 1280x704x121f (pipeline default num_frames=121 @24fps; 720 not divisible by 32 so 704) -> 22x40x16 = 14080 video tokens (attn1 video self-attn). Text is cross-attention (attn2), not joined."
+  },
+  "ltx25_audio_5s": {
+   "B": 1,
+   "Sq": 126,
+   "Sk": 126,
+   "H": 32,
+   "D": 64,
+   "layout": "packed",
+   "source": "derived: Lightricks/LTX-2.5-Diffusers transformer/config.json audio_num_attention_heads=32, audio_attention_head_dim=64, audio_patch_size=1; audio_vae/config.json sample_rate=16000, mel_hop_length=160, temporal downsample 4 -> 25 latents/s; 121f/24fps = 5.04 s -> round(5.04*25) = 126 audio tokens (audio_attn1 self-attn, independent of video resolution). Audio-video cross-attn (audio_to_video_attn / video_to_audio_attn, 32x64) has Sq!=Sk and is not listed."
+  },
+  "h3v_480p_5s": {
+   "B": 1,
+   "Sq": 12090,
+   "Sk": 12090,
+   "H": 56,
+   "D": 128,
+   "layout": "packed",
+   "source": "derived: MiniMaxAI/MiniMax-H3 transformer/config.json num_attention_heads=56, attention_head_dim=128, patch_size=[1,2,2]; vae/config.json spatial_downsample_factors prod=16, temporal_downsample_factors prod=4. 832x480 x 124 frames (5 s @24fps snapped to 17n+5, same frame count as h3_video_5s) -> 15x26x31 = 12090 video tokens. Same convention as rc h3_video_5s: text/audio rows of the packed sequence not included."
+  },
+  "wan22_5b_480p": {
+   "B": 1,
+   "Sq": 12090,
+   "Sk": 12090,
+   "H": 24,
+   "D": 128,
+   "layout": "packed",
+   "source": "derived: Wan-AI/Wan2.2-TI2V-5B-Diffusers transformer/config.json num_attention_heads=24, attention_head_dim=128, patch_size=[1,2,2]; vae/config.json scale_factor_spatial=16, scale_factor_temporal=4. 832x480x121f (5B default 121 frames @24fps; 480p not an official 5B size) -> 15x26x31 = 12090. Text is cross-attention, not joined."
+  },
+  "wan22_5b_720p": {
+   "B": 1,
+   "Sq": 27280,
+   "Sk": 27280,
+   "H": 24,
+   "D": 128,
+   "layout": "packed",
+   "source": "derived: Wan-AI/Wan2.2-TI2V-5B-Diffusers transformer/config.json num_attention_heads=24, attention_head_dim=128, patch_size=[1,2,2]; vae/config.json scale_factor_spatial=16, scale_factor_temporal=4. 1280x704x121f (5B default 121 frames @24fps; official 720p size 1280x704) -> 22x40x31 = 27280. Text is cross-attention, not joined."
+  },
+  "zimage_1024": {
+   "B": 1,
+   "Sq": 4128,
+   "Sk": 4128,
+   "H": 30,
+   "D": 128,
+   "layout": "packed",
+   "source": "derived: Tongyi-MAI/Z-Image transformer/config.json dim=3840, n_heads=30 -> head dim 3840/30=128, all_patch_size=[2]; vae/config.json AutoencoderKL 4 blocks -> 8x. 1024x1024 -> (1024/16)^2 = 4096 image tokens + caption padded to SEQ_MULTI_OF=32 (31-token model-card-style prompt incl. chat template -> 32) = 4128, single-stream joint attention in the 30 main layers (2 noise-refiner layers are image-only 4096). Resolution up to 2048 per model card."
+  },
+  "zimage_2048": {
+   "B": 1,
+   "Sq": 16416,
+   "Sk": 16416,
+   "H": 30,
+   "D": 128,
+   "layout": "packed",
+   "source": "derived: Tongyi-MAI/Z-Image transformer/config.json dim=3840, n_heads=30 -> head dim 3840/30=128, all_patch_size=[2]; vae/config.json AutoencoderKL 4 blocks -> 8x. 2048x2048 -> (2048/16)^2 = 16384 image tokens + caption padded to SEQ_MULTI_OF=32 (31-token model-card-style prompt incl. chat template -> 32) = 16416, single-stream joint attention in the 30 main layers (2 noise-refiner layers are image-only 16384). Resolution up to 2048 per model card."
+  },
+  "s1k_h24": {
+   "B": 1,
+   "Sq": 1039,
+   "Sk": 1039,
+   "H": 24,
+   "D": 128,
+   "layout": "packed",
+   "source": "synthetic: fills the 1k-4k token range between model shapes"
+  },
+  "s2k_h56": {
+   "B": 1,
+   "Sq": 2048,
+   "Sk": 2048,
+   "H": 56,
+   "D": 128,
+   "layout": "packed",
+   "source": "synthetic: fills the 1k-4k token range between model shapes"
+  },
+  "s3k_h56": {
+   "B": 1,
+   "Sq": 3072,
+   "Sk": 3072,
+   "H": 56,
+   "D": 128,
+   "layout": "packed",
+   "source": "synthetic: fills the 1k-4k token range between model shapes"
+  },
+  "s1k_d64": {
+   "B": 1,
+   "Sq": 1039,
+   "Sk": 1039,
+   "H": 32,
+   "D": 64,
+   "layout": "packed",
+   "source": "synthetic: fills the 1k-4k token range between model shapes"
+  },
+  "s2k_d64": {
+   "B": 1,
+   "Sq": 2048,
+   "Sk": 2048,
+   "H": 32,
+   "D": 64,
+   "layout": "packed",
+   "source": "synthetic: fills the 1k-4k token range between model shapes"
+  },
+  "wan22_a14b_720p": {
+   "B": 1,
+   "Sq": 75600,
+   "Sk": 75600,
+   "H": 40,
+   "D": 128,
+   "layout": "packed",
+   "source": "derived: Wan2.2 A14B (40 heads x 128) 1280x720x81f: 21 latent frames x 45 x 80 = 75600 tokens (the 75k end of the range)"
+  },
+  "wan22_5b_720p_even": {
+   "B": 1,
+   "Sq": 27264,
+   "Sk": 27264,
+   "H": 24,
+   "D": 128,
+   "layout": "packed",
+   "source": "control: wan22_5b_720p less 16 keys, a whole number of 32-key tiles (no partial tile)"
+  }
+ }
+}
