@@ -1,0 +1,67 @@
+{
+ "vm": {
+  "vm_id": "amd-gfx1151-linux-1",
+  "target": "amd:gfx1151-linux",
+  "kind": "amd",
+  "gpu": "gfx1151",
+  "lanes": 1,
+  "lane_mode": "single",
+  "lane_mode_effective": "single",
+  "purpose": "timing",
+  "account": null,
+  "comparisons": [
+   "flux-3-klein_amd-gfx1151-linux"
+  ],
+  "slots": [
+   [
+    {
+     "tag": "trial__amd-gfx1151-linux-1",
+     "lane": 0,
+     "stack": "studio",
+     "timed": false,
+     "comparison": null,
+     "est_min": 1.25,
+     "trial": true
+    }
+   ],
+   [
+    {
+     "tag": "flux-3-klein_amd-gfx1151-linux__s_int8_int8__k1p0",
+     "lane": 0,
+     "stack": "studio",
+     "timed": true,
+     "family": "flux.3-klein",
+     "comparison": "flux-3-klein_amd-gfx1151-linux",
+     "est_min": 2.5
+    }
+   ],
+   [
+    {
+     "tag": "flux-3-klein_amd-gfx1151-linux__s_int8_int8__k1p1",
+     "lane": 0,
+     "stack": "studio",
+     "timed": true,
+     "family": "flux.3-klein",
+     "comparison": "flux-3-klein_amd-gfx1151-linux",
+     "est_min": 2.5
+    }
+   ],
+   [
+    {
+     "tag": "flux-3-klein_amd-gfx1151-linux__s_int8_int8__k1p2",
+     "lane": 0,
+     "stack": "studio",
+     "timed": true,
+     "family": "flux.3-klein",
+     "comparison": "flux-3-klein_amd-gfx1151-linux",
+     "est_min": 2.5
+    }
+   ]
+  ],
+  "est_min": 68.8,
+  "est_cu": 0.0
+ },
+ "base_sha": "d480a0ade9c1f5e6a3fd67feb519c347c0ab3c09",
+ "bline_ref": "v0.46.2",
+ "branch": "amd-ci-nov22-rimg1"
+}
