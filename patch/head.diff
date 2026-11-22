@@ -1,5 +1,5 @@
 diff --git a/studio/backend/core/inference/diffusion_attention.py b/studio/backend/core/inference/diffusion_attention.py
-index fa8d8a7d21..e4224170a5 100644
+index fa8d8a7d21..e72d865dbc 100644
 --- a/studio/backend/core/inference/diffusion_attention.py
 +++ b/studio/backend/core/inference/diffusion_attention.py
 @@ -648,6 +648,58 @@ def _heads_major(t: Any) -> Any:
@@ -72,7 +72,7 @@ index fa8d8a7d21..e4224170a5 100644
  
          device = torch.device(
              _indexed_cuda_device(
-@@ -672,39 +720,79 @@ def install_rocm_contiguous_kv(target: Any) -> bool:
+@@ -672,39 +720,84 @@ def install_rocm_contiguous_kv(target: Any) -> bool:
          )
          index = device.index if device.index is not None else torch.cuda.current_device()
          l2 = int(getattr(torch.cuda.get_device_properties(index), "L2_cache_size", 0) or 0)
@@ -118,11 +118,16 @@ index fa8d8a7d21..e4224170a5 100644
 +
 +
 +def _rocm_contiguous_qkv_wanted(query: Any, key: Any, value: Any) -> bool:
-+    """Training on gfx1151: q and k both at least the token floor (self / joint attention, not short cross-attention)."""
++    """Training on gfx1151: grad on (the measured fwd+bwd; sample renders keep their path), q and k both at least the
++    token floor (self / joint attention, not short cross-attention)."""
 +    if not _ROCM_CONTIGUOUS_QKV_TRAIN:
 +        return False
      try:
 -        backends[AttentionBackendName.NATIVE] = _contiguous_kv
++        import torch
++
++        if not torch.is_grad_enabled():
++            return False
 +        floor = _ROCM_CONTIGUOUS_QKV_TRAIN.get(query.device.index)
 +        if floor is None or query.dim() != 4 or key.dim() != 4 or value.dim() != 4:
 +            return False
@@ -208,10 +213,10 @@ index bbd2a298a4..3b4f63f820 100644
  
 diff --git a/studio/backend/tests/test_diffusion_rocm_train_contiguous_qkv.py b/studio/backend/tests/test_diffusion_rocm_train_contiguous_qkv.py
 new file mode 100644
-index 0000000000..8456363e84
+index 0000000000..fcd257decb
 --- /dev/null
 +++ b/studio/backend/tests/test_diffusion_rocm_train_contiguous_qkv.py
-@@ -0,0 +1,194 @@
+@@ -0,0 +1,198 @@
 +# SPDX-License-Identifier: AGPL-3.0-only
 +# Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
 +
@@ -333,6 +338,10 @@ index 0000000000..8456363e84
 +    )  # a 1,024 px Wan still (1,024 tokens), a 512 px FLUX.2 (1,536)
 +    assert not da._rocm_contiguous_qkv_wanted(at, text, text)  # cross-attention to a short text
 +    assert not da._rocm_contiguous_qkv_wanted(at.flatten(2), at, at)
++    with torch.no_grad():
++        assert not da._rocm_contiguous_qkv_wanted(
++            at, at, at
++        )  # sample renders inside a run keep their path
 +    monkeypatch.setattr(da, "_ROCM_CONTIGUOUS_QKV_TRAIN", {5: floor})
 +    assert not da._rocm_contiguous_qkv_wanted(
 +        at, at, at
