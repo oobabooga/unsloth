@@ -1,0 +1,87 @@
+name: "AMD CI: sd.cpp Vulkan AMD picks 0070 on gfx1151 (lnx, nov21)"
+
+on:
+  push:
+    branches: [amd-ci-nov21-vkpicks-lnx]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+
+  build:
+    name: "build sd.cpp Vulkan base + head (ubuntu-22.04)"
+    runs-on: ubuntu-22.04
+    timeout-minutes: 120
+    env:
+      VULKAN_VERSION: 1.4.328.1
+      VULKAN_SHA256: 241e75b56c91c0d210ed07a7c638ec05a3e5b0e4c66ba9f0ba0f102d823ad6bf
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
+      - name: Vulkan SDK
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq && sudo apt-get install -y -qq libvulkan-dev xz-utils
+          a="$RUNNER_TEMP/vk.tar.xz"; r="$RUNNER_TEMP/vksdk"
+          curl --fail --location --retry 3 -o "$a" "https://sdk.lunarg.com/sdk/download/${VULKAN_VERSION}/linux/vulkansdk-linux-x86_64-${VULKAN_VERSION}.tar.xz"
+          echo "$VULKAN_SHA256  $a" | sha256sum --check --strict
+          mkdir -p "$r" && tar -xJf "$a" -C "$r" --strip-components=1
+          echo "VULKAN_SDK=$r/x86_64" >> "$GITHUB_ENV"; echo "$r/x86_64/bin" >> "$GITHUB_PATH"
+      - name: Build
+        run: |
+          set -euo pipefail
+          W="$RUNNER_TEMP/w"; mkdir -p "$W"
+          git clone -q --filter=blob:none https://github.com/unslothai/stable-diffusion.cpp "$W/src"
+          git -C "$W/src" checkout -q 27b9ddc
+          git -C "$W/src" submodule update --init --depth 1 ggml
+          for arm in base head; do
+            cp -r "$W/src" "$W/$arm"
+            for p in "$W/$arm"/scripts/unsloth/ggml-patches/*.patch; do git -C "$W/$arm/ggml" apply "$p"; done
+            if [ $arm = head ]; then git -C "$W/$arm/ggml" apply "$GITHUB_WORKSPACE/amd_ci/vkpicks/0070-ggml-vulkan-amd-large-tile-split-k.patch"; fi
+            git -C "$W/$arm/ggml" diff --stat | tail -1
+            cmake -S "$W/$arm" -B "$W/b_$arm" -DCMAKE_BUILD_TYPE=Release -DSD_VULKAN=ON -DGGML_NATIVE=OFF \
+              -DGGML_BUILD_TESTS=ON -DSD_WEBP=OFF -DSD_WEBM=OFF -DSD_SERVER_BUILD_FRONTEND=OFF > "$W/cfg_$arm.log"
+            cmake --build "$W/b_$arm" -j "$(nproc)" --target sd-cli test-backend-ops > "$W/build_$arm.log"
+            mkdir -p "dist/$arm"; cp "$W/b_$arm"/bin/sd-cli "$W/b_$arm"/bin/test-backend-ops "dist/$arm/"
+            git -C "$W/$arm/ggml" diff | sha256sum > "dist/$arm/ggml_patch.sha256"
+          done
+          ls -la dist/*
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
+        with:
+          name: vkpicks-bin-linux
+          path: dist
+          retention-days: 3
+
+  gfx1151:
+    name: "gfx1151 Linux RADV: sd.cpp 0070 base vs head (exclusive GPU)"
+    needs: build
+    runs-on: [self-hosted, Linux, strix-halo, devlab-dispatch]
+    timeout-minutes: 240
+    concurrency:
+      group: amd-ci-gfx1151-gpu
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4.3.0
+        with:
+          name: vkpicks-bin-linux
+          path: ${{ runner.temp }}/bin
+      - name: Probe
+        run: |
+          set +e
+          chmod +x "$RUNNER_TEMP"/bin/*/*
+          OUT="$RUNNER_TEMP/out"; mkdir -p "$OUT"
+          (command -v vulkaninfo && vulkaninfo --summary) > "$OUT/vulkaninfo.txt" 2>&1
+          PY=python3
+          if python3 -m venv "$RUNNER_TEMP/v" >/dev/null 2>&1 && "$RUNNER_TEMP/v/bin/pip" install -q pillow numpy >/dev/null 2>&1; then PY="$RUNNER_TEMP/v/bin/python"; fi
+          "$PY" amd_ci/vkpicks/vk_picks_e2e.py --base "$RUNNER_TEMP/bin/base" --head "$RUNNER_TEMP/bin/head" \
+            --models "$RUNNER_TEMP/models" --out "$OUT" --reps 2
+          echo "probe rc=$?"
+          rm -rf "${RUNNER_TEMP:?}/models"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
+        if: always()
+        with:
+          name: vkpicks-out-linux
+          path: ${{ runner.temp }}/out
+          retention-days: 7
