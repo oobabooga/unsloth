@@ -1,0 +1,452 @@
+diff --git a/studio/backend/core/_mps_sdpa_guard.py b/studio/backend/core/_mps_sdpa_guard.py
+index 382fd5ff66..65aa656048 100644
+--- a/studio/backend/core/_mps_sdpa_guard.py
++++ b/studio/backend/core/_mps_sdpa_guard.py
+@@ -51,25 +51,43 @@ def _compiling() -> bool:
+         return False
+ 
+ 
+-def _broadcast_lead(a: tuple, b: tuple) -> Any:
+-    """Product of Q's and K's broadcast leading (batch, head) dims: SDPA builds that many score matrices (a mask must
+-    broadcast to them). Plain loops, no ``int()`` or generator, so Dynamo traces it with sizes kept symbolic."""
++def _broadcast_dims(a: tuple, b: tuple) -> tuple:
++    """Per-dim broadcast of two leading (batch, head) shapes. Plain loops, no ``int()`` or generator, so Dynamo
++    traces it with sizes kept symbolic."""
+     if len(a) < len(b):
+         a, b = b, a
+     b = (1,) * (len(a) - len(b)) + tuple(b)
+-    lead = 1
++    dims = []
+     for x, y in zip(a, b):
+-        lead = lead * (x if x >= y else y)  # broadcast (one side 1), or GQA (Q has the more heads)
++        dims.append(x if x >= y else y)  # broadcast (one side 1), or GQA (Q has the more heads)
++    return tuple(dims)
++
++
++def _broadcast_lead(a: tuple, b: tuple) -> Any:
++    """Product of Q's and K's broadcast leading (batch, head) dims: SDPA builds that many score matrices (a mask must
++    broadcast to them)."""
++    lead = 1
++    for x in _broadcast_dims(a, b):
++        lead = lead * x
+     return lead
+ 
+ 
+-def chunk_rows(query: Any, key: Any) -> Optional[int]:
++def chunk_rows(
++    query: Any,
++    key: Any,
++    value: Any = None,
++) -> Optional[int]:
+     """Query rows per call when ``query`` x ``key`` exceeds the score cap, else None (one call)."""
+     q_shape, k_shape = tuple(query.shape), tuple(key.shape)
+     if len(q_shape) < 2 or len(k_shape) < 2:
+         return None
+     sq, sk = q_shape[-2], k_shape[-2]
+-    lead = _broadcast_lead(q_shape[:-2], k_shape[:-2])
++    kv_lead = k_shape[:-2]
++    v_shape = tuple(value.shape) if value is not None else ()
++    if len(v_shape) > 2:
++        # a wider V batch broadcasts Q and K too: MPS builds that many score matrices
++        kv_lead = _broadcast_dims(kv_lead, v_shape[:-2])
++    lead = _broadcast_lead(q_shape[:-2], kv_lead)
+     if sq <= 1 or lead * sq * sk <= MPS_SCORE_ELEMENTS:
+         return None
+     return max(1, MPS_SCORE_ELEMENTS // max(lead * sk, 1))
+@@ -111,7 +129,7 @@ def guard_sdpa(sdpa: Any) -> Any:
+                 return sdpa(query, key, value, *args, **kwargs)
+         bound.update(kwargs)
+         mask = bound.get("attn_mask")
+-        rows = chunk_rows(query, key)
++        rows = chunk_rows(query, key, value)
+         if rows is None:
+             return sdpa(query, key, value, *args, **kwargs)
+         if mask is not None and (
+diff --git a/studio/backend/core/inference/diffusion_attention.py b/studio/backend/core/inference/diffusion_attention.py
+index f96838a545..1dee313167 100644
+--- a/studio/backend/core/inference/diffusion_attention.py
++++ b/studio/backend/core/inference/diffusion_attention.py
+@@ -3136,8 +3136,12 @@ def _fa4_kernel_runs(
+     return not error
+ 
+ 
++# Compiled at import: a cold re.match inside a traced region (the MPS prefill check) fails fullgraph tracing.
++_VERSION_RE = re.compile(r"\s*(\d+(?:\.\d+)*)")
++
++
+ def _version_tuple(text: str) -> tuple[int, ...]:
+-    m = re.match(r"\s*(\d+(?:\.\d+)*)", str(text))
++    m = _VERSION_RE.match(str(text))
+     return tuple(int(x) for x in m.group(1).split(".")) if m else ()
+ 
+ 
+diff --git a/studio/backend/core/inference/diffusion_int8_attention.py b/studio/backend/core/inference/diffusion_int8_attention.py
+index 59c0214eaf..dddc81c7a4 100644
+--- a/studio/backend/core/inference/diffusion_int8_attention.py
++++ b/studio/backend/core/inference/diffusion_int8_attention.py
+@@ -819,10 +819,14 @@ def _plan_key(
+         (K_MEAN_STEP, K_MEAN_KEYS, V_RANGE_STEP, V_RANGE_CHUNKS, GRID_LIMIT),
+         int(mode),
+         # kernel switches: a plan built before one flips must not keep serving the old kernel
+-        tuple(os.environ.get(name) for name in _KERNEL_SWITCHES),
++        _kernel_switches(),
+     )
+ 
+ 
++def _kernel_switches() -> tuple:
++    return tuple(os.environ.get(name) for name in _KERNEL_SWITCHES)
++
++
+ def _plan(
+     q: Any,
+     k: Any,
+@@ -851,6 +855,8 @@ def _plan(
+         q.shape[1] // DECIDE_BUCKET,
+         k.shape[1] // DECIDE_BUCKET,
+         int(mode),
++        # the race verdict is the kernel's: a flipped switch must not inherit the old kernel's verdict
++        _kernel_switches(),
+     )
+     B, Sq, H, D = q.shape
+     Sk = k.shape[1]
+diff --git a/studio/backend/core/inference/diffusion_lanczos_triton.py b/studio/backend/core/inference/diffusion_lanczos_triton.py
+index 8f5a4038c9..f7c53f49de 100644
+--- a/studio/backend/core/inference/diffusion_lanczos_triton.py
++++ b/studio/backend/core/inference/diffusion_lanczos_triton.py
+@@ -163,13 +163,14 @@ def _vertical_lanczos(
+ 
+ @triton.jit
+ def _normalize_rgb(src, dst, normalization, count, block: tl.constexpr):
+-    index = tl.program_id(0) * block + tl.arange(0, block)
++    # flat over the whole batch, which can pass 2**31 elements: 64-bit offsets
++    index = tl.program_id(0).to(tl.int64) * block + tl.arange(0, block)
+     pixel = tl.load(src + index, index < count, 0).to(tl.int32)
+     value = tl.load(normalization + index % 3 * 256 + pixel)
+     tl.store(dst + index, value, index < count)
+ 
+ 
+-# The kernels index one image with 32-bit flat offsets (only the batch offset is 64-bit).
++# The resize kernels index one image with 32-bit flat offsets (only the batch offset is 64-bit).
+ MAX_FLAT = 2**31
+ 
+ 
+diff --git a/studio/backend/core/inference/diffusion_ref_preprocess.py b/studio/backend/core/inference/diffusion_ref_preprocess.py
+index eed091c5ae..97d1d56138 100644
+--- a/studio/backend/core/inference/diffusion_ref_preprocess.py
++++ b/studio/backend/core/inference/diffusion_ref_preprocess.py
+@@ -204,6 +204,14 @@ def _device_of(pipe: Any):
+     return dev if dev is not None and getattr(dev, "type", "") == "cuda" else None
+ 
+ 
++def _is_oom(exc: BaseException) -> bool:
++    try:
++        from .diffusion_vae_oom import is_oom
++        return is_oom(exc)
++    except Exception:  # noqa: BLE001
++        return "out of memory" in str(exc).lower()
++
++
+ def _probed(
+     proc: Any,
+     stock_area,
+@@ -211,7 +219,7 @@ def _probed(
+     device,
+     logger: Any = None,
+ ) -> bool:
+-    """The device's probe verdict, running the probe (Triton compile + two images) once per device."""
++    """The device's probe verdict, running the probe (Triton compile + two images) once per device (an OOM is retried)."""
+     key = str(device)
+     ok = _PROBED.get(key)
+     if ok is None:
+@@ -221,9 +229,12 @@ def _probed(
+                 try:
+                     ok = _probe(proc, stock_area, stock_pre, device)
+                 except Exception as exc:  # noqa: BLE001 - probe failure: CPU path for this device
+-                    ok = False
+                     if logger is not None:
+                         logger.warning("diffusion.ref_preprocess: probe failed on %s: %s", key, exc)
++                    if _is_oom(exc):
++                        # transient (e.g. memory pressure at load): CPU path now, probe again next request
++                        return False
++                    ok = False
+                 _PROBED[key] = ok
+                 if logger is not None:
+                     logger.info(
+diff --git a/studio/backend/core/inference/video_vae_rocm_pertap.py b/studio/backend/core/inference/video_vae_rocm_pertap.py
+index 4b0a056f04..5615b777d0 100644
+--- a/studio/backend/core/inference/video_vae_rocm_pertap.py
++++ b/studio/backend/core/inference/video_vae_rocm_pertap.py
+@@ -7,8 +7,8 @@ On Windows gfx1151 (torch 2.11 + ROCm 7.14) a Conv3d whose input or output tenso
+ per element than the same conv below that size; measured on the LTX-2.3 decoder across 6 conv shape classes and
+ 5 clip sizes. Splitting such a call into Conv2d calls, one per temporal tap with time folded into the batch, summed in
+ fp32 with the bias added once, decodes 1920x1088x121 about 1.8x faster and closer to a CPU fp32 decode. Below 2 GiB
+-the stock Conv3d is faster, and Linux ROCm has no cliff, so only Windows ROCm installs it and only calls over 2 GiB
+-take it. UNSLOTH_VIDEO_VAE_ROCM_PERTAP=0 turns it off (read per call).
++the stock Conv3d is faster, and Linux ROCm has no cliff, so only Windows ROCm installs it and only bf16 / fp32 calls
++over 2 GiB outside autocast take it. UNSLOTH_VIDEO_VAE_ROCM_PERTAP=0 turns it off (read per call).
+ """
+ 
+ from __future__ import annotations
+@@ -95,13 +95,29 @@ def pertap_conv3d(
+     return out
+ 
+ 
++# Input dtypes the per-tap path takes: fp16 taps round (and can overflow to inf) before the fp32 sum, where stock
++# Conv3d accumulates once, so a finite fp16 result could turn NaN.
++ENGAGE_DTYPES = ("bfloat16", "float32")
++
++
++def _autocast_on(torch: Any, device_type: str) -> bool:
++    try:
++        return bool(torch.is_autocast_enabled(device_type))
++    except TypeError:  # torch < 2.4: no device_type argument
++        return bool(torch.is_autocast_enabled())
++
++
+ def _pertap_eligible(conv: Any, x: Any) -> bool:
+     import torch
+ 
+-    if pertap_disabled() or torch.compiler.is_compiling():
++    # is_compiling first: a traced env read guards on the env value and recompiles when it flips
++    if torch.compiler.is_compiling() or pertap_disabled():
+         return False
+     if x.dim() != 5 or x.device.type not in ENGAGE_DEVICE_TYPES or isinstance(conv.padding, str):
+         return False
++    # autocast: stock returns the autocast dtype, the per-tap output keeps x's dtype
++    if str(x.dtype).rsplit(".", 1)[-1] not in ENGAGE_DTYPES or _autocast_on(torch, x.device.type):
++        return False
+     if torch.is_grad_enabled() and (x.requires_grad or conv.weight.requires_grad):
+         return False
+     itemsize = x.element_size()
+diff --git a/studio/backend/tests/test_diffusion_int8_attention_resid_fold.py b/studio/backend/tests/test_diffusion_int8_attention_resid_fold.py
+index 173232bc3b..91c884816e 100644
+--- a/studio/backend/tests/test_diffusion_int8_attention_resid_fold.py
++++ b/studio/backend/tests/test_diffusion_int8_attention_resid_fold.py
+@@ -150,3 +150,53 @@ def test_a_warm_plan_follows_the_kill_switch(monkeypatch):
+         assert [f for s, f in built if s] == [True, False]
+     finally:
+         I.forget_plans()
++
++
++def test_a_flipped_switch_races_its_own_kernel(monkeypatch):
++    """The plan's sink-path verdict (accuracy + timing) belongs to its kernel: after the fold switch flips, the new
++    plan races again instead of inheriting the folded kernel's verdict."""
++    import contextlib
++
++    torch = pytest.importorskip("torch")
++
++    def functions(
++        index,
++        head_dim,
++        config,
++        sinks = False,
++        fold = None,
++    ):
++        kernels = {
++            name: name for name in ("unsloth_i8stats_q", "unsloth_i8quant_kv", "unsloth_i8resid")
++        }
++        return ("attn", kernels, 4096)
++
++    class _Done:
++        def synchronize(self):
++            pass
++
++    def decide(plan, verdict, races):
++        plan["calls"] = I.SINK_DECIDE_AT
++        plan["checks"] = [(_Done(), torch.ones(2, dtype = torch.int32), False)]
++        return I._choose_path(plan, race = lambda: races.append(verdict) or verdict)[0]
++
++    monkeypatch.setattr(I, "_functions", functions)
++    monkeypatch.setattr(I, "_outside_capture", lambda: contextlib.nullcontext(True))
++    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
++    monkeypatch.setattr(I, "_drop_routes", lambda plan: None)
++    monkeypatch.setattr(I, "_GRAPHED", [False])
++    monkeypatch.delenv(I.RESID_FOLD_ENV, raising = False)
++    I.forget_plans()
++    config = next(iter(I.KERNEL_CONFIGS.values()))[128]
++    q, k, v = (torch.zeros(1, 256, 2, 128, dtype = torch.bfloat16) for _ in range(3))
++    races: list = []
++    try:
++        on = I._find_plan(q, k, v, config, None, 0, I.MODE_KERNELS)[0]
++        assert on["fold"] and decide(on, True, races) is True
++        monkeypatch.setenv(I.RESID_FOLD_ENV, "0")
++        off = I._find_plan(q, k, v, config, None, 0, I.MODE_KERNELS)[0]
++        assert not off["fold"] and off["decision"] != on["decision"]
++        assert decide(off, False, races) is False
++        assert races == [True, False]
++    finally:
++        I.forget_plans()
+diff --git a/studio/backend/tests/test_diffusion_ref_preprocess.py b/studio/backend/tests/test_diffusion_ref_preprocess.py
+index 058e7f78d9..fb453cb57d 100644
+--- a/studio/backend/tests/test_diffusion_ref_preprocess.py
++++ b/studio/backend/tests/test_diffusion_ref_preprocess.py
+@@ -316,3 +316,54 @@ def test_huge_reference_is_refused_before_the_upload():
+     img = rp.DeferredResize(_Src(), 1024, 1024)
+     with pytest.raises(ValueError, match = "32-bit"):
+         rp._gpu_preprocess(proc, img, 1024, 1024, "cpu")
++
++
++def test_batched_normalize_uses_64_bit_offsets():
++    """The guard bounds one image; the normalize kernel runs flat over the whole NHWC batch, so a [24, 8192, 8192, 3]
++    batch (4.8e9 elements) must not wrap: the program offset is widened to i64 before the multiply."""
++    import re
++
++    triton = pytest.importorskip("triton")
++    from triton.backends.compiler import GPUTarget
++    from triton.compiler import ASTSource
++
++    from core.inference import diffusion_lanczos_triton as K
++
++    assert K.fits_int32(8192, 8192, 8192, 8192) and 24 * 8192 * 8192 * 3 > 2**32
++    signature = {
++        "src": "*u8",
++        "dst": "*fp32",
++        "normalization": "*fp32",
++        "count": "i64",
++        "block": "constexpr",
++    }
++    source = ASTSource(K._normalize_rgb, signature, constexprs = {"block": 256})
++    ir = triton.compile(source, target = GPUTarget("cuda", 80, 32)).asm["ttir"]
++    assert re.search(r"arith\.muli %\S+, %c256_i64 : i64", ir), ir
++    assert "!tt.ptr<i8>>, tensor<256xi64>" in ir and "!tt.ptr<i8>>, tensor<256xi32>" not in ir, ir
++
++
++def test_probe_oom_is_not_cached(monkeypatch):
++    """An OOM during the load-time probe takes the CPU path for now and probes again on the next request; a real
++    probe failure is still cached."""
++    monkeypatch.setattr(rp, "_cuda_ok", lambda: True)
++    monkeypatch.setattr(rp, "_PROBED", {})
++    results = [torch.OutOfMemoryError("CUDA out of memory. Tried to allocate 2.00 GiB"), True]
++
++    def probe(proc, a, p, device):
++        r = results.pop(0)
++        if isinstance(r, BaseException):
++            raise r
++        return r
++
++    monkeypatch.setattr(rp, "_probe", probe)
++    pipe = _Pipe(device = torch.device("cuda:0"))
++    assert rp.install(pipe) is True
++    assert rp.warm(pipe) is False and rp._PROBED == {}
++    assert rp.warm(pipe) is True and rp._PROBED == {"cuda:0": True} and results == []
++
++    monkeypatch.setattr(rp, "_PROBED", {})
++    monkeypatch.setattr(
++        rp, "_probe", lambda *a: (_ for _ in ()).throw(RuntimeError("Triton compile failed"))
++    )
++    assert rp.warm(pipe) is False and rp._PROBED == {"cuda:0": False}
+diff --git a/studio/backend/tests/test_mps_large_attention_guard.py b/studio/backend/tests/test_mps_large_attention_guard.py
+index 1368bd5986..7c1f32609c 100644
+--- a/studio/backend/tests/test_mps_large_attention_guard.py
++++ b/studio/backend/tests/test_mps_large_attention_guard.py
+@@ -252,3 +252,53 @@ def test_repeated_split_calls_never_recompile(as_mps):
+     assert G.stats["chunked_calls"] == 0  # counted in eager only: a traced bump guards on the value
+     as_mps(q, k, v, attn_mask = mask)
+     assert G.stats["chunked_calls"] == 1
++
++
++def test_wider_value_batch_counts_every_score(as_mps, monkeypatch):
++    """SDPA broadcasts Q, K and V together: a V batch wider than Q's and K's multiplies the score matrices too."""
++    monkeypatch.setattr(G, "MPS_SCORE_ELEMENTS", 5120)
++    g = torch.Generator().manual_seed(2)
++    q = torch.randn(1, 2, 25, 8, generator = g, dtype = torch.float64)
++    k = torch.randn(1, 2, 64, 8, generator = g, dtype = torch.float64)
++    v = torch.randn(2, 2, 64, 8, generator = g, dtype = torch.float64)
++    assert G.chunk_rows(q, k) is None  # 2 * 25 * 64 = 3200 from Q and K alone
++    assert G.chunk_rows(q, k, v) == 5120 // (4 * 64)  # 4 * 25 * 64 = 6400 with V's batch
++    out = as_mps(q, k, v)
++    assert G.stats["chunked_calls"] == 1
++    assert torch.allclose(out, F.scaled_dot_product_attention(q, k, v), atol = 1e-12)
++    # GQA keeps following Q's heads; a K / V pair of one batch changes nothing
++    q6, k3 = torch.empty(1, 6, 100, 4), torch.empty(1, 3, 64, 4)
++    assert G.chunk_rows(q6, k3, k3) == G.chunk_rows(q6, k3) == G.MPS_SCORE_ELEMENTS // (6 * 64)
++
++
++_COLD_PREFILL_TRACE = """
++import torch
++from torch._subclasses.fake_tensor import FakeTensorMode
++from core import _mps_sdpa_guard as G
++with FakeTensorMode():
++    q = torch.empty(2, 3, 32, 256, device = "mps")
++    fn = torch.compile(lambda q: q if G._prefill_serves(q, q, q, None) else q + 1, backend = "eager", fullgraph = True)
++    fn(q)
++print("TRACED")
++"""
++
++
++def test_cold_prefill_check_traces_under_fullgraph():
++    """The real prefill predicate (torch version parse included) traces under fullgraph=True in a fresh process,
++    before anything warmed the regex cache."""
++    import os
++    import subprocess
++    from pathlib import Path
++
++    backend = Path(__file__).resolve().parents[1]
++    env = dict(os.environ, PYTHONPATH = str(backend) + os.pathsep + os.environ.get("PYTHONPATH", ""))
++    env.pop("PYTORCH_MPS_DISABLE_PREFILL_ATTENTION", None)
++    proc = subprocess.run(
++        [sys.executable, "-c", _COLD_PREFILL_TRACE],
++        cwd = str(backend),
++        env = env,
++        capture_output = True,
++        text = True,
++        timeout = 600,
++    )
++    assert proc.returncode == 0 and "TRACED" in proc.stdout, proc.stderr[-3000:]
+diff --git a/studio/backend/tests/test_video_vae_rocm_pertap.py b/studio/backend/tests/test_video_vae_rocm_pertap.py
+index 49421b6de5..affed9f6a6 100644
+--- a/studio/backend/tests/test_video_vae_rocm_pertap.py
++++ b/studio/backend/tests/test_video_vae_rocm_pertap.py
+@@ -322,3 +322,52 @@ def test_video_backend_installs_after_frame_pad_fix():
+     pertap = src.index("install_vae_rocm_pertap(pipe, target, logger = logger)")
+     assert 0 < pertap - pad < 600
+     assert '"vae_rocm_pertap_conv"' in src
++
++
++def test_fp16_keeps_stock_conv_no_overflow(engage_on_cpu):
++    """fp16 taps of +256*256 and -256*256 overflow before the fp32 sum (NaN); stock Conv3d returns the finite 0."""
++    conv = _patch(torch.nn.Conv3d(1, 1, (2, 1, 1), bias = False).half())
++    with torch.no_grad():
++        conv.weight.copy_(torch.tensor([256.0, -256.0]).view(1, 1, 2, 1, 1))
++        x = torch.full((1, 1, 2, 1, 1), 256.0, dtype = torch.float16)
++        ref = F.conv3d(x, conv.weight)
++        y = conv(x)
++    assert torch.isfinite(ref).all()
++    assert torch.equal(y, ref)
++    assert getattr(conv, "_unsloth_rocm_pertap_calls", 0) == 0
++
++
++def test_autocast_keeps_stock_output_dtype(engage_on_cpu):
++    geom = GEOMETRIES["ltx_k3_tpad0"]
++    conv = _patch(_conv(geom, torch.float32))
++    x = _input(geom, torch.float32)
++    with torch.no_grad(), torch.autocast("cpu", dtype = torch.bfloat16):
++        ref = F.conv3d(x, conv.weight, conv.bias, conv.stride, conv.padding)
++        y = conv(x)
++    assert ref.dtype == torch.bfloat16 and y.dtype == ref.dtype
++    assert getattr(conv, "_unsloth_rocm_pertap_calls", 0) == 0
++    bf16 = _patch(_conv(geom, torch.bfloat16))
++    with torch.no_grad():  # bf16 / fp32 outside autocast still take the per-tap path
++        conv(x)
++        bf16(x.bfloat16())
++    assert conv._unsloth_rocm_pertap_calls == 1 and bf16._unsloth_rocm_pertap_calls == 1
++
++
++def test_compiled_kill_switch_flip_does_not_recompile(monkeypatch, engage_on_cpu):
++    """is_compiling is checked before the env switch: flipping it adds no env guard, so no recompile."""
++    from torch._dynamo.testing import CompileCounter
++
++    geom = GEOMETRIES["ltx_k3_tpad0"]
++    conv = _patch(_conv(geom, torch.float32))
++    x = _input(geom, torch.float32)
++    torch._dynamo.reset()
++    counter = CompileCounter()
++    compiled = torch.compile(conv, backend = counter, fullgraph = True, dynamic = True)
++    try:
++        with torch.no_grad():
++            for value in ("1", "0", "1"):
++                monkeypatch.setenv(P.PERTAP_ENV, value)
++                compiled(x)
++        assert counter.frame_count == 1
++    finally:
++        torch._dynamo.reset()
