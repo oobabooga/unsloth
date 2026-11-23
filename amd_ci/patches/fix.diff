@@ -1,0 +1,234 @@
+diff --git a/studio/backend/core/inference/diffusion_memory.py b/studio/backend/core/inference/diffusion_memory.py
+index 640a354a27..ca00783a8a 100644
+--- a/studio/backend/core/inference/diffusion_memory.py
++++ b/studio/backend/core/inference/diffusion_memory.py
+@@ -1654,13 +1654,17 @@ def _xpu_memory() -> tuple[Optional[int], Optional[int]]:
+ 
+ 
+ def _system_memory_mib() -> tuple[Optional[int], Optional[int]]:
+-    """(total, available) host RAM in MiB, via psutil then POSIX sysconf."""
++    """(total, available) host RAM in MiB, via psutil then GlobalMemoryStatusEx (Windows) / POSIX sysconf."""
+     try:
+         import psutil
+         vm = psutil.virtual_memory()
+         return int(vm.total // (1024 * 1024)), int(vm.available // (1024 * 1024))
+     except Exception:
+         pass
++    if sys.platform == "win32":
++        from utils import host_memory
++
++        return host_memory.windows_physical_mib()
+     try:
+         page = os.sysconf("SC_PAGE_SIZE")
+         total = os.sysconf("SC_PHYS_PAGES") * page
+diff --git a/studio/backend/tests/test_sd_cpp_windows_host_ram.py b/studio/backend/tests/test_sd_cpp_windows_host_ram.py
+new file mode 100644
+index 0000000000..088ab0ff69
+--- /dev/null
++++ b/studio/backend/tests/test_sd_cpp_windows_host_ram.py
+@@ -0,0 +1,129 @@
++# SPDX-License-Identifier: AGPL-3.0-only
++# Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
++
++"""Windows without psutil: host RAM comes from GlobalMemoryStatusEx, so the CPU VAE tile is RAM-sized, not 256 px.
++
++Emulates the Windows readings on any OS: sys.platform win32, no psutil, no /proc/meminfo, no os.sysconf, and a fake
++kernel32 answering GlobalMemoryStatusEx / K32GetPerformanceInfo through the real ctypes structures."""
++
++from __future__ import annotations
++
++import ctypes
++import os
++import sys
++from types import SimpleNamespace
++
++import pytest
++
++from core.inference import diffusion_memory, diffusion_small_host
++from core.inference import sd_cpp_args as args_mod
++from core.inference import sd_cpp_backend as backend_mod
++from core.inference.llama_cpp import LlamaCppBackend
++from core.inference.sd_cpp_args import CPU_VAE_TILE_ENV
++from utils import host_memory
++
++MIB = 1 << 20
++TOTAL_MIB = 131072
++AVAIL_MIB = 100000
++PAGE = 4096
++
++
++class _FakeKernel32:
++    def __init__(self, ok = True, commit_mib = 200000):
++        self.ok = ok
++        self.commit_mib = commit_mib
++        self.status_calls = 0
++
++    def GlobalMemoryStatusEx(self, ref):
++        self.status_calls += 1
++        status = ref._obj
++        assert status.dwLength == ctypes.sizeof(type(status)) == 64
++        if not self.ok:
++            return 0
++        status.ullTotalPhys = TOTAL_MIB * MIB
++        status.ullAvailPhys = AVAIL_MIB * MIB
++        return 1
++
++    def K32GetPerformanceInfo(self, ref, cb):
++        info = ref._obj
++        info.CommitLimit = (self.commit_mib * MIB) // PAGE + 1000
++        info.CommitTotal = 1000
++        info.PageSize = PAGE
++        return 1
++
++
++@pytest.fixture
++def windows(monkeypatch):
++    """This process as a Windows Studio whose venv has no psutil."""
++    kernel32 = _FakeKernel32()
++    monkeypatch.setattr(sys, "platform", "win32")
++    monkeypatch.setitem(sys.modules, "psutil", None)
++    monkeypatch.setattr(ctypes, "WinDLL", lambda name, **kw: kernel32, raising = False)
++    monkeypatch.setattr(host_memory, "_meminfo_mib", lambda key: None)
++    monkeypatch.delattr(os, "sysconf", raising = False)
++    monkeypatch.setattr(host_memory, "cgroup_memory_budgets", lambda *a, **k: [])
++    monkeypatch.setattr(LlamaCppBackend, "_cgroup_memory_budgets", staticmethod(lambda *a, **k: []))
++    monkeypatch.delenv(diffusion_small_host.HOST_RAM_LIMIT_ENV, raising = False)
++    monkeypatch.delenv(CPU_VAE_TILE_ENV, raising = False)
++    monkeypatch.setattr(args_mod, "sd_cpp_vae_tile_size_in_pixels", lambda b: True)
++    return kernel32
++
++
++def _sized(tmp_path, name: str, mib: int) -> str:
++    path = tmp_path / name
++    with open(path, "wb") as f:
++        f.truncate(mib << 20)
++    return str(path)
++
++
++def _files(tmp_path) -> SimpleNamespace:
++    return SimpleNamespace(
++        diffusion_model = _sized(tmp_path, "dit.gguf", 2000),
++        vae = _sized(tmp_path, "vae.st", 100),
++        llm = _sized(tmp_path, "te.gguf", 3000),
++    )
++
++
++def test_readers_fall_back_to_global_memory_status(windows):
++    assert host_memory.system_total_mib() == TOTAL_MIB
++    assert host_memory.system_available_mib() == AVAIL_MIB
++    assert diffusion_memory._system_memory_mib() == (TOTAL_MIB, AVAIL_MIB)
++    assert diffusion_small_host.host_ram_mib() == (TOTAL_MIB, AVAIL_MIB)
++    assert diffusion_small_host.host_commit_mib() == 200000
++
++
++def test_cpu_vae_tile_is_ram_sized_without_psutil(windows, tmp_path):
++    assert backend_mod._cpu_vae_tile_size(_files(tmp_path), "sd-cli.exe") == 1024
++
++
++def test_offload_flags_pass_the_tile_without_psutil(windows, tmp_path):
++    flags = backend_mod._offload_vae_flags(
++        args_mod.OFFLOAD_MODEL, _files(tmp_path), "sd-cli.exe", "rocm", None
++    )
++    assert "--vae-on-cpu" in flags and "--vae-tiling" in flags
++    assert flags[flags.index("--vae-tile-size") + 1] == "1024"
++
++
++def test_commit_headroom_still_caps_the_fallback_reading(windows, tmp_path):
++    windows.commit_mib = 0
++    assert backend_mod._cpu_vae_tile_size(_files(tmp_path), "sd-cli.exe") is None
++
++
++def test_failed_status_call_stays_unread(windows, tmp_path):
++    windows.ok = False
++    assert host_memory.windows_physical_mib() == (None, None)
++    assert diffusion_small_host.host_ram_mib() == (None, None)
++    assert backend_mod._cpu_vae_tile_size(_files(tmp_path), "sd-cli.exe") is None
++
++
++def test_psutil_still_wins_when_present(windows, monkeypatch):
++    vm = SimpleNamespace(total = 64 * 1024 * MIB, available = 40 * 1024 * MIB)
++    monkeypatch.setitem(sys.modules, "psutil", SimpleNamespace(virtual_memory = lambda: vm))
++    assert host_memory.system_available_mib() == 40 * 1024
++    assert diffusion_memory._system_memory_mib() == (64 * 1024, 40 * 1024)
++    assert windows.status_calls == 0
++
++
++def test_not_windows_reads_nothing(monkeypatch):
++    monkeypatch.setattr(sys, "platform", "linux")
++    assert host_memory.windows_physical_mib() == (None, None)
+diff --git a/studio/backend/utils/host_memory.py b/studio/backend/utils/host_memory.py
+index d4ffe1702b..b74350fd4a 100644
+--- a/studio/backend/utils/host_memory.py
++++ b/studio/backend/utils/host_memory.py
+@@ -6,6 +6,7 @@
+ from __future__ import annotations
+ 
+ import os
++import sys
+ from typing import Optional
+ 
+ CGROUP_ROOT = "/sys/fs/cgroup"
+@@ -322,23 +323,59 @@ def _meminfo_mib(key: str) -> Optional[int]:
+     return None
+ 
+ 
++def windows_physical_mib() -> tuple[Optional[int], Optional[int]]:
++    """(total, available) physical RAM in MiB from GlobalMemoryStatusEx, the call psutil makes on Windows; (None,
++    None) elsewhere or unreadable. Windows has no /proc/meminfo, so without psutil nothing else reads it."""
++    if sys.platform != "win32":
++        return None, None
++    try:
++        import ctypes
++
++        class _MemoryStatusEx(ctypes.Structure):
++            _fields_ = [("dwLength", ctypes.c_uint32), ("dwMemoryLoad", ctypes.c_uint32)] + [
++                (name, ctypes.c_ulonglong)
++                for name in (
++                    "ullTotalPhys",
++                    "ullAvailPhys",
++                    "ullTotalPageFile",
++                    "ullAvailPageFile",
++                    "ullTotalVirtual",
++                    "ullAvailVirtual",
++                    "ullAvailExtendedVirtual",
++                )
++            ]
++
++        status = _MemoryStatusEx()
++        status.dwLength = ctypes.sizeof(_MemoryStatusEx)
++        if not ctypes.WinDLL("kernel32").GlobalMemoryStatusEx(ctypes.byref(status)):
++            return None, None
++        return int(status.ullTotalPhys) // _MIB, int(status.ullAvailPhys) // _MIB
++    except Exception:  # noqa: BLE001 - unreadable
++        return None, None
++
++
+ def system_available_mib() -> Optional[int]:
+-    """Host-wide available RAM in MiB (psutil, then /proc/meminfo), NOT cgroup-capped, or None."""
++    """Host-wide available RAM in MiB (psutil, then GlobalMemoryStatusEx / /proc/meminfo), NOT cgroup-capped, or
++    None."""
+     try:
+         import psutil
+         return int(psutil.virtual_memory().available // _MIB)
+-    except Exception:  # noqa: BLE001 - fall back to the kernel file
++    except Exception:  # noqa: BLE001 - fall back to the OS reading
+         pass
++    if sys.platform == "win32":
++        return windows_physical_mib()[1]
+     return _meminfo_mib("MemAvailable")
+ 
+ 
+ def system_total_mib() -> Optional[int]:
+-    """Host-wide total RAM in MiB (psutil, then /proc/meminfo), NOT cgroup-capped, or None."""
++    """Host-wide total RAM in MiB (psutil, then GlobalMemoryStatusEx / /proc/meminfo), NOT cgroup-capped, or None."""
+     try:
+         import psutil
+         return int(psutil.virtual_memory().total // _MIB)
+-    except Exception:  # noqa: BLE001 - fall back to the kernel file
++    except Exception:  # noqa: BLE001 - fall back to the OS reading
+         pass
++    if sys.platform == "win32":
++        return windows_physical_mib()[0]
+     return _meminfo_mib("MemTotal")
+ 
+ 
