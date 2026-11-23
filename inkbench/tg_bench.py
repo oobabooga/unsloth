@@ -241,8 +241,10 @@ def run_bench(cmd, env, timeout):
 
 # ------------------------------------------------------------------ -ncmoe selection
 def fits(arms, cells, model, ncmoe, a, envs):
+    # same -n as the measurement: the context (and with it the compute buffers) grows with -n, so a short probe
+    # can fit where the measured run does not (seen on a 16 GB T4: -n 32 fits at -ncmoe 4, -n 1024 does not)
     for arm, kv in cells:
-        r = run_bench(bench_cmd(arms[arm]["bench"], model, 32, kv, a.ngl, ncmoe, a.extra), envs[arm], a.timeout)
+        r = run_bench(bench_cmd(arms[arm]["bench"], model, a.probe_n or a.n, kv, a.ngl, ncmoe, a.extra), envs[arm], a.timeout)
         if r["rc"] != 0 or not r.get("ts"):
             return False, f"{arm}/{kv}: rc {r['rc']} {r.get('err_tail', '')[-300:]}"
     return True, ""
@@ -369,6 +371,7 @@ def main():
     ap.add_argument("--ngl", type=int, default=99)
     ap.add_argument("--ncmoe", action="append", default=[], help="MODEL=N fixes -ncmoe; unset models are auto-fitted (smallest that fits)")
     ap.add_argument("--ncmoe-max", type=int, default=99)
+    ap.add_argument("--probe-n", type=int, default=0, help="-n of the -ncmoe fit probes (0 = the measured --n)")
     ap.add_argument("--extra", default="", help="extra llama-bench args, same for every arm (e.g. '-t 8')")
     ap.add_argument("--baseline", default=None)
     ap.add_argument("--ratios", default="", help="comma list NUM/DEN of arm medians")
@@ -416,17 +419,26 @@ def main():
         log(f"arm {n}: {i['bench']}")
     arm_models = {arm: [m for m in models if arm not in only or m in only[arm]] for arm in arm_order}
 
-    # an arm that cannot load a file at all (e.g. an older build and a newer GGUF layout) is dropped for that file,
-    # judged with every MoE expert on the CPU so VRAM is not the reason
+    # an arm that cannot load a file at all (e.g. an older build and a newer GGUF layout) is dropped for that file:
+    # tried fully on the GPU first, then with every MoE expert on the CPU (so VRAM is not the reason); a failure of
+    # only one of the two is kept as a finding (meta "load_check") and does not drop the arm
     meta.setdefault("incompatible", {})
+    meta.setdefault("load_check", {})
     for mk, mp in models.items():
         for arm in arm_order:
             key = f"{arm}:{mk}"
             if mk not in arm_models[arm]:
                 continue
             if key not in meta["incompatible"]:
-                r = run_bench(bench_cmd(arms[arm]["bench"], mp, 8, a.kv[0], a.ngl, a.ncmoe_max, a.extra), envs[arm], a.timeout)
-                meta["incompatible"][key] = None if (r["rc"] == 0 and r.get("ts")) else r.get("err_tail", "")[-600:]
+                chk = {}
+                for nc in (0, a.ncmoe_max):
+                    r = run_bench(bench_cmd(arms[arm]["bench"], mp, 8, a.kv[0], a.ngl, nc, a.extra), envs[arm], a.timeout)
+                    chk[f"ncmoe{nc}"] = "ok" if (r["rc"] == 0 and r.get("ts")) else f"rc {r['rc']}: " + r.get("err_tail", "")[-4000:]
+                meta["load_check"][key] = chk
+                bad = [v for v in chk.values() if v != "ok"]
+                meta["incompatible"][key] = bad[-1] if len(bad) == len(chk) else None
+                if bad and len(bad) < len(chk):
+                    log(f"{arm} on {mk}: fails only in one placement: {[k for k, v in chk.items() if v != 'ok']}")
                 meta_f.write_text(json.dumps(meta, indent=1), encoding="utf-8")
             if meta["incompatible"][key]:
                 log(f"{arm} cannot run {mk}: {meta['incompatible'][key][-200:]}")
