@@ -1,0 +1,262 @@
+diff --git a/studio/backend/core/inference/diffusion_compile_config.py b/studio/backend/core/inference/diffusion_compile_config.py
+index 1a26af585d..a6f30ccb91 100644
+--- a/studio/backend/core/inference/diffusion_compile_config.py
++++ b/studio/backend/core/inference/diffusion_compile_config.py
+@@ -33,7 +33,8 @@ def reduction_config_filter_available() -> bool:
+ 
+ 
+ def family_filters_reductions(family: Any) -> bool:
+-    """``filter_reduction_configs`` on every arch, or the current CUDA device listed in ``filter_reduction_configs_archs``."""
++    """``filter_reduction_configs`` on every arch, or the current device listed in ``filter_reduction_configs_archs``:
++    a CUDA (major, minor) capability, or a ROCm gfx name such as ``"gfx1151"``."""
+     if family is None:
+         return False
+     if bool(getattr(family, "filter_reduction_configs", False)):
+@@ -41,8 +42,31 @@ def family_filters_reductions(family: Any) -> bool:
+     archs = getattr(family, "filter_reduction_configs_archs", None) or ()
+     if not archs:
+         return False
+-    cap = _device_capability()
+-    return cap is not None and cap in {tuple(int(v) for v in a) for a in archs}
++    gfx = {str(a).strip().lower() for a in archs if isinstance(a, str)}
++    caps = {tuple(int(v) for v in a) for a in archs if not isinstance(a, str)}
++    if caps:
++        cap = _device_capability()
++        if cap is not None and cap in caps:
++            return True
++    if gfx:
++        arch = _rocm_gfx_arch()
++        if arch and arch in gfx:
++            return True
++    return False
++
++
++def _rocm_gfx_arch() -> Any:
++    """The current ROCm device's gfx name (``gfx1151``), else None (CUDA, CPU, unreadable)."""
++    try:
++        import torch
++
++        if not torch.cuda.is_available() or not is_rocm_torch(torch):
++            return None
++        props = torch.cuda.get_device_properties(torch.cuda.current_device())
++        name = str(getattr(props, "gcnArchName", "") or "").split(":", 1)[0].strip().lower()
++        return name or None
++    except Exception:  # noqa: BLE001 - no device: nothing pinned
++        return None
+ 
+ 
+ def _device_capability() -> Any:
+diff --git a/studio/backend/core/inference/diffusion_families.py b/studio/backend/core/inference/diffusion_families.py
+index 81fbfa243b..04875dcd4d 100644
+--- a/studio/backend/core/inference/diffusion_families.py
++++ b/studio/backend/core/inference/diffusion_families.py
+@@ -15,7 +15,7 @@ import sys
+ import tempfile
+ from dataclasses import dataclass, field, replace
+ from pathlib import Path, PurePosixPath
+-from typing import Any, Iterable, Mapping, NamedTuple, Optional, Sequence
++from typing import Any, Iterable, Mapping, NamedTuple, Optional, Sequence, Union
+ from utils.paths.path_utils import is_appledouble_metadata
+ 
+ from .diffusion_flow_shift import flux_mu_shift
+@@ -210,10 +210,13 @@ class DiffusionFamily:
+     supports_torch_compile: bool = True
+     # False keeps cudnn.benchmark off (as VideoFamily.cudnn_benchmark): its per-process conv pick changes pixels.
+     cudnn_benchmark: bool = True
+-    # Pin inductor's reduction-config filter on every arch (``filter_reduction_configs``) or only on the listed (major,
+-    # minor) archs (``filter_reduction_configs_archs``); both unset = inductor's pick. Same two fields on VideoFamily.
++    # Pin inductor's reduction-config filter on every arch (``filter_reduction_configs``) or only on the listed CUDA
++    # (major, minor) archs / ROCm gfx names (``filter_reduction_configs_archs``); both unset = inductor's pick. Same two
++    # fields on VideoFamily.
+     filter_reduction_configs: bool = False
+-    filter_reduction_configs_archs: tuple[tuple[int, int], ...] = field(default_factory = tuple)
++    filter_reduction_configs_archs: tuple[Union[tuple[int, int], str], ...] = field(
++        default_factory = tuple
++    )
+     # Optional pre-quantized transformer checkpoints as (scheme, repo_id): fetched instead of the dense bf16 (lower
+     # load VRAM + download).
+     prequant_repos: tuple[tuple[str, str], ...] = field(default_factory = tuple)
+diff --git a/studio/backend/core/inference/video_families.py b/studio/backend/core/inference/video_families.py
+index 0fad63865f..99cc11fdcf 100644
+--- a/studio/backend/core/inference/video_families.py
++++ b/studio/backend/core/inference/video_families.py
+@@ -9,7 +9,7 @@ from __future__ import annotations
+ import os
+ import re
+ from dataclasses import dataclass, field
+-from typing import Optional
++from typing import Optional, Union
+ 
+ from .diffusion_nvfp4_flag import nvfp4_blocked, without_nvfp4
+ from .family_name_match import model_identity, normalize_family_name, token_in_name, token_length
+@@ -259,8 +259,10 @@ class VideoFamily:
+     # One config per reduction instead of a per-process benchmark that can change the render (diffusion_speed.
+     # pin_reduction_configs). Off by default: it can keep a slower config (HunyuanVideo-1.5 ~2% per step).
+     filter_reduction_configs: bool = False
+-    # Same spelling as DiffusionFamily: pin the filter only on these (major, minor) archs.
+-    filter_reduction_configs_archs: tuple[tuple[int, int], ...] = field(default_factory = tuple)
++    # Same spelling as DiffusionFamily: pin the filter only on these CUDA (major, minor) archs or ROCm gfx names.
++    filter_reduction_configs_archs: tuple[Union[tuple[int, int], str], ...] = field(
++        default_factory = tuple
++    )
+     # Curated GGUF repo for the picker (the DiT as single-file GGUF quants).
+     gguf_repo: Optional[str] = None
+     # Subdirectory of gguf_repo a bare repo id means; None keeps the root.
+@@ -835,6 +837,9 @@ _FAMILIES: tuple[VideoFamily, ...] = (
+         bf16_components_gb = (10.0, 11.4, 2.8),
+         vae_force_fp32 = True,
+         cudnn_benchmark = False,
++        # gfx1151: fresh processes rendered one seed into up to 4 clips (two norm reductions benchmark R0_BLOCK 2048 vs
++        # 4096 per process); with the filter every process matched bitwise. NVIDIA was already bit-exact.
++        filter_reduction_configs_archs = ("gfx1151",),
+         # Streamed: faster than eager with bit-identical latents; two replays per step (CFG), one graph per shape.
+         offload_cuda_graph = True,
+         # UMT5 keeps its overflowing `wo` in fp32 itself; the VAE stays fp32 (vae_force_fp32).
+diff --git a/studio/backend/tests/fixtures/diffusion_family_data_freeze.json b/studio/backend/tests/fixtures/diffusion_family_data_freeze.json
+index a56332a4dd..445ad7231d 100644
+--- a/studio/backend/tests/fixtures/diffusion_family_data_freeze.json
++++ b/studio/backend/tests/fixtures/diffusion_family_data_freeze.json
+@@ -596,7 +596,9 @@
+   "wan2.2-ti2v-5b": {
+    "cudnn_benchmark": false,
+    "filter_reduction_configs": false,
+-   "filter_reduction_configs_archs": [],
++   "filter_reduction_configs_archs": [
++    "gfx1151"
++   ],
+    "vae_fused_encoder": true
+   },
+   "z-image": {
+diff --git a/studio/backend/tests/test_wan_rocm_reduction_filter.py b/studio/backend/tests/test_wan_rocm_reduction_filter.py
+new file mode 100644
+index 0000000000..0138c883ea
+--- /dev/null
++++ b/studio/backend/tests/test_wan_rocm_reduction_filter.py
+@@ -0,0 +1,127 @@
++# SPDX-License-Identifier: AGPL-3.0-only
++# Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
++
++"""Wan2.2-TI2V-5B pins inductor's reduction-config filter on gfx1151 (Strix Halo), so one seed renders one clip in
++every fresh Studio process there.
++
++Two of its norm reductions get an R0_BLOCK 2048 and a 4096 config that sum in different orders, and a cold-cache
++process benchmarked them on near-equal timings: fresh gfx1151 processes rendered one seed into up to four clips (the
++frames matched exactly the two kernels' picks). With the filter every process matched bitwise. The opt-in is keyed on
++the ROCm gfx name, so NVIDIA (already bit-exact) and other AMD archs keep inductor's pick."""
++
++from __future__ import annotations
++
++import types
++
++import pytest
++
++torch = pytest.importorskip("torch")
++
++from core.inference import diffusion_compile_config as cc  # noqa: E402
++from core.inference import diffusion_speed as ds  # noqa: E402
++
++_WAN = "wan2.2-ti2v-5b"
++
++
++def _family(name):
++    from core.inference import diffusion_families, video_families
++    for fam in (*video_families._FAMILIES, *diffusion_families._FAMILIES):
++        if fam.name == name:
++            return fam
++    raise AssertionError(f"no family {name}")
++
++
++def _on_rocm(monkeypatch, arch):
++    """A ROCm torch whose current device reports ``arch`` (gcnArchName carries the feature suffix)."""
++    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
++    monkeypatch.setattr(torch.version, "hip", "7.13.99004", raising = False)
++    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
++    props = types.SimpleNamespace(gcnArchName = f"{arch}:sramecc-:xnack-", major = 11, minor = 5)
++    monkeypatch.setattr(torch.cuda, "get_device_properties", lambda *a, **k: props)
++    # A ROCm device answers a capability too: it must never be read as an NVIDIA one.
++    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *a, **k: (11, 5))
++
++
++def _filter_reaching_compile(monkeypatch, family):
++    seen = {}
++
++    def fake_compile(pipe, logger, **kwargs):
++        seen.update(kwargs)
++        return False
++
++    monkeypatch.setattr(ds, "compile_eligible", lambda *a, **k: True)
++    monkeypatch.setattr(ds, "_compile_repeated_blocks", fake_compile)
++    target = types.SimpleNamespace(device = "cpu", dtype = torch.bfloat16, backend = "cuda")
++    ds.apply_speed_optims(
++        types.SimpleNamespace(), target, is_gguf = False, family = family, speed_mode = ds.SPEED_DEFAULT
++    )
++    return seen["filter_reductions"]
++
++
++def test_wan_ti2v_5b_pins_the_filter_on_gfx1151(monkeypatch):
++    _on_rocm(monkeypatch, "gfx1151")
++    fam = _family(_WAN)
++    assert cc.family_filters_reductions(fam) is True
++    assert _filter_reaching_compile(monkeypatch, fam) is True
++
++
++@pytest.mark.parametrize("arch", ["gfx1100", "gfx1201", "gfx942", "gfx90a"])
++def test_wan_ti2v_5b_keeps_inductor_pick_on_other_amd_archs(monkeypatch, arch):
++    _on_rocm(monkeypatch, arch)
++    assert cc.family_filters_reductions(_family(_WAN)) is False
++
++
++@pytest.mark.parametrize("cap", [(7, 5), (8, 0), (8, 9), (9, 0), (10, 0), (12, 0), None])
++def test_wan_ti2v_5b_keeps_inductor_pick_on_nvidia(monkeypatch, cap):
++    monkeypatch.setattr(cc, "_device_capability", lambda: cap)
++    monkeypatch.setattr(cc, "_rocm_gfx_arch", lambda: None, raising = False)
++    assert cc.family_filters_reductions(_family(_WAN)) is False
++
++
++def test_cuda_arch_lists_never_match_a_rocm_device(monkeypatch):
++    # FLUX.1 / Qwen-Image list CUDA capabilities only: a gfx1151 card stays on inductor's pick.
++    _on_rocm(monkeypatch, "gfx1151")
++    for name in ("flux.1", "qwen-image", "z-image"):
++        assert cc.family_filters_reductions(_family(name)) is False
++
++
++def test_gfx_names_match_case_and_suffix_insensitively(monkeypatch):
++    _on_rocm(monkeypatch, "gfx1151")
++    for archs in (("gfx1151",), ("GFX1151",), [(12, 0), "gfx1151"]):
++        assert (
++            cc.family_filters_reductions(
++                types.SimpleNamespace(filter_reduction_configs_archs = archs)
++            )
++            is True
++        )
++    assert (
++        cc.family_filters_reductions(
++            types.SimpleNamespace(filter_reduction_configs_archs = ("gfx115",))
++        )
++        is False
++    )
++
++
++def test_a_cuda_device_never_matches_a_gfx_name(monkeypatch):
++    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
++    monkeypatch.setattr(torch.version, "hip", None, raising = False)
++    monkeypatch.setattr(torch, "__version__", "2.11.0+cu130", raising = False)
++    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *a, **k: (12, 0))
++    fam = types.SimpleNamespace(filter_reduction_configs_archs = ("gfx1151",))
++    assert cc.family_filters_reductions(fam) is False
++    assert (
++        cc.family_filters_reductions(
++            types.SimpleNamespace(filter_reduction_configs_archs = ("gfx1151", (12, 0)))
++        )
++        is True
++    )
++
++
++def test_unreadable_rocm_device_pins_nothing(monkeypatch):
++    _on_rocm(monkeypatch, "gfx1151")
++
++    def boom(*a, **k):
++        raise RuntimeError("no device")
++
++    monkeypatch.setattr(torch.cuda, "get_device_properties", boom)
++    assert cc.family_filters_reductions(_family(_WAN)) is False
