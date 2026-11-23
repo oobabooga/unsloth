@@ -1,0 +1,74 @@
+[
+ {
+  "tag": "M1",
+  "model": "Wan-AI/Wan2.2-T2V-A14B-Diffusers",
+  "auto": true,
+  "renders": 2,
+  "gen": {
+   "width": 640,
+   "height": 384,
+   "num_frames": 9,
+   "steps": 4
+  }
+ },
+ {
+  "tag": "M2",
+  "model": "Wan-AI/Wan2.2-T2V-A14B-Diffusers",
+  "auto": true,
+  "renders": 2,
+  "gen": {
+   "width": 640,
+   "height": 384,
+   "num_frames": 9,
+   "steps": 4
+  }
+ },
+ {
+  "tag": "M3",
+  "model": "Wan-AI/Wan2.2-T2V-A14B-Diffusers",
+  "auto": true,
+  "renders": 2,
+  "gen": {
+   "width": 640,
+   "height": 384,
+   "num_frames": 9,
+   "steps": 4
+  }
+ },
+ {
+  "tag": "M4",
+  "model": "Wan-AI/Wan2.2-T2V-A14B-Diffusers",
+  "auto": true,
+  "renders": 2,
+  "gen": {
+   "width": 640,
+   "height": 384,
+   "num_frames": 9,
+   "steps": 4
+  }
+ },
+ {
+  "tag": "N1",
+  "model": "Wan-AI/Wan2.2-T2V-A14B-Diffusers",
+  "auto": true,
+  "renders": 2,
+  "gen": {
+   "width": 832,
+   "height": 480,
+   "num_frames": 17,
+   "steps": 8
+  }
+ },
+ {
+  "tag": "N2",
+  "model": "Wan-AI/Wan2.2-T2V-A14B-Diffusers",
+  "auto": true,
+  "renders": 2,
+  "gen": {
+   "width": 832,
+   "height": 480,
+   "num_frames": 17,
+   "steps": 8
+  }
+ }
+]
