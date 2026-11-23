@@ -36,7 +36,8 @@ WIN = sys.platform == "win32"
 FILES = {
     "dit": ("unsloth/FLUX.2-klein-4B-GGUF", "flux-2-klein-4b-Q4_K_M.gguf"),
     "llm": ("unsloth/Qwen3-4B-GGUF", "Qwen3-4B-BF16.gguf"),
-    "vae": ("black-forest-labs/FLUX.2-klein-4B", "vae/diffusion_pytorch_model.safetensors"),
+    # The ungated unsloth copy of the FLUX.2 klein VAE (the black-forest-labs URL answered HTTP errors to the runners).
+    "vae": ("unsloth/FLUX.2-klein-4B", "vae/diffusion_pytorch_model.safetensors"),
 }
 FAMILY = "flux.2-klein"
 PROMPT = "a photo of a red fox sitting in fresh snow, golden hour, detailed fur, a wooden cabin behind"
@@ -85,13 +86,13 @@ def fetch(url: str, dest: Path) -> dict:
     curl = "curl.exe" if WIN else "curl"
     rcs = []
     rc = 1
-    for _ in range(4):
-        rc = subprocess.run([curl, "-sS", "--fail", "-L", "--retry", "5", "--retry-delay", "5", "--retry-all-errors",
+    for _ in range(8):  # HF answered 502 / HTTP2 CANCEL to the runners on the first run
+        rc = subprocess.run([curl, "-sS", "--fail", "-L", "--http1.1", "--retry", "5", "--retry-delay", "5", "--retry-all-errors",
                              "-o", str(dest) + ".part", url], env = clean_env()).returncode
         rcs.append(rc)
         if rc == 0:
             break
-        time.sleep(20)
+        time.sleep(30)
     if rc != 0:
         return {"url": url, "error": f"curl rc={rcs}"}
     os.replace(str(dest) + ".part", dest)
@@ -200,7 +201,7 @@ class Runner:
             rec["cached"] = True
             return rec
         m = self.models
-        argv = ["--diffusion-model", m["dit"], "--vae", m["vae"], "--llm", m["llm"], "--steps", str(self.steps),
+        argv = ["--diffusion-model", m["dit"], "--vae", m["vae"], "--vae-format", "flux2", "--llm", m["llm"], "--steps", str(self.steps),
                 "--cfg-scale", "1.0", "-W", str(size), "-H", str(size), "--prompt", PROMPT, "--seed", "42",
                 "-v", *flags]
         png, log = self.dir / f"{key}.png", self.dir / f"{key}.log"
