@@ -1,0 +1,223 @@
+name: "AMD CI: ROCm hosted int8 gfx1151 gate (PR 18951 head) and audit follow-ups on gfx1151 (Linux)"
+
+# Measurement only: no secret is referenced, every model is a public download (token=False).
+# Part A: base = unsloth d480a0ade9c1 (PR 18951 merge base), head = base + partA.patch (the new PR head).
+# Part B: base = unsloth 1446c1d54a (main), head = base + partB.patch (studio-rocm-audit-followups).
+
+on:
+  push:
+    branches: [amd-ci-nov22-rfix]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  UPSTREAM: "https://github.com/unslothai/unsloth"
+  BASE_A: "d480a0ade9c1f5e6a3fd67feb519c347c0ab3c09"
+  BASE_B: "1446c1d54a676a2fee415f8c3a1514d84c148bd3"
+
+jobs:
+
+  m1_cells:
+    name: "amd:gfx1151-linux rfix (gfx1151, exclusive GPU)"
+    runs-on: [self-hosted, Linux, strix-halo, devlab-dispatch]
+    timeout-minutes: 900
+    # The shared GPU group: one GPU measurement at a time across all branches.
+    concurrency:
+      group: amd-ci-gfx1151-gpu
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+        with: { persist-credentials: false }
+
+      - name: Preamble
+        run: |
+          source amd_ci/lib/preamble.sh "dbench-rfix"
+
+      - name: Hardware gate
+        run: |
+          set -euo pipefail
+          python3 amd_ci/lib/gate.py --no-torch --require rocm gpu \
+            --expect-arch gfx1151 --min-gpus 1 \
+            --out "$AMD_CI_WORK/out/host.json" || \
+          echo "note: gate ran before the venv exists; re-gated after install below"
+
+      - name: Disk, memory, cores
+        run: |
+          set +e
+          df -h "$RUNNER_TEMP"; free -g; nproc
+          exit 0
+
+      - name: Resolve states (A = PR 18951 merge base +- partA.patch, B = main +- partB.patch)
+        run: |
+          set -euo pipefail
+          git clone -q --filter=blob:none "$UPSTREAM" "$AMD_CI_WORK/repo"
+          for P in A B; do
+            if [ "$P" = A ]; then SHA="$BASE_A"; else SHA="$BASE_B"; fi
+            git -C "$AMD_CI_WORK/repo" worktree add -q --detach "$AMD_CI_WORK/$P/states/base" "$SHA"
+            git -C "$AMD_CI_WORK/repo" worktree add -q --detach "$AMD_CI_WORK/$P/states/head" "$SHA"
+            git -C "$AMD_CI_WORK/$P/states/head" apply --index "$GITHUB_WORKSPACE/amd_ci/patches/part$P.patch"
+            git -C "$AMD_CI_WORK/$P/states/head" diff --cached --stat
+            python3 "$GITHUB_WORKSPACE/diffusion_bench/amd/write_states.py" --work "$AMD_CI_WORK/$P" \
+              --base-sha "$SHA" --patch "part$P.patch" --out "$AMD_CI_WORK/out/states_$P.json"
+          done
+
+      - name: Environment and real gate
+        timeout-minutes: 60
+        run: |
+          set -euo pipefail
+          cd "$AMD_CI_WORK/B/states/base"
+          export UNSLOTH_STUDIO_HOME="$AMD_CI_WORK/studio"
+          echo "UNSLOTH_STUDIO_HOME=$UNSLOTH_STUDIO_HOME" >> "$GITHUB_ENV"
+          export UV_EXTRA_INDEX_URL="https://pypi.org/simple"
+          set +e
+          bash install.sh --local 2>&1 | tail -15
+          rc=${PIPESTATUS[0]}
+          set -e
+          [ "$rc" -eq 0 ] || exit "$rc"
+          V=""
+          for c in "$UNSLOTH_STUDIO_HOME"/unsloth_studio "$UNSLOTH_STUDIO_HOME"/.venv_t5_*; do
+            [ -x "$c/bin/python" ] && { V="$c"; break; }
+          done
+          [ -n "$V" ] || { echo "FATAL: no Studio venv"; exit 1; }
+          echo "AMD_CI_PY=$V/bin/python" >> "$GITHUB_ENV"
+          "$V/bin/python" "$GITHUB_WORKSPACE/amd_ci/lib/gate.py" --require rocm gpu \
+            --expect-arch gfx1151 --min-gpus 1 --out "$AMD_CI_WORK/out/host.json"
+          "$V/bin/python" -c "import torch, diffusers, transformers; print('studio torch', torch.__version__, 'hip', torch.version.hip, 'diffusers', diffusers.__version__, 'transformers', transformers.__version__)"
+
+      - name: "Part B (2): FLUX.2 VAE 1024 / 2048 px decode, fold peak vs estimate (base vs head)"
+        timeout-minutes: 120
+        run: |
+          set +e
+          unset CI
+          export HF_HOME="$AMD_CI_WORK/hf_home_vae" HF_HUB_DISABLE_TELEMETRY=1
+          unset HF_TOKEN HUGGING_FACE_HUB_TOKEN
+          "$AMD_CI_PY" amd_ci/lib/differential.py \
+            --states "$AMD_CI_WORK/out/states_B.json" \
+            --probe amd_ci/probes/vae_fold_peak_probe.py \
+            --criteria amd_ci/criteria/vae_fold_peak.py \
+            --out-dir "$AMD_CI_WORK/out/vae" \
+            --python "$AMD_CI_PY"
+          cat "$AMD_CI_WORK/out/vae/VERDICT.md" >> "$GITHUB_STEP_SUMMARY"
+          W="${AMD_CI_WORK:?}"
+          mkdir -p "$W/out/vae/arms"
+          cp "$W"/vaefold/*.log "$W"/vaefold/*.json "$W/out/vae/arms/" 2>/dev/null
+          rm -rf "${W:?}/vaefold" "${W:?}/hf_home_vae"
+          exit 0
+
+      - name: Model files, Part A (public downloads)
+        timeout-minutes: 150
+        run: |
+          set -euo pipefail
+          export HF_HOME="$AMD_CI_WORK/hf_home" HF_HUB_DISABLE_TELEMETRY=1
+          "$AMD_CI_PY" -m pip install -q huggingface_hub > /dev/null 2>&1 || true
+          "$AMD_CI_PY" "$GITHUB_WORKSPACE/diffusion_bench/targets/fetch_files.py" --spec "$GITHUB_WORKSPACE/diffusion_bench/specs/plan_img_A.json" \
+            --root "$AMD_CI_WORK/cm" --write "$GITHUB_WORKSPACE/diffusion_bench/specs/plan_img_A.json"
+          df -h "$RUNNER_TEMP"
+
+      - name: Clean GPU pool preflight (A)
+        timeout-minutes: 35
+        run: |
+          set -euo pipefail
+          "$AMD_CI_PY" "$GITHUB_WORKSPACE/diffusion_bench/amd/preflight_free.py" --min-free-gib 50 \
+            --timeout-s 1800 --out "$AMD_CI_WORK/out/preflight_A.json"
+
+      - name: "Part A: FLUX.3 Klein / Qwen-Image-2.1 explicit int8, kill switch, Auto (PR 18951 base vs head)"
+        timeout-minutes: 330
+        run: |
+          set +e
+          unset CI
+          export TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL=1
+          [ "${TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL:-}" = 1 ] || { echo "FATAL: AOTriton opt-in missing"; exit 3; }
+          [ -z "${CI+x}" ] || { echo "FATAL: CI is still set"; exit 3; }
+          export TORCH_HOME="$AMD_CI_WORK/torch_home"
+          export HF_HOME="$AMD_CI_WORK/hf_home"
+          "$AMD_CI_PY" amd_ci/lib/differential.py \
+            --states "$AMD_CI_WORK/out/states_A.json" \
+            --probe diffusion_bench/amd/diffusion_probe.py \
+            --criteria diffusion_bench/amd/criteria_no_regression.py \
+            --out-dir "$AMD_CI_WORK/out/gpuA" \
+            --python "$AMD_CI_PY" -- --spec diffusion_bench/specs/plan_img_A.json --work "$AMD_CI_WORK/dbenchA" --budget-min 150 --cell-timeout 3600 --only trial__amd-gfx1151-linux-1 --only flux-3-klein_amd-gfx1151-linux__s_int8_auto__k1p0 --only flux-3-klein_amd-gfx1151-linux__s_int8_int8__k1p2 --only flux-3-klein_amd-gfx1151-linux__s_int8_int8ks__k1p3 --only qwen-image-2-1_amd-gfx1151-linux__s_int8_auto__k1p0 --only qwen-image-2-1_amd-gfx1151-linux__s_int8_int8__k1p2 --only qwen-image-2-1_amd-gfx1151-linux__s_int8_int8ks__k1p3 --state-only head=flux-3-klein_amd-gfx1151-linux__s_int8_auto__k1p0 --state-only head=flux-3-klein_amd-gfx1151-linux__s_int8_int8__k1p2 --state-only head=flux-3-klein_amd-gfx1151-linux__s_int8_int8ks__k1p3 --state-only head=qwen-image-2-1_amd-gfx1151-linux__s_int8_auto__k1p0 --state-only head=qwen-image-2-1_amd-gfx1151-linux__s_int8_int8__k1p2 --state-only head=qwen-image-2-1_amd-gfx1151-linux__s_int8_int8ks__k1p3
+          cat "$AMD_CI_WORK/out/gpuA/VERDICT.md" >> "$GITHUB_STEP_SUMMARY"
+          python3 "$GITHUB_WORKSPACE/amd_ci/lib/announce.py" "$AMD_CI_WORK/out/gpuA"
+          exit 0
+
+      - name: Free Part A model files
+        run: |
+          set +e
+          W="${AMD_CI_WORK:?}"
+          rm -rf "${W:?}/cm" "${W:?}/hf_home" "${W:?}/dbenchA/models"
+          df -h "$RUNNER_TEMP"
+          exit 0
+
+      - name: Model files, Part B (public downloads)
+        timeout-minutes: 150
+        run: |
+          set -euo pipefail
+          export HF_HOME="$AMD_CI_WORK/hf_home" HF_HUB_DISABLE_TELEMETRY=1
+          "$AMD_CI_PY" "$GITHUB_WORKSPACE/diffusion_bench/targets/fetch_files.py" --spec "$GITHUB_WORKSPACE/diffusion_bench/specs/plan_ltx_B.json" \
+            --root "$AMD_CI_WORK/cm" --write "$GITHUB_WORKSPACE/diffusion_bench/specs/plan_ltx_B.json"
+          df -h "$RUNNER_TEMP"
+
+      - name: Clean GPU pool preflight (B)
+        timeout-minutes: 35
+        run: |
+          set -euo pipefail
+          "$AMD_CI_PY" "$GITHUB_WORKSPACE/diffusion_bench/amd/preflight_free.py" --min-free-gib 50 \
+            --timeout-s 1800 --out "$AMD_CI_WORK/out/preflight_B.json"
+
+      - name: "Part B (1): LTX-2.5 explicit int8 on gfx1151 (main base vs head)"
+        timeout-minutes: 240
+        run: |
+          set +e
+          unset CI
+          export TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL=1
+          [ -z "${CI+x}" ] || { echo "FATAL: CI is still set"; exit 3; }
+          export TORCH_HOME="$AMD_CI_WORK/torch_home"
+          export HF_HOME="$AMD_CI_WORK/hf_home"
+          "$AMD_CI_PY" amd_ci/lib/differential.py \
+            --states "$AMD_CI_WORK/out/states_B.json" \
+            --probe diffusion_bench/amd/diffusion_probe.py \
+            --criteria diffusion_bench/amd/criteria_no_regression.py \
+            --out-dir "$AMD_CI_WORK/out/gpuB" \
+            --python "$AMD_CI_PY" -- --spec diffusion_bench/specs/plan_ltx_B.json --work "$AMD_CI_WORK/dbenchB" --budget-min 120 --cell-timeout 3600 --only trial__amd-gfx1151-linux-1 --only ltx-2-5_amd-gfx1151-linux__s_int8_int8__k1p2 --state-only head=ltx-2-5_amd-gfx1151-linux__s_int8_int8__k1p2
+          cat "$AMD_CI_WORK/out/gpuB/VERDICT.md" >> "$GITHUB_STEP_SUMMARY"
+          python3 "$GITHUB_WORKSPACE/amd_ci/lib/announce.py" "$AMD_CI_WORK/out/gpuB"
+          exit 0
+
+      - name: Stop anything this job started (arms that never exited)
+        if: always()
+        run: |
+          set +e
+          # an unset / relative / root work dir would match every process: stop nothing then
+          W="${AMD_CI_WORK:-}"
+          case "$W" in /?*/?*) ;; *) echo "no usable AMD_CI_WORK root ('$W'): nothing to stop"; exit 0 ;; esac
+          [ -d "$W" ] || { echo "AMD_CI_WORK $W is not a directory: nothing to stop"; exit 0; }
+          W="${W%/}"
+          for sig in TERM KILL; do
+            for d in /proc/[0-9]*; do
+              pid=${d#/proc/}
+              [ "$pid" = "$$" ] && continue
+              cwd=$(readlink "$d/cwd" 2>/dev/null)
+              case "$cwd" in
+                "$W"|"$W"/*) echo "$sig pid $pid (cwd $cwd)"; kill -$sig "$pid" 2>/dev/null ;;
+              esac
+            done
+            sleep 5
+          done
+          exit 0
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: dbench-rfix
+          path: |
+            ${{ env.AMD_CI_WORK }}/out
+            ${{ env.AMD_CI_WORK }}/dbench*/states/*/runs/**/record.json
+            ${{ env.AMD_CI_WORK }}/dbench*/states/*/runs/**/*.png
+            ${{ env.AMD_CI_WORK }}/dbench*/states/*/runs/**/*.mp4
+            ${{ env.AMD_CI_WORK }}/dbench*/states/*/runs/**/*.log
+            ${{ env.AMD_CI_WORK }}/dbench*/states/*/logs
+          retention-days: 14
+          if-no-files-found: warn
