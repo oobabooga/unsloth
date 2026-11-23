@@ -24,6 +24,8 @@ KILL_ENVS = (
     "UNSLOTH_DIFFUSION_GC_SAVE_ATTENTION",
     "UNSLOTH_DIFFUSION_FAST_LORA",
     "UNSLOTH_DIFFUSION_DEQUANT_CACHE_GB",
+    "TORCH_BLAS_PREFER_HIPBLASLT",
+    "ACC_HASH_DIR",
 )
 
 
@@ -105,6 +107,8 @@ def main() -> int:
         name, state = arm["name"], arm["state"]
         env = {k: v for k, v in os.environ.items() if k not in KILL_ENVS}
         env.update({k: str(v) for k, v in (arm.get("env") or {}).items()})
+        if os.environ.get("ACC_HASH_ROOT"):
+            env["ACC_HASH_DIR"] = str(Path(os.environ["ACC_HASH_ROOT"]) / name)
         obs = out / f"obs_{name}.json"
         cmd = [args.python, "-u", args.probe, "--state", name, "--checkout", paths[state], "--out", str(obs),
                "--suite", "flux3", "--control-state", "none", "--precisions", arm.get("precisions", "bf16,nf4"),

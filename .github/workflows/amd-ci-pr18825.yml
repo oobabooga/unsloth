@@ -30,7 +30,7 @@ name: "AMD CI (Windows): validate PR 18825"
 
 on:
   push:
-    branches: [amd-ci-pr18825-tb]
+    branches: [amd-ci-pr18825-mech]
   workflow_dispatch:
 
 permissions:
@@ -157,13 +157,25 @@ jobs:
             --out "$env:AMD_CI_WORK\out\host_rocm.json"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
-      - name: Arms (base / main / kill switches, each its own process)
+      - name: Mechanism probe 2 (address / memory-pressure / thread dependence of kernels)
+        run: |
+          $ErrorActionPreference = "Continue"
+          & $env:AMD_CI_PY "$env:GITHUB_WORKSPACE\amd_ci\probes\acc18825_align.py" --out "$env:AMD_CI_WORK\out\align.json" *>&1 | Select-Object -Last 20 | Out-String | Write-Host
+          Get-Content "$env:AMD_CI_WORK\out\align.json" -Encoding UTF8 | Write-Host
+          exit 0
+
+      - name: Arms (bf16, per-step gradient bit checksums)
         timeout-minutes: 300
         run: |
           $ErrorActionPreference = "Continue"
+          $env:PYTHONPATH = "$env:GITHUB_WORKSPACE\amd_ci\hooks"
+          $env:ACC_HASH_ROOT = "$env:AMD_CI_WORK\out\hash"
+          $env:TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL = "1"
+          $env:CUDA_DEVICE_ORDER = "PCI_BUS_ID"
+          $env:TOKENIZERS_PARALLELISM = "false"
           & $env:AMD_CI_PY "$env:GITHUB_WORKSPACE\amd_ci\probes\acc18825_arms.py" `
-            --states "$env:AMD_CI_WORK\out\states.json" --extra-commit "main=$env:MAIN_SHA" --extra-commit "tbase=098209dbc233674c943edb49434af49c6e0472fd" --extra-commit "m939=939f7df181c1e961f7d3e2fb0a93b5c2fcb7bc2e" --ref-arm tbase_a `
-            --arms "$env:GITHUB_WORKSPACE\amd_ci\config\arms_win.json" `
+            --states "$env:AMD_CI_WORK\out\states.json" --extra-commit "main=$env:MAIN_SHA" `
+            --arms "$env:GITHUB_WORKSPACE\amd_ci\config\arms_win3.json" --ref-arm bud_a `
             --probe "$env:GITHUB_WORKSPACE\amd_ci\probes\diffusion_lora_train_probe.py" `
             --out-dir "$env:AMD_CI_WORK\out\arms" --python "$env:AMD_CI_PY"
           $rc = $LASTEXITCODE
@@ -173,7 +185,7 @@ jobs:
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: pr18825-windows-tb
+          name: pr18825-windows-mech
           path: ${{ env.AMD_CI_WORK }}/out
           retention-days: 7
           if-no-files-found: warn

@@ -1,0 +1,95 @@
+[
+ {
+  "name": "warm",
+  "state": "main",
+  "precisions": "bf16"
+ },
+ {
+  "name": "bud_a",
+  "state": "main",
+  "precisions": "bf16"
+ },
+ {
+  "name": "plain_a",
+  "state": "main",
+  "env": {
+   "UNSLOTH_DIFFUSION_GC_MODE": "plain"
+  },
+  "precisions": "bf16"
+ },
+ {
+  "name": "bud_b",
+  "state": "main",
+  "precisions": "bf16"
+ },
+ {
+  "name": "plain_b",
+  "state": "main",
+  "env": {
+   "UNSLOTH_DIFFUSION_GC_MODE": "plain"
+  },
+  "precisions": "bf16"
+ },
+ {
+  "name": "nosave_a",
+  "state": "main",
+  "env": {
+   "UNSLOTH_DIFFUSION_GC_SAVE_ATTENTION": "0"
+  },
+  "precisions": "bf16"
+ },
+ {
+  "name": "nosave_b",
+  "state": "main",
+  "env": {
+   "UNSLOTH_DIFFUSION_GC_SAVE_ATTENTION": "0"
+  },
+  "precisions": "bf16"
+ },
+ {
+  "name": "bud_c",
+  "state": "main",
+  "precisions": "bf16"
+ },
+ {
+  "name": "blas0_bud_a",
+  "state": "main",
+  "env": {
+   "TORCH_BLAS_PREFER_HIPBLASLT": "0"
+  },
+  "precisions": "bf16"
+ },
+ {
+  "name": "blas0_bud_b",
+  "state": "main",
+  "env": {
+   "TORCH_BLAS_PREFER_HIPBLASLT": "0"
+  },
+  "precisions": "bf16"
+ },
+ {
+  "name": "blas0_plain",
+  "state": "main",
+  "env": {
+   "TORCH_BLAS_PREFER_HIPBLASLT": "0",
+   "UNSLOTH_DIFFUSION_GC_MODE": "plain"
+  },
+  "precisions": "bf16"
+ },
+ {
+  "name": "blas1_bud_a",
+  "state": "main",
+  "env": {
+   "TORCH_BLAS_PREFER_HIPBLASLT": "1"
+  },
+  "precisions": "bf16"
+ },
+ {
+  "name": "blas1_bud_b",
+  "state": "main",
+  "env": {
+   "TORCH_BLAS_PREFER_HIPBLASLT": "1"
+  },
+  "precisions": "bf16"
+ }
+]
