@@ -90,7 +90,7 @@ jobs:
         run: |
           $ErrorActionPreference = "Continue"
           & "$env:AMD_CI_WORK\venv\Scripts\python.exe" -u "$env:GITHUB_WORKSPACE\inkbench\amd_job.py" --kit "$env:GITHUB_WORKSPACE\inkbench" `
-            --work "$env:AMD_CI_WORK\ib" --out "$env:AMD_CI_WORK\out\ib" --rounds 3 *>&1 | Tee-Object -FilePath "$env:AMD_CI_WORK\out\amd_job.log"
+            --work "$env:AMD_CI_WORK\ib" --out "$env:AMD_CI_WORK\out\ib" --rounds 3 --win-recipe xgpu *>&1 | Tee-Object -FilePath "$env:AMD_CI_WORK\out\amd_job.log"
           $rc = $LASTEXITCODE
           Write-Host "amd_job rc=$rc"
           exit $rc

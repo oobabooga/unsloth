@@ -109,8 +109,22 @@ def git(*a, cwd):
                           capture_output=True, text=True).stdout.strip()
 
 
-def build_head(kit, work, rroot, out):
-    src, bdir = work / "src_HEAD", work / "build_HEAD"
+def rocm_wheels(work):
+    """ROCm SDK wheels for gfx1151 (the toolchain the earlier inkperf4 Windows leg built with successfully)."""
+    for idx in (f"https://rocm.nightlies.amd.com/v2/{GFX}/", f"https://repo.amd.com/rocm/whl/{GFX}/"):
+        if run([sys.executable, "-m", "pip", "install", "-q", "--index-url", idx, "rocm[libraries,devel]"], check=False) == 0:
+            break
+    sdk = Path(sys.executable).parent / ("rocm-sdk" + EXE)
+    root = Path(subprocess.run([str(sdk), "path", "--root"], capture_output=True, text=True).stdout.strip().splitlines()[-1])
+    ver = subprocess.run([sys.executable, "-m", "pip", "show", "rocm"], capture_output=True, text=True).stdout
+    ver = re.search(r"Version: (\S+)", ver)
+    log("ROCm wheels root", root, ver and ver.group(1))
+    return root, (ver.group(1) if ver else "?")
+
+
+def build_head(kit, work, rroot, out, diff="head_b12631.diff", want_tree=None, name="HEAD", recipe="prebuilt"):
+    want_tree = want_tree or HEAD_TREE
+    src, bdir = work / f"src_{name}", work / f"build_{name}"
     if src.exists():
         shutil.rmtree(src)
     src.mkdir(parents=True)
@@ -120,12 +134,12 @@ def build_head(kit, work, rroot, out):
     c = git("rev-parse", "HEAD", cwd=src)
     if not c.startswith(HEAD_COMMIT):
         raise SystemExit(f"{HEAD_TAG} = {c}, expected {HEAD_COMMIT}")
-    git("apply", "--binary", "--whitespace=nowarn", str(kit / "head_b12631.diff"), cwd=src)
+    git("apply", "--binary", "--whitespace=nowarn", str(kit / diff), cwd=src)
     git("add", "-A", cwd=src)
     tree = git("write-tree", cwd=src)
-    log("HEAD tree", tree)
-    if tree != HEAD_TREE:
-        raise SystemExit(f"HEAD tree {tree} != {HEAD_TREE}")
+    log(f"{name} tree", tree)
+    if tree != want_tree:
+        raise SystemExit(f"{name} tree {tree} != {want_tree}")
     env = dict(os.environ)
     llvm = rroot / "lib" / "llvm" / "bin"
     if WIN:
@@ -146,23 +160,31 @@ def build_head(kit, work, rroot, out):
     if WIN:
         flags.insert(2, "-DCMAKE_C_FLAGS=-Wno-error=incompatible-pointer-types")
     note = "prebuilt ROCm flags, GGML_RPC=OFF, no server"
+    if recipe == "xgpu":  # the inkperf4 Windows leg's recipe: native CPU, no backend DL, ROCm wheels' clang
+        clang = next(c for c in (llvm / f"clang{EXE}", rroot / "bin" / f"clang{EXE}") if c.exists())
+        flags = [f"-DCMAKE_C_COMPILER={clang}", f"-DCMAKE_CXX_COMPILER={clang.with_name('clang++' + EXE)}",
+                 "-DCMAKE_BUILD_TYPE=Release", "-DLLAMA_BUILD_TESTS=OFF", "-DLLAMA_CURL=OFF", "-DLLAMA_BUILD_SERVER=OFF",
+                 "-DGGML_NATIVE=ON", "-DGGML_HIP=ON", f"-DGPU_TARGETS={GFX}", f"-DAMDGPU_TARGETS={GFX}", "-DGGML_RPC=OFF",
+                 "-DLLAMA_OPENSSL=OFF"]
+        env["HIP_CLANG_PATH"] = str(clang.parent)
+        note = "inkperf4 Windows recipe (ROCm wheels, GGML_NATIVE=ON, no GGML_BACKEND_DL), GGML_RPC=OFF"
     tg = ["llama-bench", "llama-perplexity", "llama-completion"]
-    for attempt, extra in enumerate([[], ["-DGGML_CPU_ALL_VARIANTS=OFF"]]):
+    for attempt, extra in enumerate([[], ["-DGGML_CPU_ALL_VARIANTS=OFF"]] if recipe == "prebuilt" else [[]]):
         if bdir.exists():
             shutil.rmtree(bdir)
-        rc = run(["cmake", "-S", src, "-B", bdir, "-G", "Ninja", *flags, *extra], env=env, logf=out / "head_cmake.log", check=False)
+        rc = run(["cmake", "-S", src, "-B", bdir, "-G", "Ninja", *flags, *extra], env=env, logf=out / f"{name.lower()}_cmake.log", check=False)
         if rc == 0:
             rc = run(["cmake", "--build", bdir, "--config", "Release", "-j", str(os.cpu_count() or 8), "--target", *tg],
-                     env=env, logf=out / "head_build.log", check=False)
+                     env=env, logf=out / f"{name.lower()}_build.log", check=False)
         if rc == 0:
             if extra:
                 note += "; GGML_CPU_ALL_VARIANTS=OFF (the all-variants CPU build failed with ROCm clang here)"
             break
-        log(f"HEAD build attempt {attempt} failed")
+        log(f"{name} build attempt {attempt} failed")
     else:
-        raise SystemExit("HEAD build failed")
+        raise SystemExit(f"{name} build failed")
     b = bdir / "bin"
-    (b / "BUILD_INFO.txt").write_text(f"ggml-org {HEAD_TAG} + head_b12631.diff, tree {tree}; TheRock {rroot}; {note}\n", encoding="utf-8")
+    (b / "BUILD_INFO.txt").write_text(f"ggml-org {HEAD_TAG} + {diff}, tree {tree}; ROCm {rroot}; {note}\n", encoding="utf-8")
     return b, note
 
 
@@ -206,6 +228,8 @@ def main():
     ap.add_argument("--work", required=True)
     ap.add_argument("--rounds", type=int, default=3)
     ap.add_argument("--out", default=None)
+    ap.add_argument("--win-recipe", default="prebuilt", choices=["prebuilt", "xgpu"],
+                    help="xgpu: build HEAD and a CURsrc control with the inkperf4 Windows recipe on ROCm wheels")
     a = ap.parse_args()
     kit, work = Path(a.kit).resolve(), Path(a.work).resolve()
     out = Path(a.out).resolve() if a.out else work / "out"
@@ -219,8 +243,13 @@ def main():
     fetch("https://huggingface.co/datasets/ggml-org/ci/resolve/main/wikitext-2-raw-v1.zip", z)
     zipfile.ZipFile(z).extractall(work / "wikitext")
     wiki = next((work / "wikitext").rglob("wiki.test.raw"))
-    rroot, rver = therock(work)
-    head_bin, note = build_head(kit, work, rroot, out)
+    xg = WIN and a.win_recipe == "xgpu"
+    rroot, rver = rocm_wheels(work) if xg else therock(work)
+    head_bin, note = build_head(kit, work, rroot, out, recipe="xgpu" if xg else "prebuilt")
+    cursrc_bin = None
+    if xg:
+        cursrc_bin, _ = build_head(kit, work, rroot, out, diff="cur_b12631.diff",
+                                   want_tree="6e030e1c96c8fb675af1a478de2b1bcbfd49f81e", name="CURsrc", recipe="xgpu")
     th.join()
     models = res["models"]
     log("models", models, "errors", res["errors"])
@@ -239,7 +268,13 @@ def main():
            "--ppl-arms", "CUR,HEAD", "--ppl-model", "q4", "--ppl-text", str(wiki),
            "--note", f"AMD {GFX} {'Windows HIP' if WIN else 'Linux ROCm'}; PREV/CUR unslothai rocm-{GFX} assets (bundled ROCm); "
                      f"MAIN ggml-org {main_asset}; HEAD {HEAD_TAG} + master 6fa79e0460 pins, TheRock {rver}, {note}"]
-    if WIN:
+    if xg:
+        cmd[cmd.index("--ratios") + 1] += ",HEAD/CURsrc,CURsrc/CUR"
+        cmd[cmd.index("--ppl-arms") + 1] = "CUR,CURsrc,HEAD"
+        cmd += ["--arm", f"CURsrc={cursrc_bin}", "--arm-lib", f"CURsrc={rlib}"]
+        cmd[cmd.index("--note") + 1] = cmd[cmd.index("--note") + 1].replace("TheRock", "ROCm wheels") + \
+            "; CURsrc = CUR's own source (release source tarball) built with the same recipe as HEAD (control)"
+    elif WIN:
         # TheRock's Windows tree keeps rocBLAS / hipBLASLt kernel packs where a bin\rocblas.dll does not find them
         # (first run: access violation in rocblas_sgemm from HEAD's ggml-hip.dll, every file and placement). The
         # prebuilt relocates them next to the DLLs (scripts/unsloth/relocate_kpack.py), so HEAD runs on CUR's
