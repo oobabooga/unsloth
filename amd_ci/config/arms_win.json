@@ -1,0 +1,96 @@
+[
+ {
+  "name": "warm",
+  "state": "main",
+  "precisions": "bf16,nf4"
+ },
+ {
+  "name": "base_a",
+  "state": "base",
+  "precisions": "bf16,nf4"
+ },
+ {
+  "name": "main_a",
+  "state": "main",
+  "precisions": "bf16,nf4"
+ },
+ {
+  "name": "base_b",
+  "state": "base",
+  "precisions": "bf16,nf4"
+ },
+ {
+  "name": "main_b",
+  "state": "main",
+  "precisions": "bf16,nf4"
+ },
+ {
+  "name": "main_off",
+  "state": "main",
+  "env": {
+   "UNSLOTH_DIFFUSION_GC_MODE": "plain",
+   "UNSLOTH_DIFFUSION_DEQUANT_CACHE": "0"
+  },
+  "precisions": "bf16,nf4"
+ },
+ {
+  "name": "main_plain",
+  "state": "main",
+  "env": {
+   "UNSLOTH_DIFFUSION_GC_MODE": "plain"
+  },
+  "precisions": "nf4"
+ },
+ {
+  "name": "main_nocache",
+  "state": "main",
+  "env": {
+   "UNSLOTH_DIFFUSION_DEQUANT_CACHE": "0"
+  },
+  "precisions": "nf4"
+ },
+ {
+  "name": "main_nosave",
+  "state": "main",
+  "env": {
+   "UNSLOTH_DIFFUSION_GC_SAVE_ATTENTION": "0",
+   "UNSLOTH_DIFFUSION_DEQUANT_CACHE": "0"
+  },
+  "precisions": "bf16,nf4"
+ },
+ {
+  "name": "merge_a",
+  "state": "head",
+  "precisions": "bf16,nf4"
+ },
+ {
+  "name": "main_plain_b",
+  "state": "main",
+  "env": {
+   "UNSLOTH_DIFFUSION_GC_MODE": "plain"
+  },
+  "precisions": "nf4"
+ },
+ {
+  "name": "main_nocache_b",
+  "state": "main",
+  "env": {
+   "UNSLOTH_DIFFUSION_DEQUANT_CACHE": "0"
+  },
+  "precisions": "nf4"
+ },
+ {
+  "name": "main_off_b",
+  "state": "main",
+  "env": {
+   "UNSLOTH_DIFFUSION_GC_MODE": "plain",
+   "UNSLOTH_DIFFUSION_DEQUANT_CACHE": "0"
+  },
+  "precisions": "bf16,nf4"
+ },
+ {
+  "name": "main_c",
+  "state": "main",
+  "precisions": "bf16,nf4"
+ }
+]
