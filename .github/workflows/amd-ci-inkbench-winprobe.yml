@@ -1,0 +1,110 @@
+name: "AMD CI: Inkling-2-Mini HEAD crash probe, CURsrc vs HEAD by kill switch (gfx1151 Windows HIP, correctness only)"
+
+# inkbench/amd_job.py: HEAD = ggml-org b12631 + unslothai master 6fa79e0460 pin set (head_b12631.diff, tree hash
+# checked) built with the b12631 prebuilt's TheRock 10.3.0a20261107 and ROCm flags (MSVC environment); PREV / CUR =
+# unslothai windows rocm-gfx1151 release assets; MAIN = ggml-org b12649 win-rocm-10.0. tg_bench.py: llama-bench -p 0
+# -n 1024 -fa 1 -ngl 99, one fresh process per run, arms interleaved per round, F16 and Q8_0 KV, plus the CUR vs HEAD
+# PPL sanity. No GPU group on Windows (as in the earlier inkperf4 Windows leg): the run records GPU state per run.
+
+on:
+  push:
+    branches: [amd-ci-inkbench-winprobe]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  ROCM_GFX: "gfx1151"
+
+jobs:
+
+  linux-control:
+    name: "linux control (selector diagnosis)"
+    runs-on: [self-hosted, Linux, strix-halo, devlab-dispatch]
+    timeout-minutes: 10
+    env:
+      HIP_VISIBLE_DEVICES: ""
+      ROCR_VISIBLE_DEVICES: ""
+    steps:
+      - name: Report which machine answered
+        run: |
+          set +e
+          echo "control leg: same selector with Linux in place of Windows; machine: $(uname -n)"
+
+  windows:
+    name: "HIP gfx1151 HEAD crash probe on Windows"
+    runs-on: [self-hosted, Windows, strix-halo, devlab-dispatch]
+    timeout-minutes: 600
+    defaults:
+      run:
+        shell: powershell
+    steps:
+      - uses: actions/checkout@v4
+        with: { persist-credentials: false }
+
+      - name: Preamble
+        run: |
+          .\amd_ci\lib\preamble.ps1 -Name "inkbench-winprobe"
+
+      - name: Locate the system Python
+        run: |
+          $ErrorActionPreference = "Continue"
+          $found = $null
+          foreach ($c in @("C:\Program Files\Python312\python.exe",
+                           "C:\Program Files\Python311\python.exe",
+                           "C:\Program Files\Python310\python.exe")) {
+            if (Test-Path -LiteralPath $c) { $found = $c; break }
+          }
+          if ($null -eq $found) {
+            Write-Host "FATAL: no system Python found at any known location."
+            exit 1
+          }
+          & $found --version
+          Add-Content -Path $env:GITHUB_ENV -Value "AMD_CI_PY=$found"
+
+      - name: Host diagnostics
+        run: |
+          $ErrorActionPreference = "Continue"
+          Write-Host "RUNNER_OS=[$env:RUNNER_OS] machine=$env:COMPUTERNAME"
+          foreach ($b in @("git", "tar", "cmake", "ninja", "amd-smi")) {
+            $c = Get-Command $b -ErrorAction SilentlyContinue
+            if ($c) { Write-Host ("{0,-10} {1}" -f $b, $c.Source) } else { Write-Host ("{0,-10} MISSING" -f $b) }
+          }
+          Get-CimInstance Win32_VideoController | ForEach-Object { Write-Host "GPU: $($_.Name) driver $($_.DriverVersion)" }
+          Get-PSDrive -PSProvider FileSystem | ForEach-Object { Write-Host "drive $($_.Name) free $([math]::Round($_.Free/1GB)) GB" }
+          & $env:AMD_CI_PY "$env:GITHUB_WORKSPACE\amd_ci\lib\gate.py" --no-torch --require windows --out "$env:AMD_CI_WORK\out\host.json"
+
+      - name: Python tools
+        timeout-minutes: 20
+        run: |
+          $ErrorActionPreference = "Continue"
+          $V = "$env:AMD_CI_WORK\venv"
+          & $env:AMD_CI_PY -m venv $V
+          & "$V\Scripts\python.exe" -m pip install -q --upgrade pip
+          & "$V\Scripts\python.exe" -m pip install -q "cmake>=3.28" ninja huggingface_hub
+          Add-Content -Path $env:GITHUB_ENV -Value "PATH=$V\Scripts;$env:PATH"
+
+      - name: Build HEAD and CURsrc, llama-bench per kill switch
+        timeout-minutes: 200
+        run: |
+          $ErrorActionPreference = "Continue"
+          & "$env:AMD_CI_WORK\venv\Scripts\python.exe" -u "$env:GITHUB_WORKSPACE\inkbench\amd_win_probe.py" --kit "$env:GITHUB_WORKSPACE\inkbench" `
+            --work "$env:AMD_CI_WORK\ib" --out "$env:AMD_CI_WORK\out\ib" *>&1 | Tee-Object -FilePath "$env:AMD_CI_WORK\out\amd_job.log"
+          $rc = $LASTEXITCODE
+          Write-Host "probe rc=$rc"
+          exit $rc
+
+      - name: Free the work tree (keep only out/)
+        if: always()
+        run: |
+          $ErrorActionPreference = "Continue"
+          Remove-Item -Recurse -Force "$env:AMD_CI_WORK\ib", "$env:AMD_CI_WORK\venv" -ErrorAction SilentlyContinue
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: inkbench-winprobe
+          path: ${{ env.AMD_CI_WORK }}/out
+          retention-days: 7
+          if-no-files-found: warn
