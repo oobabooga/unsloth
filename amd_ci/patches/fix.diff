@@ -1,0 +1,1119 @@
+diff --git a/studio/backend/core/inference/diffusion_compile_config.py b/studio/backend/core/inference/diffusion_compile_config.py
+index 1a26af585d..a6f30ccb91 100644
+--- a/studio/backend/core/inference/diffusion_compile_config.py
++++ b/studio/backend/core/inference/diffusion_compile_config.py
+@@ -33,7 +33,8 @@ def reduction_config_filter_available() -> bool:
+ 
+ 
+ def family_filters_reductions(family: Any) -> bool:
+-    """``filter_reduction_configs`` on every arch, or the current CUDA device listed in ``filter_reduction_configs_archs``."""
++    """``filter_reduction_configs`` on every arch, or the current device listed in ``filter_reduction_configs_archs``:
++    a CUDA (major, minor) capability, or a ROCm gfx name such as ``"gfx1151"``."""
+     if family is None:
+         return False
+     if bool(getattr(family, "filter_reduction_configs", False)):
+@@ -41,8 +42,31 @@ def family_filters_reductions(family: Any) -> bool:
+     archs = getattr(family, "filter_reduction_configs_archs", None) or ()
+     if not archs:
+         return False
+-    cap = _device_capability()
+-    return cap is not None and cap in {tuple(int(v) for v in a) for a in archs}
++    gfx = {str(a).strip().lower() for a in archs if isinstance(a, str)}
++    caps = {tuple(int(v) for v in a) for a in archs if not isinstance(a, str)}
++    if caps:
++        cap = _device_capability()
++        if cap is not None and cap in caps:
++            return True
++    if gfx:
++        arch = _rocm_gfx_arch()
++        if arch and arch in gfx:
++            return True
++    return False
++
++
++def _rocm_gfx_arch() -> Any:
++    """The current ROCm device's gfx name (``gfx1151``), else None (CUDA, CPU, unreadable)."""
++    try:
++        import torch
++
++        if not torch.cuda.is_available() or not is_rocm_torch(torch):
++            return None
++        props = torch.cuda.get_device_properties(torch.cuda.current_device())
++        name = str(getattr(props, "gcnArchName", "") or "").split(":", 1)[0].strip().lower()
++        return name or None
++    except Exception:  # noqa: BLE001 - no device: nothing pinned
++        return None
+ 
+ 
+ def _device_capability() -> Any:
+diff --git a/studio/backend/core/inference/diffusion_families.py b/studio/backend/core/inference/diffusion_families.py
+index 81fbfa243b..04875dcd4d 100644
+--- a/studio/backend/core/inference/diffusion_families.py
++++ b/studio/backend/core/inference/diffusion_families.py
+@@ -15,7 +15,7 @@ import sys
+ import tempfile
+ from dataclasses import dataclass, field, replace
+ from pathlib import Path, PurePosixPath
+-from typing import Any, Iterable, Mapping, NamedTuple, Optional, Sequence
++from typing import Any, Iterable, Mapping, NamedTuple, Optional, Sequence, Union
+ from utils.paths.path_utils import is_appledouble_metadata
+ 
+ from .diffusion_flow_shift import flux_mu_shift
+@@ -210,10 +210,13 @@ class DiffusionFamily:
+     supports_torch_compile: bool = True
+     # False keeps cudnn.benchmark off (as VideoFamily.cudnn_benchmark): its per-process conv pick changes pixels.
+     cudnn_benchmark: bool = True
+-    # Pin inductor's reduction-config filter on every arch (``filter_reduction_configs``) or only on the listed (major,
+-    # minor) archs (``filter_reduction_configs_archs``); both unset = inductor's pick. Same two fields on VideoFamily.
++    # Pin inductor's reduction-config filter on every arch (``filter_reduction_configs``) or only on the listed CUDA
++    # (major, minor) archs / ROCm gfx names (``filter_reduction_configs_archs``); both unset = inductor's pick. Same two
++    # fields on VideoFamily.
+     filter_reduction_configs: bool = False
+-    filter_reduction_configs_archs: tuple[tuple[int, int], ...] = field(default_factory = tuple)
++    filter_reduction_configs_archs: tuple[Union[tuple[int, int], str], ...] = field(
++        default_factory = tuple
++    )
+     # Optional pre-quantized transformer checkpoints as (scheme, repo_id): fetched instead of the dense bf16 (lower
+     # load VRAM + download).
+     prequant_repos: tuple[tuple[str, str], ...] = field(default_factory = tuple)
+diff --git a/studio/backend/core/inference/video_families.py b/studio/backend/core/inference/video_families.py
+index 0fad63865f..99cc11fdcf 100644
+--- a/studio/backend/core/inference/video_families.py
++++ b/studio/backend/core/inference/video_families.py
+@@ -9,7 +9,7 @@ from __future__ import annotations
+ import os
+ import re
+ from dataclasses import dataclass, field
+-from typing import Optional
++from typing import Optional, Union
+ 
+ from .diffusion_nvfp4_flag import nvfp4_blocked, without_nvfp4
+ from .family_name_match import model_identity, normalize_family_name, token_in_name, token_length
+@@ -259,8 +259,10 @@ class VideoFamily:
+     # One config per reduction instead of a per-process benchmark that can change the render (diffusion_speed.
+     # pin_reduction_configs). Off by default: it can keep a slower config (HunyuanVideo-1.5 ~2% per step).
+     filter_reduction_configs: bool = False
+-    # Same spelling as DiffusionFamily: pin the filter only on these (major, minor) archs.
+-    filter_reduction_configs_archs: tuple[tuple[int, int], ...] = field(default_factory = tuple)
++    # Same spelling as DiffusionFamily: pin the filter only on these CUDA (major, minor) archs or ROCm gfx names.
++    filter_reduction_configs_archs: tuple[Union[tuple[int, int], str], ...] = field(
++        default_factory = tuple
++    )
+     # Curated GGUF repo for the picker (the DiT as single-file GGUF quants).
+     gguf_repo: Optional[str] = None
+     # Subdirectory of gguf_repo a bare repo id means; None keeps the root.
+@@ -835,6 +837,9 @@ _FAMILIES: tuple[VideoFamily, ...] = (
+         bf16_components_gb = (10.0, 11.4, 2.8),
+         vae_force_fp32 = True,
+         cudnn_benchmark = False,
++        # gfx1151: fresh processes rendered one seed into up to 4 clips (two norm reductions benchmark R0_BLOCK 2048 vs
++        # 4096 per process); with the filter every process matched bitwise. NVIDIA was already bit-exact.
++        filter_reduction_configs_archs = ("gfx1151",),
+         # Streamed: faster than eager with bit-identical latents; two replays per step (CFG), one graph per shape.
+         offload_cuda_graph = True,
+         # UMT5 keeps its overflowing `wo` in fp32 itself; the VAE stays fp32 (vae_force_fp32).
+diff --git a/studio/backend/routes/inference.py b/studio/backend/routes/inference.py
+index 2961b9b1b6..45563fa1a9 100644
+--- a/studio/backend/routes/inference.py
++++ b/studio/backend/routes/inference.py
+@@ -17930,28 +17930,9 @@ _NOT_SUPPORTED_HINTS = (
+     "does not support",
+ )
+ 
+-# The frontend keys its "Open settings" button on this wording (model-memory-action.ts).
+-_GPU_QUANT_ENGINE_MESSAGE = (
+-    "{fmt} models run on the vLLM or SGLang engine.\nInstall one in Settings > System > "
+-    "More engines, then choose it as Inference engine in this model's run settings."
++_NVFP4_INFERENCE_UNSUPPORTED_MESSAGE = (
++    "We are working on supporting NVFP4 inference. For now it is not supported"
+ )
+-_GPU_QUANT_NO_ENGINE_MESSAGE = (
+-    "{fmt} models run on the vLLM or SGLang engine.\nThose need Linux or Windows with an "
+-    "NVIDIA GPU. On this computer, try a GGUF or MLX build of this model instead."
+-)
+-_NVFP4_ENGINE_MESSAGE = _GPU_QUANT_ENGINE_MESSAGE.format(fmt = "NVFP4")
+-_NVFP4_NO_ENGINE_MESSAGE = _GPU_QUANT_NO_ENGINE_MESSAGE.format(fmt = "NVFP4")
+-
+-
+-def _gpu_quant_inference_message(fmt: str) -> str:
+-    try:
+-        from core.inference.engine_install import gpu_platform, support_reason
+-        if gpu_platform() != "rocm" and support_reason("vllm", wait = False) is None:
+-            return _GPU_QUANT_ENGINE_MESSAGE.format(fmt = fmt)
+-    except Exception:
+-        pass
+-    return _GPU_QUANT_NO_ENGINE_MESSAGE.format(fmt = fmt)
+-
+ 
+ # Users cannot pip install into Studio's environment, so give our own message.
+ _COMPRESSED_TENSORS_INFERENCE_UNSUPPORTED_MESSAGE = (
+@@ -17983,15 +17964,10 @@ _MANAGED_ENGINE_QUANTIZATIONS = {
+     "awq": ("gptqmodel", "awq"),
+     "gptq": ("gptqmodel", "auto_gptq"),
+     "auto-round": ("auto_round",),
+-    # Plain "fp8" and ModelOpt (unsloth rewrites it to native FP8 / NVFP4) stay on Default.
+-    "fbgemm_fp8": ("fbgemm_gpu",),
+ }
+ _OFFERED_ENGINES = ("vllm", "sglang")
+ # SGLang registers auto-round too, but only vLLM has been run on it (#7997).
+-_OFFERED_ENGINES_FOR = {
+-    "auto-round": ("vllm",),
+-    "fbgemm_fp8": ("vllm",),
+-}
++_OFFERED_ENGINES_FOR = {"auto-round": ("vllm",)}
+ 
+ 
+ def _managed_engine_offer(
+@@ -18059,7 +18035,7 @@ def _managed_engine_offer_for(config, hf_token) -> Optional[dict]:
+             if support_reason(name) is not None:
+                 return False
+             if gpu_platform() == "rocm":
+-                if method in ("auto-round", "fbgemm_fp8"):
++                if method == "auto-round":
+                     # Unmeasured on ROCm vLLM; an explicit vLLM load still gets to try (#7997).
+                     return False
+                 text_config = metadata.get("text_config")
+@@ -18110,18 +18086,6 @@ def _is_unsupported_nvfp4_inference_error(msg: str) -> bool:
+     return "nvfp4" in lower_msg and "per-module mlx quantization metadata" in lower_msg
+ 
+ 
+-# The metadata repr names the scheme: compressed-tensors "float-quantized", HF / ModelOpt "fp8".
+-_FP8_METADATA_MARKERS = ("fp8", "float-quantized")
+-
+-
+-def _is_unsupported_fp8_inference_error(msg: str) -> bool:
+-    """The same MLX error for an FP8 checkpoint; NVFP4 is checked first, as mixed ones carry both."""
+-    lower_msg = _diagnosis_text(msg).lower()
+-    return "per-module mlx quantization metadata" in lower_msg and any(
+-        marker in lower_msg for marker in _FP8_METADATA_MARKERS
+-    )
+-
+-
+ # The two transformers sites, reworded in 5.10 to add a version: match only what survived.
+ _MISSING_COMPRESSED_TENSORS_SIGNATURES = (
+     "is required for compressed-tensors quantization",
+@@ -18138,9 +18102,7 @@ def _is_missing_compressed_tensors_error(msg: str) -> bool:
+ def _unsupported_quantization_detail(msg: str, engine: Optional[str] = None) -> Optional[str]:
+     """The refusal to show for a quantization error, or None; the one place signatures are added."""
+     if _is_unsupported_nvfp4_inference_error(msg):
+-        return _gpu_quant_inference_message("NVFP4")
+-    if _is_unsupported_fp8_inference_error(msg):
+-        return _gpu_quant_inference_message("FP8")
++        return _NVFP4_INFERENCE_UNSUPPORTED_MESSAGE
+     if _is_missing_compressed_tensors_error(msg):
+         return _COMPRESSED_TENSORS_INFERENCE_UNSUPPORTED_MESSAGE + _vllm_engine_hint(engine)
+     return None
+diff --git a/studio/backend/tests/fixtures/diffusion_family_data_freeze.json b/studio/backend/tests/fixtures/diffusion_family_data_freeze.json
+index a56332a4dd..445ad7231d 100644
+--- a/studio/backend/tests/fixtures/diffusion_family_data_freeze.json
++++ b/studio/backend/tests/fixtures/diffusion_family_data_freeze.json
+@@ -596,7 +596,9 @@
+   "wan2.2-ti2v-5b": {
+    "cudnn_benchmark": false,
+    "filter_reduction_configs": false,
+-   "filter_reduction_configs_archs": [],
++   "filter_reduction_configs_archs": [
++    "gfx1151"
++   ],
+    "vae_fused_encoder": true
+   },
+   "z-image": {
+diff --git a/studio/backend/tests/test_compressed_tensors_load_error_message.py b/studio/backend/tests/test_compressed_tensors_load_error_message.py
+index 8bbc763562..07e8b99bda 100644
+--- a/studio/backend/tests/test_compressed_tensors_load_error_message.py
++++ b/studio/backend/tests/test_compressed_tensors_load_error_message.py
+@@ -245,14 +245,15 @@ def test_no_other_quantization_family_is_re_routed_into_this_refusal():
+ 
+ def test_the_mlx_refusal_is_unchanged():
+     """The signature this route already recognised keeps its own wording."""
+-    with patch("core.inference.engine_install.support_reason", return_value = "no GPU"):
+-        error = _load_failure(
+-            "Unsloth: 'unsloth/gemma-4-E2B-it-NVFP4' has per-module MLX quantization "
+-            "metadata {'config_groups': {'group_1': {'format': 'nvfp4-pack-quantized'}}}",
+-            exception_type = RuntimeError,
+-        )
++    error = _load_failure(
++        "Unsloth: 'unsloth/gemma-4-E2B-it-NVFP4' has per-module MLX quantization "
++        "metadata {'config_groups': {'group_1': {'format': 'nvfp4-pack-quantized'}}}",
++        exception_type = RuntimeError,
++    )
+ 
+-    assert error.detail == _load_route_module()._NVFP4_NO_ENGINE_MESSAGE
++    assert error.detail == (
++        "We are working on supporting NVFP4 inference. For now it is not supported"
++    )
+ 
+ 
+ @pytest.mark.parametrize(
+@@ -293,7 +294,7 @@ def test_the_refusal_names_no_quantization_scheme():
+     assert "GGUF" in refusal
+     assert "bitsandbytes 4-bit" in refusal
+ 
+-    assert "NVFP4" in inference_route._NVFP4_NO_ENGINE_MESSAGE
++    assert "NVFP4" in inference_route._NVFP4_INFERENCE_UNSUPPORTED_MESSAGE
+ 
+ 
+ @pytest.mark.parametrize("message", REFUSALS.values(), ids = list(REFUSALS))
+@@ -347,7 +348,7 @@ def test_the_vllm_hint_never_touches_other_refusals():
+             inference_route._unsupported_quantization_detail(
+                 "Unsloth: 'x' has per-module MLX quantization metadata {'format': 'nvfp4-pack-quantized'}"
+             )
+-            == inference_route._NVFP4_ENGINE_MESSAGE
++            == inference_route._NVFP4_INFERENCE_UNSUPPORTED_MESSAGE
+         )
+         assert (
+             inference_route._unsupported_quantization_detail("Network connection timed out") is None
+diff --git a/studio/backend/tests/test_managed_engine_offer.py b/studio/backend/tests/test_managed_engine_offer.py
+index 3b278e5a3b..a59621b07f 100644
+--- a/studio/backend/tests/test_managed_engine_offer.py
++++ b/studio/backend/tests/test_managed_engine_offer.py
+@@ -59,7 +59,7 @@ def offer(
+ @pytest.fixture(autouse = True)
+ def _no_awq_or_gptq_packages():
+     real = importlib.util.find_spec
+-    missing = {"gptqmodel", "awq", "auto_gptq", "auto_round", "fbgemm_gpu"}
++    missing = {"gptqmodel", "awq", "auto_gptq", "auto_round"}
+     with patch.object(
+         importlib.util,
+         "find_spec",
+@@ -302,34 +302,3 @@ def test_amd_offers_only_the_checkpoints_vllms_rocm_build_loads(tmp_path):
+             assert engines(w8a8) == engines(w4a16) == engines(awq) == ["vllm"]
+             for metadata in (fp8, nvfp4, NVFP4, gptq, AUTOROUND):
+                 assert engines(metadata) is None, metadata
+-
+-
+-def test_fbgemm_fp8_is_offered_vllm_and_plain_fp8_and_modelopt_stay_on_default():
+-    for algo in ("FP8", "NVFP4"):
+-        assert (
+-            offer({"quantization_config": {"quant_method": "modelopt", "quant_algo": algo}}) is None
+-        )
+-    fbgemm = {"quantization_config": {"quant_method": "fbgemm_fp8"}}
+-    assert offer(fbgemm) == {"quantization": "fbgemm_fp8", "engines": ["vllm"]}
+-    assert offer({"quantization_config": {"quant_method": "fp8"}}) is None
+-
+-
+-def test_fbgemm_fp8_is_not_offered_where_default_can_run_it():
+-    real = importlib.util.find_spec
+-    with patch.object(
+-        importlib.util,
+-        "find_spec",
+-        side_effect = lambda name, *a: object() if name == "fbgemm_gpu" else real(name, *a),
+-    ):
+-        assert offer({"quantization_config": {"quant_method": "fbgemm_fp8"}}) is None
+-
+-
+-def test_amd_is_not_offered_fbgemm_fp8(tmp_path):
+-    amd = {"vllm": None, "sglang": "SGLang requires an NVIDIA GPU. Use vLLM on AMD GPUs."}
+-    with (
+-        patch("core.inference.engine_install.gpu_platform", return_value = "rocm"),
+-        patch("core.inference.engine_install.support_reason", side_effect = amd.get),
+-    ):
+-        for method in ("fbgemm_fp8",):
+-            metadata = {"quantization_config": {"quant_method": method}}
+-            assert route._managed_engine_offer_for(_config(tmp_path, metadata), None) is None
+diff --git a/studio/backend/tests/test_nvfp4_load_error_message.py b/studio/backend/tests/test_nvfp4_load_error_message.py
+index 001851b280..4a1195fc8a 100644
+--- a/studio/backend/tests/test_nvfp4_load_error_message.py
++++ b/studio/backend/tests/test_nvfp4_load_error_message.py
+@@ -16,21 +16,6 @@ from models.inference import LoadRequest, ValidateModelRequest
+ _BACKEND_ROOT = Path(__file__).resolve().parent.parent
+ 
+ 
+-NO_ENGINE = (
+-    "NVFP4 models run on the vLLM or SGLang engine.\nThose need Linux or Windows with an "
+-    "NVIDIA GPU. On this computer, try a GGUF or MLX build of this model instead."
+-)
+-
+-
+-@pytest.fixture(autouse = True)
+-def _host_without_engines():
+-    with patch(
+-        "core.inference.engine_install.support_reason",
+-        return_value = "Managed engines currently require Linux x86_64 or Windows x64.",
+-    ):
+-        yield
+-
+-
+ def _load_route_module():
+     spec = importlib.util.spec_from_file_location(
+         "inference_route_nvfp4_error",
+@@ -113,7 +98,9 @@ def test_nvfp4_mlx_metadata_error_is_replaced_with_short_message(exception_type,
+     )
+ 
+     assert error.status_code == 500
+-    assert error.detail == NO_ENGINE
++    assert error.detail == (
++        "We are working on supporting NVFP4 inference. For now it is not supported"
++    )
+     assert "quantization metadata" not in error.detail
+ 
+ 
+@@ -144,7 +131,9 @@ def test_nvfp4_validation_error_is_replaced_with_short_message(exception_type, n
+     )
+ 
+     assert error.status_code == 400
+-    assert error.detail == NO_ENGINE
++    assert error.detail == (
++        "We are working on supporting NVFP4 inference. For now it is not supported"
++    )
+     assert "quantization metadata" not in error.detail
+ 
+ 
+@@ -163,62 +152,3 @@ def test_unrelated_validation_error_keeps_existing_message(native, expected_deta
+ 
+     assert error.status_code == 400
+     assert error.detail == expected_detail
+-
+-
+-_MLX_NVFP4_ERROR = (
+-    "Unsloth: 'unsloth/Qwen3.6-35B-A3B-NVFP4-Fast' has per-module MLX quantization metadata "
+-    "{'config_groups': {'group_1': {'format': 'nvfp4-pack-quantized'}}}"
+-)
+-
+-
+-@pytest.mark.parametrize(
+-    "platform, reason, engine_message",
+-    [
+-        ("cuda", None, True),
+-        ("rocm", None, False),
+-        ("cuda", "Checking for a supported NVIDIA GPU.", False),
+-    ],
+-)
+-def test_nvfp4_points_at_the_engines_only_where_they_run(platform, reason, engine_message):
+-    inference_route = _load_route_module()
+-    with (
+-        patch("core.inference.engine_install.support_reason", return_value = reason),
+-        patch("core.inference.engine_install.gpu_platform", return_value = platform),
+-    ):
+-        detail = inference_route._unsupported_quantization_detail(_MLX_NVFP4_ERROR)
+-    if engine_message:
+-        assert detail == inference_route._NVFP4_ENGINE_MESSAGE
+-        assert "Settings > System > More engines" in detail
+-    else:
+-        assert detail == NO_ENGINE
+-
+-
+-@pytest.mark.parametrize(
+-    "metadata",
+-    [
+-        "{'config_groups': {'group_0': {'format': 'float-quantized'}}}",
+-        "{'quant_method': 'fp8', 'weight_block_size': [128, 128]}",
+-        "{'quant_method': 'modelopt', 'quant_algo': 'FP8'}",
+-    ],
+-)
+-def test_fp8_gets_the_same_message_naming_fp8(metadata):
+-    inference_route = _load_route_module()
+-    msg = f"Unsloth: 'x' has per-module MLX quantization metadata {metadata}, but requested {{}}"
+-    assert inference_route._unsupported_quantization_detail(msg) == NO_ENGINE.replace(
+-        "NVFP4", "FP8"
+-    )
+-
+-
+-def test_a_mixed_nvfp4_checkpoint_is_named_nvfp4():
+-    inference_route = _load_route_module()
+-    msg = (
+-        "Unsloth: 'x' has per-module MLX quantization metadata {'config_groups': {'group_0': "
+-        "{'format': 'float-quantized'}, 'group_1': {'format': 'nvfp4-pack-quantized'}}}"
+-    )
+-    assert inference_route._unsupported_quantization_detail(msg) == NO_ENGINE
+-
+-
+-def test_other_per_module_metadata_keeps_its_own_error():
+-    inference_route = _load_route_module()
+-    msg = "Unsloth: 'x' has per-module MLX quantization metadata {'format': 'pack-quantized', 'type': 'int'}"
+-    assert inference_route._unsupported_quantization_detail(msg) is None
+diff --git a/studio/backend/tests/test_wan_rocm_reduction_filter.py b/studio/backend/tests/test_wan_rocm_reduction_filter.py
+new file mode 100644
+index 0000000000..0138c883ea
+--- /dev/null
++++ b/studio/backend/tests/test_wan_rocm_reduction_filter.py
+@@ -0,0 +1,127 @@
++# SPDX-License-Identifier: AGPL-3.0-only
++# Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
++
++"""Wan2.2-TI2V-5B pins inductor's reduction-config filter on gfx1151 (Strix Halo), so one seed renders one clip in
++every fresh Studio process there.
++
++Two of its norm reductions get an R0_BLOCK 2048 and a 4096 config that sum in different orders, and a cold-cache
++process benchmarked them on near-equal timings: fresh gfx1151 processes rendered one seed into up to four clips (the
++frames matched exactly the two kernels' picks). With the filter every process matched bitwise. The opt-in is keyed on
++the ROCm gfx name, so NVIDIA (already bit-exact) and other AMD archs keep inductor's pick."""
++
++from __future__ import annotations
++
++import types
++
++import pytest
++
++torch = pytest.importorskip("torch")
++
++from core.inference import diffusion_compile_config as cc  # noqa: E402
++from core.inference import diffusion_speed as ds  # noqa: E402
++
++_WAN = "wan2.2-ti2v-5b"
++
++
++def _family(name):
++    from core.inference import diffusion_families, video_families
++    for fam in (*video_families._FAMILIES, *diffusion_families._FAMILIES):
++        if fam.name == name:
++            return fam
++    raise AssertionError(f"no family {name}")
++
++
++def _on_rocm(monkeypatch, arch):
++    """A ROCm torch whose current device reports ``arch`` (gcnArchName carries the feature suffix)."""
++    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
++    monkeypatch.setattr(torch.version, "hip", "7.13.99004", raising = False)
++    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
++    props = types.SimpleNamespace(gcnArchName = f"{arch}:sramecc-:xnack-", major = 11, minor = 5)
++    monkeypatch.setattr(torch.cuda, "get_device_properties", lambda *a, **k: props)
++    # A ROCm device answers a capability too: it must never be read as an NVIDIA one.
++    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *a, **k: (11, 5))
++
++
++def _filter_reaching_compile(monkeypatch, family):
++    seen = {}
++
++    def fake_compile(pipe, logger, **kwargs):
++        seen.update(kwargs)
++        return False
++
++    monkeypatch.setattr(ds, "compile_eligible", lambda *a, **k: True)
++    monkeypatch.setattr(ds, "_compile_repeated_blocks", fake_compile)
++    target = types.SimpleNamespace(device = "cpu", dtype = torch.bfloat16, backend = "cuda")
++    ds.apply_speed_optims(
++        types.SimpleNamespace(), target, is_gguf = False, family = family, speed_mode = ds.SPEED_DEFAULT
++    )
++    return seen["filter_reductions"]
++
++
++def test_wan_ti2v_5b_pins_the_filter_on_gfx1151(monkeypatch):
++    _on_rocm(monkeypatch, "gfx1151")
++    fam = _family(_WAN)
++    assert cc.family_filters_reductions(fam) is True
++    assert _filter_reaching_compile(monkeypatch, fam) is True
++
++
++@pytest.mark.parametrize("arch", ["gfx1100", "gfx1201", "gfx942", "gfx90a"])
++def test_wan_ti2v_5b_keeps_inductor_pick_on_other_amd_archs(monkeypatch, arch):
++    _on_rocm(monkeypatch, arch)
++    assert cc.family_filters_reductions(_family(_WAN)) is False
++
++
++@pytest.mark.parametrize("cap", [(7, 5), (8, 0), (8, 9), (9, 0), (10, 0), (12, 0), None])
++def test_wan_ti2v_5b_keeps_inductor_pick_on_nvidia(monkeypatch, cap):
++    monkeypatch.setattr(cc, "_device_capability", lambda: cap)
++    monkeypatch.setattr(cc, "_rocm_gfx_arch", lambda: None, raising = False)
++    assert cc.family_filters_reductions(_family(_WAN)) is False
++
++
++def test_cuda_arch_lists_never_match_a_rocm_device(monkeypatch):
++    # FLUX.1 / Qwen-Image list CUDA capabilities only: a gfx1151 card stays on inductor's pick.
++    _on_rocm(monkeypatch, "gfx1151")
++    for name in ("flux.1", "qwen-image", "z-image"):
++        assert cc.family_filters_reductions(_family(name)) is False
++
++
++def test_gfx_names_match_case_and_suffix_insensitively(monkeypatch):
++    _on_rocm(monkeypatch, "gfx1151")
++    for archs in (("gfx1151",), ("GFX1151",), [(12, 0), "gfx1151"]):
++        assert (
++            cc.family_filters_reductions(
++                types.SimpleNamespace(filter_reduction_configs_archs = archs)
++            )
++            is True
++        )
++    assert (
++        cc.family_filters_reductions(
++            types.SimpleNamespace(filter_reduction_configs_archs = ("gfx115",))
++        )
++        is False
++    )
++
++
++def test_a_cuda_device_never_matches_a_gfx_name(monkeypatch):
++    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
++    monkeypatch.setattr(torch.version, "hip", None, raising = False)
++    monkeypatch.setattr(torch, "__version__", "2.11.0+cu130", raising = False)
++    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *a, **k: (12, 0))
++    fam = types.SimpleNamespace(filter_reduction_configs_archs = ("gfx1151",))
++    assert cc.family_filters_reductions(fam) is False
++    assert (
++        cc.family_filters_reductions(
++            types.SimpleNamespace(filter_reduction_configs_archs = ("gfx1151", (12, 0)))
++        )
++        is True
++    )
++
++
++def test_unreadable_rocm_device_pins_nothing(monkeypatch):
++    _on_rocm(monkeypatch, "gfx1151")
++
++    def boom(*a, **k):
++        raise RuntimeError("no device")
++
++    monkeypatch.setattr(torch.cuda, "get_device_properties", boom)
++    assert cc.family_filters_reductions(_family(_WAN)) is False
+diff --git a/studio/frontend/src/features/chat/hooks/use-chat-model-runtime.ts b/studio/frontend/src/features/chat/hooks/use-chat-model-runtime.ts
+index 6603d53f2b..1f25fe104f 100644
+--- a/studio/frontend/src/features/chat/hooks/use-chat-model-runtime.ts
++++ b/studio/frontend/src/features/chat/hooks/use-chat-model-runtime.ts
+@@ -24,10 +24,7 @@ import {
+   MULTI_MODEL_REFUSAL_TITLE,
+   refusalHeadersOf,
+ } from "@/lib/multi-model-refusal";
+-import {
+-  engineSettingsAction,
+-  modelMemorySettingsAction,
+-} from "@/features/settings/lib/model-memory-action";
++import { modelMemorySettingsAction } from "@/features/settings/lib/model-memory-action";
+ import { createNavigationNonce } from "@/lib/navigation-nonce";
+ import {
+   isBackendDownForDesktopUpdate,
+@@ -3497,9 +3494,7 @@ export function useChatModelRuntime() {
+             const refusal = isMultiModelRefusal(null, refusalHeadersOf(err), message);
+             const title = refusal ? MULTI_MODEL_REFUSAL_TITLE : summary;
+             const description = refusal ? message : detail || undefined;
+-            const action = refusal
+-              ? modelMemorySettingsAction()
+-              : (engineSettingsAction(message) ?? logsAction);
++            const action = refusal ? modelMemorySettingsAction() : logsAction;
+             if (loadToastDismissedRef.current) {
+               toast.error(title, { description, action });
+             } else {
+diff --git a/studio/frontend/src/features/hub/lib/unsloth-support.ts b/studio/frontend/src/features/hub/lib/unsloth-support.ts
+index 2eaad17f0d..a4b4698700 100644
+--- a/studio/frontend/src/features/hub/lib/unsloth-support.ts
++++ b/studio/frontend/src/features/hub/lib/unsloth-support.ts
+@@ -134,12 +134,9 @@ const VLLM_QUANT_METHODS: ReadonlySet<string> = new Set([
+   "awq",
+   "gptq",
+   "auto-round",
+-  "fbgemm_fp8",
+-]);
+-const VLLM_ROCM_REFUSED_QUANT_METHODS: ReadonlySet<string> = new Set([
+-  "auto-round",
+-  "fbgemm_fp8",
+ ]);
++// Not offered on ROCm vLLM, matching /validate: AutoRound is unmeasured there.
++const VLLM_ROCM_REFUSED_QUANT_METHODS: ReadonlySet<string> = new Set(["auto-round"]);
+ const VLLM_FORMAT_KEYS: ReadonlySet<string> = new Set(["awq", "gptq"]);
+ // Chat only: vLLM refuses audio (_reject_unsupported_managed_kind); untagged repos count as chat.
+ const VLLM_CHAT_TASKS: ReadonlySet<string> = new Set(["text-generation", "image-text-to-text"]);
+diff --git a/studio/frontend/src/features/model-picker/components/managed-engine-offer-dialog.tsx b/studio/frontend/src/features/model-picker/components/managed-engine-offer-dialog.tsx
+index f0af438e3e..23014b2e6f 100644
+--- a/studio/frontend/src/features/model-picker/components/managed-engine-offer-dialog.tsx
++++ b/studio/frontend/src/features/model-picker/components/managed-engine-offer-dialog.tsx
+@@ -28,7 +28,6 @@ const QUANTIZATION_NAMES: Record<string, string> = {
+   awq: "AWQ",
+   gptq: "GPTQ",
+   "auto-round": "AutoRound",
+-  fbgemm_fp8: "FBGEMM FP8",
+ };
+ 
+ /** Root-mounted: a Default-engine load only vLLM / SGLang can run waits here for an engine. */
+diff --git a/studio/frontend/src/features/model-picker/components/model-selector/pickers.tsx b/studio/frontend/src/features/model-picker/components/model-selector/pickers.tsx
+index 99c9dd8f2a..42a45f78d9 100644
+--- a/studio/frontend/src/features/model-picker/components/model-selector/pickers.tsx
++++ b/studio/frontend/src/features/model-picker/components/model-selector/pickers.tsx
+@@ -3608,11 +3608,6 @@ const FORMAT_FILTER_LABELS: Record<FormatFilter, string> = {
+   npu: "NPU",
+ };
+ 
+-const VLLM_CHECKPOINT_QUANTS: ReadonlySet<string> = new Set([
+-  "compressed-tensors",
+-  "fbgemm_fp8",
+-]);
+-
+ const FORMAT_FILTER_DOTS: Partial<Record<FormatFilter, string>> = {
+   gguf: "bg-format-gguf",
+   mlx: "bg-format-mlx",
+@@ -4509,9 +4504,9 @@ export function HubModelPicker({
+   const chatSupportedCheckpointQuant = useCallback(
+     (r: HfModelResult) =>
+       isChatSupported(r) ||
+-      // Only vLLM loads these; plain fp8 passes on Default.
++      // Only compressed-tensors: the vLLM engine loads it; fbgemm / fine-grained FP8 stay refused.
+       (runsCheckpointQuant(r) &&
+-        VLLM_CHECKPOINT_QUANTS.has(r.quantMethod?.toLowerCase() ?? "") &&
++        r.quantMethod?.toLowerCase() === "compressed-tensors" &&
+         isChatSupported({ ...r, quantMethod: undefined })),
+     [isChatSupported, runsCheckpointQuant],
+   );
+diff --git a/studio/frontend/src/features/recipe-studio/executions/runtime.ts b/studio/frontend/src/features/recipe-studio/executions/runtime.ts
+index 46a4041494..c0d96205aa 100644
+--- a/studio/frontend/src/features/recipe-studio/executions/runtime.ts
++++ b/studio/frontend/src/features/recipe-studio/executions/runtime.ts
+@@ -7,7 +7,6 @@ import type {
+   RecipeExecutionBatch,
+   RecipeExecutionKind,
+   RecipeExecutionRecord,
+-  RecipeExecutionStatus,
+   RecipeSourceProgress,
+ } from "../execution-types";
+ import {
+@@ -83,31 +82,6 @@ function normalizeSourceProgress(input: unknown): RecipeSourceProgress | null {
+   return raw as RecipeSourceProgress;
+ }
+ 
+-function terminalFinishedAt(
+-  execution: RecipeExecutionRecord,
+-  status: JobStatusResponse,
+-  mappedStatus: RecipeExecutionStatus,
+-): number | null {
+-  const terminal =
+-    mappedStatus === "completed" ||
+-    mappedStatus === "error" ||
+-    mappedStatus === "cancelled";
+-  if (!terminal) {
+-    return null;
+-  }
+-  const { started_at: started, finished_at: finished } = status;
+-  if (
+-    typeof started === "number" &&
+-    typeof finished === "number" &&
+-    Number.isFinite(started) &&
+-    finished >= started
+-  ) {
+-    // Server duration on the browser clock: the two clocks can differ on a remote Studio.
+-    return execution.createdAt + Math.round((finished - started) * 1000);
+-  }
+-  return execution.finishedAt ?? Date.now();
+-}
+-
+ export function applyExecutionStatusSnapshot(
+   execution: RecipeExecutionRecord,
+   status: JobStatusResponse,
+@@ -140,7 +114,12 @@ export function applyExecutionStatusSnapshot(
+     model_usage: normalizeObject(status.model_usage),
+     artifact_path: status.artifact_path ?? execution.artifact_path,
+     error: status.error ?? null,
+-    finishedAt: terminalFinishedAt(execution, status, mappedStatus),
++    finishedAt:
++      mappedStatus === "completed" ||
++      mappedStatus === "error" ||
++      mappedStatus === "cancelled"
++        ? Date.now()
++        : null,
+   };
+ }
+ 
+diff --git a/studio/frontend/src/features/recipe-studio/executions/tracker.ts b/studio/frontend/src/features/recipe-studio/executions/tracker.ts
+index 3f5b3783b6..0969754988 100644
+--- a/studio/frontend/src/features/recipe-studio/executions/tracker.ts
++++ b/studio/frontend/src/features/recipe-studio/executions/tracker.ts
+@@ -152,7 +152,7 @@ export async function trackRecipeExecution({
+         latestExecution = {
+           ...latestExecution,
+           status: "completed",
+-          finishedAt: latestExecution.finishedAt ?? Date.now(),
++          finishedAt: Date.now(),
+           artifact_path:
+             typeof event.payload.artifact_path === "string"
+               ? event.payload.artifact_path
+@@ -169,7 +169,7 @@ export async function trackRecipeExecution({
+         latestExecution = {
+           ...latestExecution,
+           status: "error",
+-          finishedAt: latestExecution.finishedAt ?? Date.now(),
++          finishedAt: Date.now(),
+           error:
+             typeof event.payload.error === "string"
+               ? event.payload.error
+@@ -194,7 +194,7 @@ export async function trackRecipeExecution({
+         latestExecution = {
+           ...latestExecution,
+           status: "cancelled",
+-          finishedAt: latestExecution.finishedAt ?? Date.now(),
++          finishedAt: Date.now(),
+           error: latestExecution.error ?? "Run cancelled.",
+         };
+         onUpsert(latestExecution);
+diff --git a/studio/frontend/src/features/recipe-studio/recipe-studio-page.tsx b/studio/frontend/src/features/recipe-studio/recipe-studio-page.tsx
+index 644062d385..7f253e1fcd 100644
+--- a/studio/frontend/src/features/recipe-studio/recipe-studio-page.tsx
++++ b/studio/frontend/src/features/recipe-studio/recipe-studio-page.tsx
+@@ -240,10 +240,6 @@ export function RecipeStudioPage({
+   const lastProcessedFitTickRef = useRef(0);
+   const previousActiveViewRef = useRef<RecipeStudioView>("editor");
+   const previousActiveExecutionIdRef = useRef<string | null>(null);
+-  const watchedRunRef = useRef<{
+-    id: string;
+-    doneSeenAt: number | null;
+-  } | null>(null);
+   const pendingEditorTabFitRef = useRef(false);
+   const forceEditorTabFitRef = useRef(false);
+   const viewportMovedSinceAutoFitRef = useRef(true);
+@@ -440,7 +436,6 @@ export function RecipeStudioPage({
+ 
+   useEffect(() => {
+     if (activeExecution) {
+-      watchedRunRef.current = { id: activeExecution.id, doneSeenAt: null };
+       setRecentCompletedExecution(null);
+       return;
+     }
+@@ -453,14 +448,7 @@ export function RecipeStudioPage({
+       setRecentCompletedExecution(null);
+       return;
+     }
+-    // finishedAt is the server's finish; a run watched here counts from when this page saw it end.
+-    const watched = watchedRunRef.current;
+-    let doneAt = latestCompleted.finishedAt;
+-    if (watched?.id === latestCompleted.id) {
+-      watched.doneSeenAt ??= Date.now();
+-      doneAt = watched.doneSeenAt;
+-    }
+-    const elapsedMs = Date.now() - doneAt;
++    const elapsedMs = Date.now() - latestCompleted.finishedAt;
+     if (elapsedMs >= COMPLETE_ISLAND_VISIBLE_MS) {
+       setRecentCompletedExecution(null);
+       return;
+diff --git a/studio/frontend/src/features/settings/lib/model-memory-action.ts b/studio/frontend/src/features/settings/lib/model-memory-action.ts
+index 37187ecf3c..6c67545133 100644
+--- a/studio/frontend/src/features/settings/lib/model-memory-action.ts
++++ b/studio/frontend/src/features/settings/lib/model-memory-action.ts
+@@ -17,21 +17,3 @@ export function modelMemorySettingsAction():
+         .openDialog("resources", { scrollTarget: "resources-model-memory" }),
+   };
+ }
+-
+-// The backend's FP8 / NVFP4 refusal on a host that can run vLLM (routes/inference.py _GPU_QUANT_ENGINE_MESSAGE).
+-const ENGINE_SETTINGS_MARKER = "Settings > System > More engines";
+-
+-export function engineSettingsAction(
+-  message: string,
+-): { label: string; onClick: () => void } | undefined {
+-  if (!(message.includes(ENGINE_SETTINGS_MARKER) && isAccountOwner())) {
+-    return undefined;
+-  }
+-  return {
+-    label: "Open settings",
+-    onClick: () =>
+-      useSettingsDialogStore
+-        .getState()
+-        .openDialog("resources", { scrollTarget: "resources-engines" }),
+-  };
+-}
+diff --git a/studio/frontend/tests/hub-recommended-format.test.ts b/studio/frontend/tests/hub-recommended-format.test.ts
+index 99b1d88fcc..5bd5380491 100644
+--- a/studio/frontend/tests/hub-recommended-format.test.ts
++++ b/studio/frontend/tests/hub-recommended-format.test.ts
+@@ -185,11 +185,7 @@ test("the chat picker lists FP8 / NVFP4 checkpoints the GPU runs, whatever their
+   // Only the quant-method check is waived: an FP8 image model is still not a chat model.
+   assert.match(
+     picker,
+-    /runsCheckpointQuant\(r\) &&\s*VLLM_CHECKPOINT_QUANTS\.has\(r\.quantMethod\?\.toLowerCase\(\) \?\? ""\) &&\s*isChatSupported\(\{ \.\.\.r, quantMethod: undefined \}\)/,
+-  );
+-  assert.match(
+-    picker,
+-    /VLLM_CHECKPOINT_QUANTS: ReadonlySet<string> = new Set\(\[\s*"compressed-tensors",\s*"fbgemm_fp8",\s*\]\)/,
++    /runsCheckpointQuant\(r\) &&\s*r\.quantMethod\?\.toLowerCase\(\) === "compressed-tensors" &&\s*isChatSupported\(\{ \.\.\.r, quantMethod: undefined \}\)/,
+   );
+   assert.match(
+     picker,
+diff --git a/studio/frontend/tests/load-refusal-header.test.ts b/studio/frontend/tests/load-refusal-header.test.ts
+index 1426d83f73..c4989406d5 100644
+--- a/studio/frontend/tests/load-refusal-header.test.ts
++++ b/studio/frontend/tests/load-refusal-header.test.ts
+@@ -155,7 +155,7 @@ test("Images, Video and chat raise the refusal under its title, with the owner's
+       [
+         "isMultiModelRefusal(null, refusalHeadersOf(err), message);",
+         "const title = refusal ? MULTI_MODEL_REFUSAL_TITLE : summary;",
+-        "? modelMemorySettingsAction()\n              : (engineSettingsAction(message) ?? logsAction);",
++        "const action = refusal ? modelMemorySettingsAction() : logsAction;",
+       ],
+     ],
+   ];
+@@ -177,17 +177,3 @@ test("the wording matched here is the backend's", (t) => {
+   for (const marker of refusal.MULTI_MODEL_REFUSAL_MARKERS)
+     assert.ok(source.includes(marker), marker);
+ });
+-
+-test("the NVFP4 refusal's settings button keys on the backend's wording", () => {
+-  const backend = readFileSync(
+-    new URL("../../backend/routes/inference.py", import.meta.url),
+-    "utf8",
+-  );
+-  const action = readSrc("features/settings/lib/model-memory-action.ts");
+-  const marker = /ENGINE_SETTINGS_MARKER = "([^"]+)"/.exec(action)?.[1];
+-  assert.ok(marker);
+-  const engineMessage = /_GPU_QUANT_ENGINE_MESSAGE = \(([\s\S]*?)\n\)/.exec(backend)?.[1] ?? "";
+-  const text = [...engineMessage.matchAll(/"([^"]*)"/g)].map((m) => m[1]).join("");
+-  assert.ok(text.includes(marker), text);
+-  assert.match(action, /openDialog\("resources", \{ scrollTarget: "resources-engines" \}\)/);
+-});
+diff --git a/studio/frontend/tests/recipe-execution-terminal-timestamps.test.ts b/studio/frontend/tests/recipe-execution-terminal-timestamps.test.ts
+deleted file mode 100644
+index 50443fa3f1..0000000000
+--- a/studio/frontend/tests/recipe-execution-terminal-timestamps.test.ts
++++ /dev/null
+@@ -1,88 +0,0 @@
+-// SPDX-License-Identifier: AGPL-3.0-only
+-// Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
+-
+-// Re-polled terminal snapshots must not move finishedAt; server timestamps are seconds.
+-
+-import assert from "node:assert/strict";
+-import { register } from "node:module";
+-import test from "node:test";
+-
+-import type { JobStatusResponse } from "../src/features/recipe-studio/api/index.ts";
+-
+-register("./bundler-resolver.mjs", import.meta.url);
+-
+-const { applyExecutionStatusSnapshot, createBaseExecutionRecord } =
+-  await import("../src/features/recipe-studio/executions/runtime.ts");
+-
+-const BROWSER_START_MS = 1_763_000_000_000;
+-const SERVER_STARTED_AT = 1_763_003_610.3045754;
+-const SERVER_FINISHED_AT = 1_763_003_652.00544;
+-const SERVER_DURATION_MS = 41_701;
+-
+-function baseExecution() {
+-  return createBaseExecutionRecord({
+-    recipeId: "recipe-1",
+-    kind: "preview",
+-    rows: 5,
+-    currentSignature: "sig",
+-  });
+-}
+-
+-test("reapplying a terminal payload keeps the server duration on the browser clock", (t) => {
+-  t.mock.timers.enable({ apis: ["Date"] });
+-  t.mock.timers.setTime(BROWSER_START_MS);
+-  const execution = baseExecution();
+-  const payload: JobStatusResponse = {
+-    job_id: "job-1",
+-    status: "completed",
+-    started_at: SERVER_STARTED_AT,
+-    finished_at: SERVER_FINISHED_AT,
+-  };
+-
+-  t.mock.timers.setTime(BROWSER_START_MS + 60_000);
+-  const first = applyExecutionStatusSnapshot(execution, payload);
+-  t.mock.timers.setTime(BROWSER_START_MS + 900_000);
+-  const second = applyExecutionStatusSnapshot(first, payload);
+-
+-  assert.equal(first.createdAt, BROWSER_START_MS);
+-  assert.equal(first.finishedAt, BROWSER_START_MS + SERVER_DURATION_MS);
+-  assert.equal(second.createdAt, first.createdAt);
+-  assert.equal(second.finishedAt, first.finishedAt);
+-  assert.ok(Number.isInteger(second.finishedAt));
+-});
+-
+-test("a terminal payload without server timestamps keeps the first observed finish", (t) => {
+-  t.mock.timers.enable({ apis: ["Date"] });
+-  t.mock.timers.setTime(BROWSER_START_MS);
+-  const execution = baseExecution();
+-  const payload = { job_id: "job-1", status: "completed" };
+-
+-  t.mock.timers.setTime(BROWSER_START_MS + 42_000);
+-  const first = applyExecutionStatusSnapshot(execution, payload);
+-  assert.equal(first.finishedAt, BROWSER_START_MS + 42_000);
+-
+-  t.mock.timers.setTime(BROWSER_START_MS + 900_000);
+-  const second = applyExecutionStatusSnapshot(first, payload);
+-  assert.equal(second.finishedAt, first.finishedAt);
+-});
+-
+-test("an active snapshot leaves the run open and its start untouched", (t) => {
+-  t.mock.timers.enable({ apis: ["Date"] });
+-  t.mock.timers.setTime(BROWSER_START_MS);
+-  const running = applyExecutionStatusSnapshot(baseExecution(), {
+-    job_id: "job-1",
+-    status: "active",
+-    started_at: SERVER_STARTED_AT,
+-    finished_at: null,
+-  });
+-  assert.equal(running.createdAt, BROWSER_START_MS);
+-  assert.equal(running.finishedAt, null);
+-
+-  const failed = applyExecutionStatusSnapshot(running, {
+-    job_id: "job-1",
+-    status: "error",
+-    started_at: SERVER_STARTED_AT,
+-    finished_at: SERVER_FINISHED_AT,
+-  });
+-  assert.equal(failed.finishedAt, BROWSER_START_MS + SERVER_DURATION_MS);
+-});
+diff --git a/studio/frontend/tests/unsloth-support-vllm.test.ts b/studio/frontend/tests/unsloth-support-vllm.test.ts
+index ad9037123b..218f04b9fd 100644
+--- a/studio/frontend/tests/unsloth-support-vllm.test.ts
++++ b/studio/frontend/tests/unsloth-support-vllm.test.ts
+@@ -125,23 +125,3 @@ test("the vLLM label for AWQ / GPTQ tags does not depend on tag order or GGUF na
+     undefined,
+   );
+ });
+-
+-test("FBGEMM FP8 runs on vLLM only; plain fp8 and ModelOpt stay on the Default engine", () => {
+-  const fbgemm = { modelId: "meta-llama/Llama-3.1-8B-FP8", tags: ["fbgemm"], quantMethod: "fbgemm_fp8", deviceType: "cuda" };
+-  assert.equal(
+-    classifyUnslothSupport({ modelId: "nvidia/Llama-3.1-8B-Instruct-FP8", quantMethod: "modelopt", deviceType: "cuda" }).status,
+-    "supported",
+-  );
+-  for (const row of [fbgemm]) {
+-    assert.equal(classifyUnslothSupport({ ...row, vllmAvailable: true }).supportedIn, "vllm", row.quantMethod);
+-    assert.equal(
+-      classifyUnslothSupport({ ...row, vllmAvailable: true, vllmPlatform: "rocm" }).supportedIn,
+-      undefined,
+-      row.quantMethod,
+-    );
+-  }
+-  assert.equal(
+-    classifyUnslothSupport({ modelId: "Qwen/Qwen3-8B-FP8", quantMethod: "fp8", deviceType: "cuda" }).status,
+-    "supported",
+-  );
+-});
+diff --git a/tests/test_deepseek_v41_lora_coverage.py b/tests/test_deepseek_v41_lora_coverage.py
+index 6665fe9d91..e11c8797b9 100644
+--- a/tests/test_deepseek_v41_lora_coverage.py
++++ b/tests/test_deepseek_v41_lora_coverage.py
+@@ -134,7 +134,7 @@ def test_deepseek_v41_compiles_only_with_a_compile_safe_checkpoint():
+     # Compile stays on only with a new enough unsloth_zoo and torch specialize_float.
+     assert "prepare_compiled_checkpoint" in body and "except ImportError" in body
+     assert re.search(
+-        r"if prepare_compiled_checkpoint is None or not prepare_compiled_checkpoint\(\):\s*\n\s*_set_partial_compile_disable\(\)",
++        r'if prepare_compiled_checkpoint is None or not prepare_compiled_checkpoint\(\):\s*\n\s*os\.environ\["UNSLOTH_COMPILE_DISABLE"\] = "partial"',
+         body,
+     )
+     assert "deepseek_v41," not in "deepseek_v4,"
+diff --git a/tests/test_loader_compile_disable_preserve.py b/tests/test_loader_compile_disable_preserve.py
+deleted file mode 100644
+index a4fe9b88c2..0000000000
+--- a/tests/test_loader_compile_disable_preserve.py
++++ /dev/null
+@@ -1,76 +0,0 @@
+-# SPDX-License-Identifier: AGPL-3.0-only
+-# Copyright 2026-present the Unsloth AI Inc. team. All rights reserved.
+-
+-"""Branches forcing UNSLOTH_COMPILE_DISABLE=partial keep an explicit full disable full."""
+-
+-import ast
+-import os
+-from pathlib import Path
+-
+-import pytest
+-
+-pytest.importorskip("torch")
+-
+-import unsloth.models.loader as loader_module
+-
+-
+-def _loader_tree():
+-    return ast.parse(Path(loader_module.__file__).read_text(encoding = "utf-8"))
+-
+-
+-@pytest.mark.parametrize("value", ["1", "true", "True", "TRUE", "yes", "YES"])
+-def test_explicit_full_disable_is_never_downgraded(monkeypatch, value):
+-    monkeypatch.setenv("UNSLOTH_COMPILE_DISABLE", value)
+-    loader_module._set_partial_compile_disable()
+-    assert os.environ["UNSLOTH_COMPILE_DISABLE"] == "1"
+-
+-
+-@pytest.mark.parametrize("value", [None, "0", "partial", "no", "false"])
+-def test_unset_or_non_full_values_still_get_partial(monkeypatch, value):
+-    if value is None:
+-        monkeypatch.delenv("UNSLOTH_COMPILE_DISABLE", raising = False)
+-    else:
+-        monkeypatch.setenv("UNSLOTH_COMPILE_DISABLE", value)
+-    loader_module._set_partial_compile_disable()
+-    assert os.environ["UNSLOTH_COMPILE_DISABLE"] == "partial"
+-
+-
+-def _function_of(node, parents):
+-    while node in parents:
+-        node = parents[node]
+-        if isinstance(node, ast.FunctionDef):
+-            return node
+-    return None
+-
+-
+-def test_partial_is_written_only_inside_the_helper():
+-    tree = _loader_tree()
+-    parents = {child: node for node in ast.walk(tree) for child in ast.iter_child_nodes(node)}
+-    writes = [
+-        node
+-        for node in ast.walk(tree)
+-        if isinstance(node, ast.Assign)
+-        and any(isinstance(c, ast.Constant) and c.value == "partial" for c in ast.walk(node.value))
+-        and any(
+-            isinstance(t, ast.Subscript)
+-            and isinstance(t.slice, ast.Constant)
+-            and t.slice.value == "UNSLOTH_COMPILE_DISABLE"
+-            for t in node.targets
+-        )
+-    ]
+-    assert writes, "no partial write found"
+-    assert all(
+-        getattr(_function_of(w, parents), "name", None) == "_set_partial_compile_disable"
+-        for w in writes
+-    )
+-
+-
+-def test_all_five_model_branches_call_the_helper():
+-    calls = [
+-        node
+-        for node in ast.walk(_loader_tree())
+-        if isinstance(node, ast.Call)
+-        and isinstance(node.func, ast.Name)
+-        and node.func.id == "_set_partial_compile_disable"
+-    ]
+-    assert len(calls) == 5, f"expected the five branches to call the helper, found {len(calls)}"
+diff --git a/unsloth/models/loader.py b/unsloth/models/loader.py
+index 08499f55ab..4bab4bb1cf 100644
+--- a/unsloth/models/loader.py
++++ b/unsloth/models/loader.py
+@@ -953,13 +953,6 @@ DISABLE_COMPILE_MODEL_NAMES = [
+     "granite,llava_next",  # Granite-vision 3
+ ]
+ 
+-
+-def _set_partial_compile_disable():
+-    # Keep a full disable full; true/yes become "1" since zoo only reads "1" / "partial" as off.
+-    value = os.environ.get("UNSLOTH_COMPILE_DISABLE", "0").lower()
+-    os.environ["UNSLOTH_COMPILE_DISABLE"] = "1" if value in ("1", "true", "yes") else "partial"
+-
+-
+ # Architectures with gated-deltanet (linear attention) layers. Unsloth bundles the flash-linear-attention Triton kernels, so no install is needed; transformers falls back to the much slower pure PyTorch path only when they cannot be enabled.
+ FLA_MODEL_TYPE_PREFIXES = ("qwen3_next", "qwen3_5", "kimi_linear", "olmo_hybrid")
+ _fla_advised = False
+@@ -2950,7 +2943,7 @@ class FastModel(FastBaseModel):
+             from unsloth.kernels.utils import is_rdna
+ 
+             if is_rdna():
+-                _set_partial_compile_disable()
++                os.environ["UNSLOTH_COMPILE_DISABLE"] = "partial"
+         elif "cohere2" in model_types_all and transformers_version < Version("4.50.0.dev0"):
+             raise RuntimeError(
+                 "Unsloth: Cohere's Command model only works on transformers >= 4.50.0." + NIGHTLY
+@@ -2962,9 +2955,9 @@ class FastModel(FastBaseModel):
+             except ImportError:
+                 prepare_compiled_checkpoint = None
+             if prepare_compiled_checkpoint is None or not prepare_compiled_checkpoint():
+-                _set_partial_compile_disable()
++                os.environ["UNSLOTH_COMPILE_DISABLE"] = "partial"
+         elif "csm" in model_types_all:
+-            _set_partial_compile_disable()  # Inference is too slow
++            os.environ["UNSLOTH_COMPILE_DISABLE"] = "partial"  # Inference is too slow
+             os.environ["UNSLOTH_DISABLE_STATIC_GENERATION"] = "1"  # Sesame fails
+             # Set the down projection compute dtype to float32 for float16 machines, and norms to float32 since they get upcasted anyway.
+             register_custom_dtype(
+@@ -3052,7 +3045,7 @@ class FastModel(FastBaseModel):
+         else:
+             for check_model_name in DISABLE_COMPILE_MODEL_NAMES:
+                 if check_model_name in lowered_model_name:
+-                    _set_partial_compile_disable()
++                    os.environ["UNSLOTH_COMPILE_DISABLE"] = "partial"
+                     os.environ["UNSLOTH_DISABLE_STATIC_GENERATION"] = "1"
+                     if transformers_version < Version("4.50.0.dev0"):
+                         raise RuntimeError(
+@@ -3066,7 +3059,7 @@ class FastModel(FastBaseModel):
+             and getattr(model_config, "model_type", None) in ("t5", "mt5", "umt5")
+             and _is_text_seq2seq_config(model_config)
+         ):
+-            _set_partial_compile_disable()
++            os.environ["UNSLOTH_COMPILE_DISABLE"] = "partial"
+ 
+         if auto_model is not None:
+             # All other models need to disable static cache.
