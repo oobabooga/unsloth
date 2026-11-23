@@ -26,7 +26,7 @@ from pathlib import Path
 
 DATASET = "multimodalart/1920-raider-waite-tarot-public-domain"
 MODEL = "black-forest-labs/FLUX.2-klein-base-4B"
-CELLS = {"flux2k_1024": 1024, "flux2k_768": 768, "flux2k_512": 512}
+CELLS = {"flux2k_1024": 1024, "flux2k_768": 768, "flux2k_512": 512, "flux2k_1024e": 1024}  # e = eager
 _ENG = {"eager": 0, "traced": 0}
 _ORIG_HEADS_MAJOR = []
 
@@ -263,7 +263,7 @@ def stage_train(args) -> dict:
         "base_model": MODEL, "data_dir": args.data_dir, "output_dir": str(out_dir),
         "resolution": CELLS[args.cell], "train_steps": args.steps, "learning_rate": 2e-4, "lora_rank": 16,
         "lr_scheduler": "constant_with_warmup", "lr_warmup_steps": 5, "base_precision": "bf16",
-        "compile_transformer": "auto", "seed": 42, "adapter_name": f"rtc_{args.cell}_{args.arm}", "log_every": 1,
+        "compile_transformer": "off" if args.cell.endswith("e") else "auto", "seed": 42, "adapter_name": f"rtc_{args.cell}_{args.arm}", "log_every": 1,
         "hf_token": None,
     }
     res["config"] = config
