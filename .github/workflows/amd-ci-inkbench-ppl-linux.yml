@@ -1,0 +1,81 @@
+name: "AMD CI: Inkling-2-Mini CUR vs HEAD PPL attribution by kill switch (gfx1151 Linux ROCm, correctness only)"
+
+# inkbench/amd_job.py: HEAD = ggml-org b12631 + unslothai master 6fa79e0460 pin set (head_b12631.diff, tree hash
+# checked) built with the b12631 prebuilt's TheRock 10.3.0a20261121 and ROCm flags; PREV / CUR = unslothai
+# rocm-gfx1151 release assets; MAIN = ggml-org b12649 ubuntu-rocm-10.0. tg_bench.py: llama-bench -p 0 -n 1024 -fa 1
+# -ngl 99, one fresh process per run, arms interleaved per round, F16 and Q8_0 KV, plus the CUR vs HEAD PPL sanity.
+# This branch: amd_ppl_probe.py, PPL only (no timing), so no GPU group.
+
+on:
+  push:
+    branches: [amd-ci-inkbench-ppl-linux]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  ROCM_GFX: "gfx1151"
+
+jobs:
+
+  gpu:
+    name: "HIP gfx1151 CUR vs HEAD PPL by kill switch on Linux ROCm (correctness only, shared GPU)"
+    runs-on: [self-hosted, Linux, strix-halo, devlab-dispatch]
+    timeout-minutes: 600
+    steps:
+      - uses: actions/checkout@v4
+        with: { persist-credentials: false }
+
+      - name: Preamble
+        run: |
+          source amd_ci/lib/preamble.sh "inkbench-ppl-gpu"
+      - name: Host diagnostics
+        run: |
+          set +e
+          uname -a
+          nproc
+          free -g
+          df -h "$AMD_CI_WORK" /tmp
+          ls -d /opt/rocm* || echo "no /opt/rocm"
+          for b in hipconfig rocminfo amd-smi cmake ninja python3 git tar; do
+            printf '%-10s %s\n' "$b" "$(command -v $b || echo MISSING)"
+          done
+          ls -l /dev/kfd /dev/dri || echo "no /dev/kfd or /dev/dri"
+          cat /sys/class/drm/card*/device/gpu_busy_percent 2>/dev/null
+          python3 amd_ci/lib/gate.py --no-torch --out "$AMD_CI_WORK/out/host.json"
+
+      - name: Python tools
+        timeout-minutes: 20
+        run: |
+          set -eu
+          V="$AMD_CI_WORK/venv"
+          python3 -m venv "$V"
+          "$V/bin/python" -m pip install -q --upgrade pip
+          "$V/bin/python" -m pip install -q "cmake>=3.28" ninja huggingface_hub
+          echo "PATH=$V/bin:$PATH" >> "$GITHUB_ENV"
+
+      - name: Build HEAD, PPL per kill switch
+        timeout-minutes: 200
+        run: |
+          set +e
+          python -u "$GITHUB_WORKSPACE/inkbench/amd_ppl_probe.py" --kit "$GITHUB_WORKSPACE/inkbench" --work "$AMD_CI_WORK/ib" \
+            --out "$AMD_CI_WORK/out/ib" 2>&1 | tee "$AMD_CI_WORK/out/amd_job.log"
+          rc=${PIPESTATUS[0]}
+          echo "amd_job rc=$rc"
+          exit "$rc"
+
+      - name: Free the work tree (keep only out/)
+        if: always()
+        run: |
+          set +e
+          du -sh "$AMD_CI_WORK" 2>/dev/null
+          rm -rf "${AMD_CI_WORK:?}/ib" "${AMD_CI_WORK:?}/venv"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: inkbench-ppl-linux
+          path: ${{ env.AMD_CI_WORK }}/out
+          retention-days: 7
+          if-no-files-found: warn
