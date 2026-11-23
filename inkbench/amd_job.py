@@ -239,6 +239,16 @@ def main():
            "--ppl-arms", "CUR,HEAD", "--ppl-model", "q4", "--ppl-text", str(wiki),
            "--note", f"AMD {GFX} {'Windows HIP' if WIN else 'Linux ROCm'}; PREV/CUR unslothai rocm-{GFX} assets (bundled ROCm); "
                      f"MAIN ggml-org {main_asset}; HEAD {HEAD_TAG} + master 6fa79e0460 pins, TheRock {rver}, {note}"]
+    if WIN:
+        # TheRock's Windows tree keeps rocBLAS / hipBLASLt kernel packs where a bin\rocblas.dll does not find them
+        # (first run: access violation in rocblas_sgemm from HEAD's ggml-hip.dll, every file and placement). The
+        # prebuilt relocates them next to the DLLs (scripts/unsloth/relocate_kpack.py), so HEAD runs on CUR's
+        # bundled runtime: the same TheRock 10.3.0a20261107 build, laid out as the shipped bundle.
+        import tg_bench as T
+        cur_spec = f"gh:unslothai/llama.cpp@{CUR_TAG}/app-{CUR_TAG}-{plat}-rocm-{GFX}.{ext}"
+        cur_dir = T.find_bin(T.fetch_release(cur_spec, work / "tgcache")[0]).parent
+        cmd[cmd.index(f"HEAD={rlib}")] = f"HEAD={cur_dir}"
+        cmd[cmd.index("--note") + 1] += f"; Windows HEAD runtime = CUR's bundled ROCm DLLs ({cur_dir.name})"
     if not WIN:
         cmd += ["--arm-lib", f"MAIN={rlib}"]  # the ggml-org Linux ROCm build expects a system ROCm; TheRock's stands in
         sysdeps = rroot / "lib" / "rocm_sysdeps" / "lib"
