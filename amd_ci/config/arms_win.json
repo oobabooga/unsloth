@@ -1,0 +1,62 @@
+[
+ {
+  "name": "warm",
+  "state": "main",
+  "precisions": "bf16,nf4"
+ },
+ {
+  "name": "tbase_a",
+  "state": "tbase",
+  "precisions": "bf16,nf4"
+ },
+ {
+  "name": "m939_a",
+  "state": "m939",
+  "precisions": "bf16,nf4"
+ },
+ {
+  "name": "main_a",
+  "state": "main",
+  "precisions": "bf16,nf4"
+ },
+ {
+  "name": "tbase_b",
+  "state": "tbase",
+  "precisions": "bf16,nf4"
+ },
+ {
+  "name": "m939_b",
+  "state": "m939",
+  "precisions": "bf16,nf4"
+ },
+ {
+  "name": "main_b",
+  "state": "main",
+  "precisions": "bf16,nf4"
+ },
+ {
+  "name": "main_off",
+  "state": "main",
+  "env": {
+   "UNSLOTH_DIFFUSION_GC_MODE": "plain",
+   "UNSLOTH_DIFFUSION_DEQUANT_CACHE": "0"
+  },
+  "precisions": "bf16,nf4"
+ },
+ {
+  "name": "m939_plain",
+  "state": "m939",
+  "env": {
+   "UNSLOTH_DIFFUSION_GC_MODE": "plain"
+  },
+  "precisions": "bf16,nf4"
+ },
+ {
+  "name": "m939_nocache",
+  "state": "m939",
+  "env": {
+   "UNSLOTH_DIFFUSION_DEQUANT_CACHE": "0"
+  },
+  "precisions": "nf4"
+ }
+]
