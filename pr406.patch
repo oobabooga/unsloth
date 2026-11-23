@@ -1,0 +1,2260 @@
+From 40f03baeac10d011415796bbdaf6feb9602105f8 Mon Sep 17 00:00:00 2001
+From: paleluna82-del <260293746+paleluna82-del@users.noreply.github.com>
+Date: Sun, 22 Nov 2026 23:58:52 +0900
+Subject: [PATCH 1/8] CUDA/HIP: banded relative-bias attention on AMD WMMA via
+ the MMA kernel
+
+- ggml_cuda_flash_attn_ext_banded_use_mma: also on AMD RDNA (WMMA) when the GQA layout gives ncols2 >= 2
+  (mask without head dim, n_kv % FATTN_KQ_STRIDE == 0, aligned strides). GGML_CUDA_BANDED_AMD_MMA=0 opts out.
+- per-query sinks for the banded MMA path: launch_fattn appends a dense [n_seq, n_q, n_head] sink block
+  after rel in a pool buffer and tags it with m1 = 2; the kernel reads sink per (query, head).
+- test-backend-ops: Inkling-2-Mini shapes (GQA 24/8, n_kv 1536/8704, odd n_q, Q8_0 cache) in eval and perf.
+- GGML_CUDA_BANDED_DEBUG_NOREL=1 drops rel and sinks for timing only (to be removed before sharing).
+
+R9700 (gfx1201), Inkling-2-Mini UD-Q4_K_M, q8_0 KV, ROCBLAS_USE_HIPBLASLT=0:
+pp512 1481 / pp2048 1241 / pp8192 951 / pp16384 900 / tg128 37.7
+(scalar banded: 1019 / 700 / 546 / 400; Unsloth b12588 prebuilt: 1360 / 1087 / 867 / 735 / 35.8)
+PPL c512 b512 x40 6.7326 (scalar 6.7402), c16384 b512 x2 5.0015 (5.0034), greedy 128 tokens identical.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ ggml/src/ggml-cuda/fattn-common.cuh  | 35 +++++++++++++++++++++++--
+ ggml/src/ggml-cuda/fattn-mma-f16.cuh | 18 ++++++++++---
+ ggml/src/ggml-cuda/fattn.cu          | 39 +++++++++++++++++++++++++---
+ tests/test-backend-ops.cpp           | 11 ++++++++
+ 4 files changed, 95 insertions(+), 8 deletions(-)
+
+diff --git a/ggml/src/ggml-cuda/fattn-common.cuh b/ggml/src/ggml-cuda/fattn-common.cuh
+index ed065b4d0..0c5fc3feb 100644
+--- a/ggml/src/ggml-cuda/fattn-common.cuh
++++ b/ggml/src/ggml-cuda/fattn-common.cuh
+@@ -1028,6 +1028,19 @@ static __global__ void flash_attn_combine_results(
+     dst[tid] = VKQ_numerator / VKQ_denominator;
+ }
+ 
++// banded MMA on AMD: expand sinks [n_head, n_q or 1, n_seq or 1] to a dense [n_seq, n_q, n_head] block after rel
++static __global__ void fattn_banded_sinks_expand(const float * __restrict__ src, float * __restrict__ dst,
++        const int n_head, const int64_t n_q, const int64_t n, const int64_t s1, const int64_t s2) {
++    const int64_t i = int64_t(blockIdx.x)*blockDim.x + threadIdx.x;
++    if (i >= n) {
++        return;
++    }
++    const int64_t h = i % n_head;
++    const int64_t q = (i / n_head) % n_q;
++    const int64_t b = i / (int64_t(n_head)*n_q);
++    dst[i] = src[h + q*s1 + b*s2];
++}
++
+ template <int DV, int ncols1, int ncols2>
+ void launch_fattn(
+     ggml_backend_cuda_context & ctx, ggml_tensor * dst, fattn_kernel_t fattn_kernel, const int nwarps, const size_t nbytes_shared,
+@@ -1302,6 +1315,24 @@ void launch_fattn(
+         max_bias = -float(rel->ne[0]);
+     }
+ 
++    // banded with sinks (AMD MMA path): rel then sinks in one pool buffer, m1 > 1.5 tells the kernel
++    const char * sinks_data = sinks ? (const char *) sinks->data : nullptr;
++    const ggml_tensor * banded_sinks = rel ? dst->src[4] : nullptr;
++    ggml_cuda_pool_alloc<float> rel_sinks(pool);
++    if (banded_sinks) {
++        GGML_ASSERT(banded_sinks->type == GGML_TYPE_F32 && banded_sinks->ne[0] == Q->ne[2]);
++        const int64_t n_rel = ggml_nelements(rel);
++        const int64_t n_snk = Q->ne[1]*Q->ne[2]*Q->ne[3];
++        rel_sinks.alloc(n_rel + n_snk);
++        CUDA_CHECK(cudaMemcpyAsync(rel_sinks.ptr, rel->data, n_rel*sizeof(float), cudaMemcpyDeviceToDevice, main_stream));
++        const int64_t s1 = banded_sinks->ne[1] > 1 ? int64_t(banded_sinks->nb[1] / sizeof(float)) : 0;
++        const int64_t s2 = banded_sinks->ne[2] > 1 ? int64_t(banded_sinks->nb[2] / sizeof(float)) : 0;
++        fattn_banded_sinks_expand<<<(n_snk + 255)/256, 256, 0, main_stream>>>(
++            (const float *) banded_sinks->data, rel_sinks.ptr + n_rel, int(Q->ne[2]), Q->ne[1], n_snk, s1, s2);
++        CUDA_CHECK(cudaGetLastError());
++        sinks_data = (const char *) rel_sinks.ptr;
++    }
++
+     if (logit_softcap != 0.0f) {
+         scale /= logit_softcap;
+     }
+@@ -1311,7 +1342,7 @@ void launch_fattn(
+ 
+     // m0/m1 are unused for banded bias; the negative tag would otherwise blow up the exponent
+     const float m0 = rel ? 1.0f : powf(2.0f, -(max_bias       ) / n_head_log2);
+-    const float m1 = rel ? 1.0f : powf(2.0f, -(max_bias / 2.0f) / n_head_log2);
++    const float m1 = rel ? (banded_sinks ? 2.0f : 1.0f) : powf(2.0f, -(max_bias / 2.0f) / n_head_log2);
+ 
+     // TODO other tensor dimensions after removal of WMMA kernel:
+     const uint3 ne01 = init_fastdiv_values(Q->ne[1]);
+@@ -1324,7 +1355,7 @@ void launch_fattn(
+         K_data,
+         V_data,
+         mask ? ((const char *) mask->data) : nullptr,
+-        sinks ? ((const char *) sinks->data) : nullptr,
++        sinks_data,
+         KV_max.ptr,
+         kv_rows ? (const int *) kv_rows->data : nullptr,
+         !stream_k && parallel_blocks > 1 ? dst_tmp.ptr : (float *) KQV->data, dst_tmp_meta.ptr,
+diff --git a/ggml/src/ggml-cuda/fattn-mma-f16.cuh b/ggml/src/ggml-cuda/fattn-mma-f16.cuh
+index e09bc5153..debb08380 100644
+--- a/ggml/src/ggml-cuda/fattn-mma-f16.cuh
++++ b/ggml/src/ggml-cuda/fattn-mma-f16.cuh
+@@ -1624,7 +1624,15 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
+ #pragma unroll
+         for (int col = 0; col < cols_per_thread; ++col) {
+             const int jc = (threadIdx.y/np)*cols_per_warp + (cols_per_warp == 8 ? T_C_KQ::get_j(col) : T_C_KQ::get_i(2*col));
+-            const float sink = sinks_f[jc % ncols2];
++            float sink;
++            if (rel_f) {
++                // banded: one sink per query and head; padding columns get a finite floor to avoid NaN
++                const int64_t q_idx = int64_t(jt)*ncols1 + jc/ncols2;
++                const int     head  = head_q0 + jc % ncols2;
++                sink = q_idx < ne01.z && head < ne02 ? sinks_f[q_idx*ne02 + head] : -1e30f;
++            } else {
++                sink = sinks_f[jc % ncols2];
++            }
+ 
+             const float KQ_max_new = fmaxf(KQ_max[col], sink);
+             const float KQ_max_diff = KQ_max[col] - KQ_max_new;
+@@ -2029,6 +2037,8 @@ static __global__ void flash_attn_ext_f16(
+     float2     * GGML_CUDA_RESTRICT dst_meta       = dst_meta_ptr;
+     const bool banded_bias = max_bias < 0.0f;
+     const int  rel_extent  = banded_bias ? int(-max_bias) : 0;
++    // banded with sinks: a dense [n_seq, n_q, n_head] sink block follows rel (see launch_fattn)
++    const bool banded_sinks = banded_bias && m1 > 1.5f;
+ 
+     // Skip unused kernel variants for faster compilation:
+     if (use_logit_softcap && !(DKQ == 128 || DKQ == 256 || DKQ == 512)) {
+@@ -2135,7 +2145,8 @@ static __global__ void flash_attn_ext_f16(
+         float2       * dstk   = ((float2 *) dst) + (sequence*ne01.z*ne02 + zt_Q) * (DV/2);
+ 
+         const half2 * V_h2 = V_is_K_view ? K_h2 : (const half2 *) (V + nb23*sequence + nb22*z_KV);
+-        const float * sinks_f = sinks && !banded_bias ? (const float *) sinks + zt_Q : nullptr;
++        const float * sinks_f = sinks && !banded_bias ? (const float *) sinks + zt_Q :
++            (banded_sinks ? (const float *) sinks + int64_t(ne03)*ne01.z*ne02*rel_extent + int64_t(sequence)*ne01.z*ne02 : nullptr);
+         const float * rel_f = banded_bias ?
+             (const float *) sinks + int64_t(sequence)*ne01.z*ne02*rel_extent : nullptr;
+         const int32_t * indices = use_sparse ? sparse_indices + (int64_t(sequence % ne33)*iter_j + jt)*ne11 :
+@@ -2192,7 +2203,8 @@ static __global__ void flash_attn_ext_f16(
+     float2       * dstk   = ((float2 *) dst) + (sequence*ne01.z*ne02 + zt_Q) * (DV/2);
+ 
+     const half2 * V_h2 = V_is_K_view ? K_h2 : (const half2 *) (V + nb23*sequence + nb22*z_KV);
+-    const float * sinks_f = sinks && !banded_bias ? (const float *) sinks + zt_Q : nullptr;
++    const float * sinks_f = sinks && !banded_bias ? (const float *) sinks + zt_Q :
++            (banded_sinks ? (const float *) sinks + int64_t(ne03)*ne01.z*ne02*rel_extent + int64_t(sequence)*ne01.z*ne02 : nullptr);
+     const float * rel_f = banded_bias ?
+         (const float *) sinks + int64_t(sequence)*ne01.z*ne02*rel_extent : nullptr;
+     const int32_t * indices = use_sparse ? sparse_indices + (int64_t(sequence % ne33)*iter_j + jt)*ne11 :
+diff --git a/ggml/src/ggml-cuda/fattn.cu b/ggml/src/ggml-cuda/fattn.cu
+index a328a82fe..3c48d23c5 100644
+--- a/ggml/src/ggml-cuda/fattn.cu
++++ b/ggml/src/ggml-cuda/fattn.cu
+@@ -590,8 +590,18 @@ bool ggml_cuda_flash_attn_ext_banded_use_mma(const int device, const ggml_tensor
+         return false;
+     }
+ 
+-    // the MMA kernel passes rel in the sinks slot
+-    if (dst->src[4]) {
++    const int cc = ggml_cuda_info().devices[device].cc;
++    // AMD RDNA: the banded branch of the MMA kernel indexes rel through the portable tile layout (get_i/get_j),
++    // so it runs on WMMA too; sinks are appended after rel by launch_fattn. GGML_CUDA_BANDED_AMD_MMA=0 keeps the
++    // scalar banded kernels.
++    static const bool amd_enabled = [] {
++        const char * env = getenv("GGML_CUDA_BANDED_AMD_MMA");
++        return env == nullptr || atoi(env) != 0;
++    }();
++    const bool amd = amd_enabled && amd_wmma_available(cc) && !turing_mma_available(cc);
++
++    // the MMA kernel passes rel in the sinks slot; only the AMD path appends sinks after rel
++    if (dst->src[4] && !amd) {
+         return false;
+     }
+ 
+@@ -609,7 +619,30 @@ bool ggml_cuda_flash_attn_ext_banded_use_mma(const int device, const ggml_tensor
+         return false;
+     }
+ 
+-    return turing_mma_available(ggml_cuda_info().devices[device].cc);
++    if (turing_mma_available(cc)) {
++        return true;
++    }
++    if (!amd) {
++        return false;
++    }
++    // the WMMA kernel has device code only for ncols2 >= 2, i.e. when the GQA optimization applies
++    const ggml_tensor * mask = dst->src[3];
++    const int64_t n_kv = dst->src[5] ? dst->src[5]->ne[0] : K->ne[1];
++    if (!mask || mask->ne[2] != 1 || n_kv % FATTN_KQ_STRIDE != 0 || Q->ne[2] / K->ne[2] < 2) {
++        return false;
++    }
++    for (const ggml_tensor * t : {Q, K, V, mask}) {
++        if (ggml_is_quantized(t->type)) {
++            continue;
++        }
++        for (size_t i = 1; i < GGML_MAX_DIMS; ++i) {
++            if (t->nb[i] % 16 != 0) {
++                return false;
++            }
++        }
++    }
++    const ggml_tensor * sinks = dst->src[4];
++    return !sinks || (sinks->type == GGML_TYPE_F32 && sinks->ne[0] == Q->ne[2]);
+ }
+ 
+ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const ggml_tensor * dst) {
+diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
+index b27bc63d4..9a8e69efe 100644
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -13577,6 +13577,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+         test_cases.emplace_back(new test_flash_attn_ext_banded_sinks(128,  6, 1,   17, 16403, 1024, 1, GGML_TYPE_F16, GGML_TYPE_F32,  sinks));
+         test_cases.emplace_back(new test_flash_attn_ext_banded_sinks(128, 48, 8,  512,  4096, 1024, 2, GGML_TYPE_F16, GGML_TYPE_F32,  sinks));
+         test_cases.emplace_back(new test_flash_attn_ext_banded_sinks(128,  8, 2,  512,  4096, 1024, 1, GGML_TYPE_F16, GGML_TYPE_F32,  sinks));
++        // Inkling-2-Mini shapes: GQA 3 (24/8), SWA and full-attention n_kv, odd n_q, F16 and Q8_0 caches (AMD WMMA banded path)
++        test_cases.emplace_back(new test_flash_attn_ext_banded_sinks(128, 24, 8,  512,  1536, 1024, 1, GGML_TYPE_F16,  GGML_TYPE_F32, sinks));
++        test_cases.emplace_back(new test_flash_attn_ext_banded_sinks(128, 24, 8,  509,  1536, 1024, 1, GGML_TYPE_Q8_0, GGML_TYPE_F32, sinks));
++        test_cases.emplace_back(new test_flash_attn_ext_banded_sinks(128, 24, 8,  512,  8704, 1024, 1, GGML_TYPE_Q8_0, GGML_TYPE_F32, sinks));
++        test_cases.emplace_back(new test_flash_attn_ext_banded_sinks(128, 24, 8,    1,  8704, 1024, 1, GGML_TYPE_Q8_0, GGML_TYPE_F32, sinks));
++        test_cases.emplace_back(new test_flash_attn_ext_banded_sinks(128, 24, 8,   37,  2048, 1024, 1, GGML_TYPE_F16,  GGML_TYPE_F32, sinks));
+         test_cases.emplace_back(new test_flash_attn_ext_banded_sinks(128,  8, 1, 2048,  2048, 1024, 1, GGML_TYPE_F16, GGML_TYPE_F32,  sinks));
+         test_cases.emplace_back(new test_flash_attn_ext_banded_sinks(128,  8, 1,  511, 16403, 1024, 1, GGML_TYPE_F16, GGML_TYPE_F32,  sinks));
+     }
+@@ -14010,6 +14016,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
+     std::vector<std::unique_ptr<test_case>> test_cases;
+ 
++    // Inkling-2-Mini banded attention, one prefill ubatch: SWA (n_kv 1536) and full attention (n_kv 8704), Q8_0 cache
++    for (int64_t n_kv : {1536, 8704}) {
++        test_cases.emplace_back(new test_flash_attn_ext_banded_sinks(128, 24, 8, 512, n_kv, 1024, 1, GGML_TYPE_Q8_0, GGML_TYPE_F32, 2));
++    }
++
+     test_cases.emplace_back(new test_timestep_embedding());
+     test_cases.emplace_back(new test_timestep_embedding(GGML_TYPE_F32, {32769, 1, 1, 1}, 4096, 10000));
+     test_cases.emplace_back(new test_timestep_embedding(GGML_TYPE_F32, {65, 1, 1, 1}, 1, 10000));
+-- 
+2.43.0
+
+
+From 94fa080ea6c066b6ebaddf71676e2044c1298f35 Mon Sep 17 00:00:00 2001
+From: paleluna82-del <260293746+paleluna82-del@users.noreply.github.com>
+Date: Sun, 22 Nov 2026 23:58:52 +0900
+Subject: [PATCH 2/8] inkling2: banded attention over a wrapped (ring) SWA
+ cache
+
+Once a sequence outgrows the SWA cache (n_swa + n_ubatch cells), position p lives in cell p % size and
+get_n_kv_pos_contiguous returned 0, so the 40 SWA layer applications fell back to the dense relative bias.
+
+- llama_kv_cache::get_n_kv_pos_ring: accepts a full ring (each of the last size positions in cell pos % size,
+  the ubatch is the newest tail) and returns the rotation (cell of the oldest position); dense otherwise.
+- ggml_flash_attn_ext_banded_set_kv_rot (op_params i32 slot 6): the relative distance uses the logical index
+  (cell - rot) mod n_kv. CPU reference and the CUDA/HIP MMA kernel implement it (rotation passed in m0);
+  every other banded kernel rejects a nonzero rotation, and the model probes support with one, so it falls
+  back to dense. Rotation is part of the graph-reuse check.
+- test-backend-ops: rotations 1/511/1024/1535/700, F16 and Q8_0 caches, per-head and per-query sinks.
+
+R9700, UD-Q4_K_M, q8_0 KV, ROCBLAS_USE_HIPBLASLT_BATCHED=0:
+pp512 1518 / pp2048 1458 / pp8192 1413 / pp16384 1371 / pp32768 1308 / tg128 37.4
+(before: 1481 / 1241 / 951 / 900; Unsloth b12588 prebuilt: 1363 / 1086 / 865 / 735 / 570 / 35.8)
+All 48 layer applications banded in every ubatch of a 3.3K prompt. PPL c512 b512 x40 6.7313 (dense 6.7333),
+c16384 b512 x2 4.9991 (5.0027); greedy output on a ~2K-token prompt identical to the dense path.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ ggml/include/ggml.h                  |  7 ++++
+ ggml/src/ggml-cpu/ops.cpp            |  5 ++-
+ ggml/src/ggml-cuda/fattn-banded.cu   |  7 ++++
+ ggml/src/ggml-cuda/fattn-common.cuh  |  3 +-
+ ggml/src/ggml-cuda/fattn-mma-f16.cuh | 31 +++++++++------
+ ggml/src/ggml.c                      |  8 ++++
+ src/llama-graph.cpp                  |  5 ++-
+ src/llama-graph.h                    |  2 +
+ src/llama-kv-cache.cpp               | 59 ++++++++++++++++++++++++++++
+ src/llama-kv-cache.h                 |  5 +++
+ src/models/inkling2.cpp              | 17 ++++++--
+ tests/test-backend-ops.cpp           | 25 ++++++++++++
+ 12 files changed, 153 insertions(+), 21 deletions(-)
+
+diff --git a/ggml/include/ggml.h b/ggml/include/ggml.h
+index 423803950..725b31299 100644
+--- a/ggml/include/ggml.h
++++ b/ggml/include/ggml.h
+@@ -2268,6 +2268,13 @@ extern "C" {
+             float                 scale,
+             int64_t               rel_extent);
+ 
++    // the K/V cells are a ring rotated by kv_rot: cell (kv_rot + j) % n_kv holds the j-th oldest position.
++    // The relative distance uses that logical index. 0 = cells in position order.
++    GGML_API void ggml_flash_attn_ext_banded_set_kv_rot(
++            struct ggml_tensor * a,
++            int32_t              kv_rot);
++
++
+     // same as ggml_flash_attn_ext, but each q slice attends to its own list of K/V rows
+     // q:       [n_embd_k, n_batch, n_head,    ne3]
+     // k:       [n_embd_k, n_rows,  n_head_kv, 1  ] shared by all q slices
+diff --git a/ggml/src/ggml-cpu/ops.cpp b/ggml/src/ggml-cpu/ops.cpp
+index f908af72e..8961d69d5 100644
+--- a/ggml/src/ggml-cpu/ops.cpp
++++ b/ggml/src/ggml-cpu/ops.cpp
+@@ -8896,6 +8896,7 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
+     const ggml_tensor * sinks = dst->src[4];
+     const ggml_tensor * rel     = dst->src[6];
+     const ggml_tensor * kv_rows = dst->src[5];
++    const int32_t       kv_rot  = rel ? ggml_get_op_params_i32(dst, 6) : 0;
+ 
+     GGML_TENSOR_LOCALS(int64_t, neq, q,   ne)
+     GGML_TENSOR_LOCALS(size_t,  nbq, q,   nb)
+@@ -9028,7 +9029,9 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
+ 
+             if (rel) {
+                 // the offset aligns a short decode Q block to the tail of K (FA4 seqlen_k - seqlen_q convention)
+-                const int64_t rel_dist = iq1 + (nek1 - neq1) - ic;
++                // ring cells: the logical (position-ordered) index of cell ic
++                const int64_t ic_log   = ic >= kv_rot ? ic - kv_rot : ic - kv_rot + nek1;
++                const int64_t rel_dist = iq1 + (nek1 - neq1) - ic_log;
+                 if (rel_dist >= 0 && rel_dist < rel->ne[0]) {
+                     s += ggml_flash_attn_ext_banded_load(rel, iq1, iq2, iq3, rel_dist);
+                 }
+diff --git a/ggml/src/ggml-cuda/fattn-banded.cu b/ggml/src/ggml-cuda/fattn-banded.cu
+index 4005e5c46..aafc0947c 100644
+--- a/ggml/src/ggml-cuda/fattn-banded.cu
++++ b/ggml/src/ggml-cuda/fattn-banded.cu
+@@ -915,6 +915,11 @@ bool ggml_cuda_flash_attn_ext_banded_supported(int device, const ggml_tensor * d
+         return false;
+     }
+ 
++    // ring-rotated K/V cells: only the MMA kernel maps cells to their logical distance
++    if (ggml_get_op_params_i32(dst, 6) != 0 && !ggml_cuda_flash_attn_ext_banded_use_mma(device, dst)) {
++        return false;
++    }
++
+     // quantized K/V are read as F16: check the op with F16 K/V of the same shape
+     if (dst->src[1] && dst->src[2] &&
+         (fattn_banded_kv_f16_convertible(dst->src[1]->type) || fattn_banded_kv_f16_convertible(dst->src[2]->type))) {
+@@ -932,6 +937,8 @@ bool ggml_cuda_flash_attn_ext_banded_supported(int device, const ggml_tensor * d
+         }
+         op.src[1] = &k16;
+         op.src[2] = &v16;
++        // the rotation was checked against the real (quantized) K/V above; the F16 stand-ins keep quantized strides
++        ggml_set_op_params_i32(&op, 6, 0);
+         return ggml_cuda_flash_attn_ext_banded_supported(device, &op);
+     }
+ 
+diff --git a/ggml/src/ggml-cuda/fattn-common.cuh b/ggml/src/ggml-cuda/fattn-common.cuh
+index 0c5fc3feb..6292a85af 100644
+--- a/ggml/src/ggml-cuda/fattn-common.cuh
++++ b/ggml/src/ggml-cuda/fattn-common.cuh
+@@ -1341,7 +1341,8 @@ void launch_fattn(
+     const uint32_t n_head_log2 = 1u << uint32_t(floorf(log2f(float(n_head))));
+ 
+     // m0/m1 are unused for banded bias; the negative tag would otherwise blow up the exponent
+-    const float m0 = rel ? 1.0f : powf(2.0f, -(max_bias       ) / n_head_log2);
++    // banded: m0 carries the ring rotation of the K/V cells (exact as float below 2^24)
++    const float m0 = rel ? float(ggml_get_op_params_i32(dst, 6)) : powf(2.0f, -(max_bias       ) / n_head_log2);
+     const float m1 = rel ? (banded_sinks ? 2.0f : 1.0f) : powf(2.0f, -(max_bias / 2.0f) / n_head_log2);
+ 
+     // TODO other tensor dimensions after removal of WMMA kernel:
+diff --git a/ggml/src/ggml-cuda/fattn-mma-f16.cuh b/ggml/src/ggml-cuda/fattn-mma-f16.cuh
+index debb08380..adb2b4c7e 100644
+--- a/ggml/src/ggml-cuda/fattn-mma-f16.cuh
++++ b/ggml/src/ggml-cuda/fattn-mma-f16.cuh
+@@ -626,6 +626,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
+         const float slope,
+         const float logit_softcap,
+         const int rel_extent,
++        const int rel_rot,
+         const int head_q0,
+         const uint3 ne01,
+         const int ne02,
+@@ -802,7 +803,8 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
+                     const int c      = jc % ncols2;
+                     const int64_t q_idx  = int64_t(jt)*ncols1 + j;
+                     const int64_t kv_idx = int64_t(k_VKQ_0) + i;
+-                    const int64_t dist   = q_idx + (int64_t(ne11) - ne01.z) - kv_idx;
++                    const int64_t kv_log = kv_idx >= rel_rot ? kv_idx - rel_rot : kv_idx - rel_rot + ne11;
++                    const int64_t dist   = q_idx + (int64_t(ne11) - ne01.z) - kv_log;
+                     if (q_idx < ne01.z && head_q0 + c < ne02 && kv_idx < ne11 &&
+                             dist >= 0 && dist < rel_extent) {
+                         KQ_C[i00/(np*T_C_KQ::I)].x[l] +=
+@@ -885,7 +887,8 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
+                     const int c      = jc % ncols2;
+                     const int64_t q_idx  = int64_t(jt)*ncols1 + j;
+                     const int64_t kv_idx = int64_t(k_VKQ_0) + i;
+-                    const int64_t dist   = q_idx + (int64_t(ne11) - ne01.z) - kv_idx;
++                    const int64_t kv_log = kv_idx >= rel_rot ? kv_idx - rel_rot : kv_idx - rel_rot + ne11;
++                    const int64_t dist   = q_idx + (int64_t(ne11) - ne01.z) - kv_log;
+                     if (q_idx < ne01.z && head_q0 + c < ne02 && kv_idx < ne11 &&
+                             dist >= 0 && dist < rel_extent) {
+                         KQ_C[i00/(np*T_C_KQ::J)].x[l] +=
+@@ -1157,7 +1160,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
+     }
+ #else
+     GGML_UNUSED_VARS(Q_f2, K_h2, V_h2, mask_h, indices, rel_f, dstk, dstk_fixup,
+-        scale, slope, logit_softcap, rel_extent, head_q0, ne01, ne02, ne11,
++        scale, slope, logit_softcap, rel_extent, rel_rot, head_q0, ne01, ne02, ne11,
+         stride_K, stride_V, stride_mask,
+         tile_Q, tile_K, tile_V, tile_mask,
+         Q_B, VKQ_C, KQ_max, KQ_rowsum, kb0, kb0_next);
+@@ -1327,6 +1330,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
+         const float slope,
+         const float logit_softcap,
+         const int rel_extent,
++        const int rel_rot,
+         const int head_q0,
+         const uint3 ne01,
+         const int ne02,
+@@ -1528,7 +1532,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
+                 <DKQ, DV, ncols1, ncols2, nwarps, use_logit_softcap, V_is_K_view, use_sparse, needs_fixup, is_fixup, last_iter, oob_check,
+                  T_A_KQ, T_B_KQ, T_C_KQ, T_A_VKQ, T_B_VKQ, T_C_VKQ>
+                 (Q_f2, K_h2, V_h2, mask_h, indices, rel_f, dstk, dstk_fixup, scale, slope, logit_softcap,
+-                 rel_extent, head_q0, ne01, ne02, ne11, stride_K, stride_V, stride_mask, tile_Q, tile_K, tile_V, tile_mask, Q_B, VKQ_C,
++                 rel_extent, rel_rot, head_q0, ne01, ne02, ne11, stride_K, stride_V, stride_mask, tile_Q, tile_K, tile_V, tile_mask, Q_B, VKQ_C,
+                  KQ_max, KQ_rowsum, jt, kb0, kb0_next, k_VKQ_sup);
+             kb0 = kb0_next;
+         }
+@@ -1538,7 +1542,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
+             <DKQ, DV, ncols1, ncols2, nwarps, use_logit_softcap, V_is_K_view, use_sparse, needs_fixup, is_fixup, last_iter, oob_check,
+              T_A_KQ, T_B_KQ, T_C_KQ, T_A_VKQ, T_B_VKQ, T_C_VKQ>
+             (Q_f2, K_h2, V_h2, mask_h, indices, rel_f, dstk, dstk_fixup, scale, slope, logit_softcap,
+-             rel_extent, head_q0, ne01, ne02, ne11, stride_K, stride_V, stride_mask, tile_Q, tile_K, tile_V, tile_mask, Q_B, VKQ_C,
++             rel_extent, rel_rot, head_q0, ne01, ne02, ne11, stride_K, stride_V, stride_mask, tile_Q, tile_K, tile_V, tile_mask, Q_B, VKQ_C,
+              KQ_max, KQ_rowsum, jt, kb0, kb0, k_VKQ_sup);
+     } else if constexpr (ncols2 == 1 || use_sparse) {
+         constexpr bool oob_check = true;
+@@ -1549,7 +1553,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
+                 <DKQ, DV, ncols1, ncols2, nwarps, use_logit_softcap, V_is_K_view, use_sparse, needs_fixup, is_fixup, last_iter, oob_check,
+                  T_A_KQ, T_B_KQ, T_C_KQ, T_A_VKQ, T_B_VKQ, T_C_VKQ>
+                 (Q_f2, K_h2, V_h2, mask_h, indices, rel_f, dstk, dstk_fixup, scale, slope, logit_softcap,
+-                 rel_extent, head_q0, ne01, ne02, ne11, stride_K, stride_V, stride_mask, tile_Q, tile_K, tile_V, tile_mask, Q_B, VKQ_C,
++                 rel_extent, rel_rot, head_q0, ne01, ne02, ne11, stride_K, stride_V, stride_mask, tile_Q, tile_K, tile_V, tile_mask, Q_B, VKQ_C,
+                  KQ_max, KQ_rowsum, jt, kb0, kb0 + 1, k_VKQ_sup);
+         }
+         constexpr bool last_iter = true;
+@@ -1558,7 +1562,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
+             <DKQ, DV, ncols1, ncols2, nwarps, use_logit_softcap, V_is_K_view, use_sparse, needs_fixup, is_fixup, last_iter, oob_check,
+               T_A_KQ, T_B_KQ, T_C_KQ, T_A_VKQ, T_B_VKQ, T_C_VKQ>
+             (Q_f2, K_h2, V_h2, mask_h, indices, rel_f, dstk, dstk_fixup, scale, slope, logit_softcap,
+-             rel_extent, head_q0, ne01, ne02, ne11, stride_K, stride_V, stride_mask, tile_Q, tile_K, tile_V, tile_mask, Q_B, VKQ_C,
++             rel_extent, rel_rot, head_q0, ne01, ne02, ne11, stride_K, stride_V, stride_mask, tile_Q, tile_K, tile_V, tile_mask, Q_B, VKQ_C,
+              KQ_max, KQ_rowsum, jt, kb0, kb0, k_VKQ_sup);
+     } else {
+         constexpr bool oob_check = false;
+@@ -1569,7 +1573,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
+                 <DKQ, DV, ncols1, ncols2, nwarps, use_logit_softcap, V_is_K_view, use_sparse, needs_fixup, is_fixup, last_iter, oob_check,
+                  T_A_KQ, T_B_KQ, T_C_KQ, T_A_VKQ, T_B_VKQ, T_C_VKQ>
+                 (Q_f2, K_h2, V_h2, mask_h, indices, rel_f, dstk, dstk_fixup, scale, slope, logit_softcap,
+-                 rel_extent, head_q0, ne01, ne02, ne11, stride_K, stride_V, stride_mask, tile_Q, tile_K, tile_V, tile_mask, Q_B, VKQ_C,
++                 rel_extent, rel_rot, head_q0, ne01, ne02, ne11, stride_K, stride_V, stride_mask, tile_Q, tile_K, tile_V, tile_mask, Q_B, VKQ_C,
+                  KQ_max, KQ_rowsum, jt, kb0, kb0 + 1, k_VKQ_sup);
+         }
+         constexpr bool last_iter = true;
+@@ -1578,7 +1582,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
+             <DKQ, DV, ncols1, ncols2, nwarps, use_logit_softcap, V_is_K_view, use_sparse, needs_fixup, is_fixup, last_iter, oob_check,
+              T_A_KQ, T_B_KQ, T_C_KQ, T_A_VKQ, T_B_VKQ, T_C_VKQ>
+             (Q_f2, K_h2, V_h2, mask_h, indices, rel_f, dstk, dstk_fixup, scale, slope, logit_softcap,
+-             rel_extent, head_q0, ne01, ne02, ne11, stride_K, stride_V, stride_mask, tile_Q, tile_K, tile_V, tile_mask, Q_B, VKQ_C,
++             rel_extent, rel_rot, head_q0, ne01, ne02, ne11, stride_K, stride_V, stride_mask, tile_Q, tile_K, tile_V, tile_mask, Q_B, VKQ_C,
+              KQ_max, KQ_rowsum, jt, kb0, kb0, k_VKQ_sup);
+     }
+ 
+@@ -1983,7 +1987,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
+     }
+ #else
+     GGML_UNUSED_VARS(Q_f2, K_h2, V_h2, mask_h, indices, sinks_f, rel_f, dstk, dstk_fixup,
+-        scale, slope, logit_softcap, rel_extent, head_q0, ne01, ne02, gqa_ratio, ne11,
++        scale, slope, logit_softcap, rel_extent, rel_rot, head_q0, ne01, ne02, gqa_ratio, ne11,
+         stride_Q1, stride_Q2, stride_K, stride_V, stride_mask,
+         jt, kb0_start, kb0_stop, kb0_max);
+     NO_DEVICE_CODE;
+@@ -2037,6 +2041,7 @@ static __global__ void flash_attn_ext_f16(
+     float2     * GGML_CUDA_RESTRICT dst_meta       = dst_meta_ptr;
+     const bool banded_bias = max_bias < 0.0f;
+     const int  rel_extent  = banded_bias ? int(-max_bias) : 0;
++    const int  rel_rot     = banded_bias ? int(m0) : 0;
+     // banded with sinks: a dense [n_seq, n_q, n_head] sink block follows rel (see launch_fattn)
+     const bool banded_sinks = banded_bias && m1 > 1.5f;
+ 
+@@ -2168,12 +2173,12 @@ static __global__ void flash_attn_ext_f16(
+             constexpr bool needs_fixup = false; // CUDA block is working on an entire tile.
+             flash_attn_ext_f16_process_tile<DKQ, DV, ncols1, ncols2, nwarps, use_logit_softcap, V_is_K_view, use_sparse, needs_fixup, is_fixup>
+                 (Q_f2, K_h2, V_h2, mask_h, indices, sinks_f, rel_f, dstk, dst_meta, scale, slope, logit_softcap,
+-                 rel_extent, zt_Q, ne01, ne02, gqa_ratio, ne11, stride_Q1, stride_Q2, stride_K, stride_V, stride_mask, jt, zt_gqa, kb0_rot, kb0_rot + kb0_stop - kb0_start, kb0_max);
++                 rel_extent, rel_rot, zt_Q, ne01, ne02, gqa_ratio, ne11, stride_Q1, stride_Q2, stride_K, stride_V, stride_mask, jt, zt_gqa, kb0_rot, kb0_rot + kb0_stop - kb0_start, kb0_max);
+         } else {
+             constexpr bool needs_fixup = true; // CUDA block is missing the beginning of a tile.
+             flash_attn_ext_f16_process_tile<DKQ, DV, ncols1, ncols2, nwarps, use_logit_softcap, V_is_K_view, use_sparse, needs_fixup, is_fixup>
+                 (Q_f2, K_h2, V_h2, mask_h, indices, sinks_f, rel_f, dstk, dst_meta, scale, slope, logit_softcap,
+-                 rel_extent, zt_Q, ne01, ne02, gqa_ratio, ne11, stride_Q1, stride_Q2, stride_K, stride_V, stride_mask, jt, zt_gqa, kb0_rot, kb0_rot + kb0_stop - kb0_start, kb0_max);
++                 rel_extent, rel_rot, zt_Q, ne01, ne02, gqa_ratio, ne11, stride_Q1, stride_Q2, stride_K, stride_V, stride_mask, jt, zt_gqa, kb0_rot, kb0_rot + kb0_stop - kb0_start, kb0_max);
+         }
+ 
+         kbc += iter_k;
+@@ -2225,7 +2230,7 @@ static __global__ void flash_attn_ext_f16(
+     constexpr bool needs_fixup = false;
+     flash_attn_ext_f16_process_tile<DKQ, DV, ncols1, ncols2, nwarps, use_logit_softcap, V_is_K_view, use_sparse, needs_fixup, is_fixup>
+         (Q_f2, K_h2, V_h2, mask_h, indices, sinks_f, rel_f, dstk, dst_meta, scale, slope, logit_softcap,
+-         rel_extent, zt_Q, ne01, ne02, gqa_ratio, ne11, stride_Q1, stride_Q2, stride_K, stride_V, stride_mask, jt, zt_gqa, kb0_rot, kb0_rot + kb0_stop - kb0_start, kb0_max);
++         rel_extent, rel_rot, zt_Q, ne01, ne02, gqa_ratio, ne11, stride_Q1, stride_Q2, stride_K, stride_V, stride_mask, jt, zt_gqa, kb0_rot, kb0_rot + kb0_stop - kb0_start, kb0_max);
+ #else
+     GGML_UNUSED_VARS(Q_ptr, K_ptr, V_ptr, mask_ptr, sinks_ptr, KV_max_ptr, KV_rows_ptr, dst_ptr, dst_meta_ptr, scale,
+         max_bias, m0, m1, n_head_log2, logit_softcap,
+diff --git a/ggml/src/ggml.c b/ggml/src/ggml.c
+index f8529a4eb..9aa0c0093 100644
+--- a/ggml/src/ggml.c
++++ b/ggml/src/ggml.c
+@@ -5518,6 +5518,14 @@ struct ggml_tensor * ggml_flash_attn_ext_banded(
+     return result;
+ }
+ 
++void ggml_flash_attn_ext_banded_set_kv_rot(
++        struct ggml_tensor * a,
++        int32_t              kv_rot) {
++    GGML_ASSERT(a->op == GGML_OP_FLASH_ATTN_EXT_BANDED);
++    GGML_ASSERT(kv_rot >= 0 && kv_rot < a->src[1]->ne[1]);
++    ggml_set_op_params_i32(a, 6, kv_rot);
++}
++
+ struct ggml_tensor * ggml_flash_attn_ext(
+         struct ggml_context * ctx,
+         struct ggml_tensor  * q,
+diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
+index 365e8f84c..524324404 100644
+--- a/src/llama-graph.cpp
++++ b/src/llama-graph.cpp
+@@ -1477,8 +1477,9 @@ bool llm_graph_input_mem_hybrid_iswa_rel::can_reuse(const llm_graph_params & par
+     res &= self_rel_pos_swa->ne[1] == params.ubatch.n_tokens;
+ 
+     if (banded) {
+-        res &= attn_ctx->get_base()->get_n_kv_pos_contiguous() == n_kv_banded[0];
+-        res &= attn_ctx->get_swa()->get_n_kv_pos_contiguous()  == n_kv_banded[1];
++        uint32_t rot[2];
++        res &= attn_ctx->get_base()->get_n_kv_pos_ring(rot[0]) == n_kv_banded[0] && rot[0] == kv_rot_banded[0];
++        res &= attn_ctx->get_swa()->get_n_kv_pos_ring(rot[1])  == n_kv_banded[1] && rot[1] == kv_rot_banded[1];
+     }
+ 
+     res &= inp_rs->s_copy->ne[0] == mctx->get_recr()->get_n_rs();
+diff --git a/src/llama-graph.h b/src/llama-graph.h
+index 3c0b14129..9d6fc5603 100644
+--- a/src/llama-graph.h
++++ b/src/llama-graph.h
+@@ -813,6 +813,8 @@ public:
+ 
+     // [base, swa] K/V cells of the banded attention, 0 = dense
+     uint32_t n_kv_banded[2] = { 0, 0 };
++    // [base, swa] ring rotation of the banded K/V cells, 0 = position order
++    uint32_t kv_rot_banded[2] = { 0, 0 };
+     bool     banded         = false;
+ 
+     const uint32_t extent;
+diff --git a/src/llama-kv-cache.cpp b/src/llama-kv-cache.cpp
+index 87957aad9..a7861de17 100644
+--- a/src/llama-kv-cache.cpp
++++ b/src/llama-kv-cache.cpp
+@@ -1365,6 +1365,52 @@ uint32_t llama_kv_cache::get_n_kv_pos_contiguous(const slot_info & sinfo, const
+     return c0 + pos_max + 1;
+ }
+ 
++uint32_t llama_kv_cache::get_n_kv_pos_ring(const slot_info & sinfo, const llama_ubatch & ubatch, uint32_t & rot) const {
++    rot = 0;
++    const uint32_t n_contiguous = get_n_kv_pos_contiguous(sinfo, ubatch);
++    if (n_contiguous > 0) {
++        return n_contiguous;
++    }
++
++    // same preconditions as the contiguous case: one stream, one sequence, the ubatch is its monotonic tail
++    if (sinfo.n_stream() != 1 || ubatch.n_seqs_unq != 1 || ubatch.n_tokens == 0 ||
++        ubatch.pos == nullptr || ubatch.n_seq_id == nullptr ||
++        ubatch.seq_id == nullptr || ubatch.seq_id[0] == nullptr) {
++        return 0;
++    }
++    const llama_seq_id seq_id = ubatch.seq_id[0][0];
++    if (seq_id < 0 || (size_t) seq_id >= seq_to_stream.size()) {
++        return 0;
++    }
++    const uint32_t stream = seq_to_stream[seq_id];
++    if (sinfo.strm[0] < 0 || (uint32_t) sinfo.strm[0] != stream || stream >= v_cells.size()) {
++        return 0;
++    }
++    const auto & cells = v_cells[stream];
++    const uint32_t  size    = cells.size();
++    const llama_pos pos_max = cells.seq_pos_max(seq_id);
++    // a ring only exists once the sequence is longer than the cache
++    if (size == 0 || pos_max < (llama_pos) size || (uint32_t) pos_max + 1 < ubatch.n_tokens) {
++        return 0;
++    }
++    const llama_pos pos_start = pos_max + 1 - ubatch.n_tokens;
++    for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
++        if (ubatch.pos[i] != pos_start + (llama_pos) i ||
++            ubatch.n_seq_id[i] < 1 || ubatch.seq_id[i] == nullptr || ubatch.seq_id[i][0] != seq_id) {
++            return 0;
++        }
++    }
++    // every one of the last size positions must sit in cell pos % size, so the cells hold nothing else
++    for (llama_pos pos = pos_max + 1 - (llama_pos) size; pos <= pos_max; ++pos) {
++        const uint32_t i = (uint32_t) (pos % (llama_pos) size);
++        if (cells.is_empty(i) || cells.pos_get(i) != pos || !cells.seq_has(i, seq_id)) {
++            return 0;
++        }
++    }
++    rot = (uint32_t) ((pos_max + 1) % (llama_pos) size);
++    return size;
++}
++
+ uint32_t llama_kv_cache::get_n_kv_slices(const llama_ubatch & ubatch) {
+     if (ubatch.n_seqs_unq == 1) {
+         return 1;
+@@ -3157,6 +3203,19 @@ uint32_t llama_kv_cache_context::get_n_kv_pos_contiguous() const {
+     return result <= (uint32_t) n_kv ? result : 0;
+ }
+ 
++uint32_t llama_kv_cache_context::get_n_kv_pos_ring(uint32_t & rot) const {
++    rot = 0;
++    if (ubatches.empty() || sinfos.empty() || i_cur >= ubatches.size() || i_cur >= sinfos.size()) {
++        return get_n_kv_pos_contiguous(); // reserve: no ring
++    }
++    const uint32_t result = kv->get_n_kv_pos_ring(sinfos[i_cur], ubatches[i_cur], rot);
++    if (result > (uint32_t) n_kv) {
++        rot = 0;
++        return 0;
++    }
++    return result;
++}
++
+ uint32_t llama_kv_cache_context::get_n_kv_rows() const {
+     return n_kv_rows;
+ }
+diff --git a/src/llama-kv-cache.h b/src/llama-kv-cache.h
+index 605b55f0a..139eddd86 100644
+--- a/src/llama-kv-cache.h
++++ b/src/llama-kv-cache.h
+@@ -197,6 +197,10 @@ public:
+     // active cell count when position p lives in physical cell p; 0 for any non-contiguous layout
+     uint32_t get_n_kv_pos_contiguous(const slot_info & sinfo, const llama_ubatch & ubatch) const;
+ 
++    // like get_n_kv_pos_contiguous, but also accepts a full ring: position p in cell p % size for the last size
++    // positions of the sequence (a wrapped SWA cache); rot is the cell of the oldest position, 0 when contiguous
++    uint32_t get_n_kv_pos_ring(const slot_info & sinfo, const llama_ubatch & ubatch, uint32_t & rot) const;
++
+     // attention over the cells of each sequence of the ubatch instead of the whole cache (see ggml_flash_attn_ext_rows)
+     // the ubatch splits into n_slices groups of tokens with one sequence each
+     // if it cannot (f.ex. interleaved or coupled sequences), it is a single slice over the cells of all its sequences
+@@ -425,6 +429,7 @@ public:
+ 
+     uint32_t get_n_kv() const;
+     uint32_t get_n_kv_pos_contiguous() const;
++    uint32_t get_n_kv_pos_ring(uint32_t & rot) const;
+     uint32_t get_n_kv_rows() const;
+     uint32_t get_size() const;
+ 
+diff --git a/src/models/inkling2.cpp b/src/models/inkling2.cpp
+index e32f53881..4afceb635 100644
+--- a/src/models/inkling2.cpp
++++ b/src/models/inkling2.cpp
+@@ -327,11 +327,17 @@ bool llama_model_inkling2::graph::use_banded(int il, bool swa) {
+     const int64_t nh  = hparams.n_head(il);
+     const int64_t nkv = hparams.n_head_kv(il);
+     ggml_tensor * pq = ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, hd, 1, nh, 1);
+-    ggml_tensor * pk = ggml_new_tensor_4d(ctx0, cache->type_k(), hd, 1, nkv, 1);
+-    ggml_tensor * pv = ggml_new_tensor_4d(ctx0, cache->type_v(), hd, 1, nkv, 1);
+-    ggml_tensor * pm = ggml_new_tensor_4d(ctx0, GGML_TYPE_F16, 1, 1, 1, 1);
++    // a ring-rotated cache needs a kernel that maps cells to logical distances: probe with a rotation then,
++    // at a padded cell count (256) so the probe meets the layout conditions of such kernels
++    const int64_t pn  = inp->kv_rot_banded[swa] ? 256 : 1;
++    ggml_tensor * pk = ggml_new_tensor_4d(ctx0, cache->type_k(), hd, pn, nkv, 1);
++    ggml_tensor * pv = ggml_new_tensor_4d(ctx0, cache->type_v(), hd, pn, nkv, 1);
++    ggml_tensor * pm = ggml_new_tensor_4d(ctx0, GGML_TYPE_F16, pn, 1, 1, 1);
+     ggml_tensor * pr = ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, 1, nh, 1, 1);
+     ggml_tensor * op = ggml_flash_attn_ext_banded(ctx0, pq, pk, pv, pm, pr, 1.0f, 1);
++    if (inp->kv_rot_banded[swa]) {
++        ggml_flash_attn_ext_banded_set_kv_rot(op, 1);
++    }
+     ggml_flash_attn_ext_add_sinks(op, ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, nh, 1, 1));
+     ggml_prec_set_acc(op, GGML_PREC_F32);
+     const bool ok = ggml_backend_dev_supports_op(dev, op);
+@@ -347,7 +353,7 @@ ggml_tensor * llama_model_inkling2::graph::build_inputs() {
+     // banded FA needs a position-contiguous cache; small ubatches stay dense for graph reuse
+     inp->banded = cparams.flash_attn && n_tokens > n_tokens_banded_min;
+     for (int i = 0; i < 2 && inp->banded; ++i) {
+-        inp->n_kv_banded[i] = (i ? attn->mctx->get_swa() : attn->mctx->get_base())->get_n_kv_pos_contiguous();
++        inp->n_kv_banded[i] = (i ? attn->mctx->get_swa() : attn->mctx->get_base())->get_n_kv_pos_ring(inp->kv_rot_banded[i]);
+     }
+ 
+     ggml_tensor * inp_pos = build_inp_pos();
+@@ -507,6 +513,9 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
+             ggml_tensor * rel_b = ggml_mul_mat(ctx0, layer.attn_rel_bias, Rcur);
+             rel_b = ggml_reshape_4d(ctx0, rel_b, rel_b->ne[0], n_head, n_tokens, 1);
+             cur = ggml_flash_attn_ext_banded(ctx0, q_fa, k_fa, v_fa, m, rel_b, 1.0f/sqrtf(n_embd_head), rel_b->ne[0]);
++            if (inp->kv_rot_banded[is_swa]) {
++                ggml_flash_attn_ext_banded_set_kv_rot(cur, inp->kv_rot_banded[is_swa]);
++            }
+             ggml_flash_attn_ext_add_sinks(cur, ggml_reshape_3d(ctx0, sinks, n_head, n_tokens, 1));
+             ggml_prec_set_acc(cur, GGML_PREC_F32);
+             res->add_fused_node({LLM_FUSED_OP_FLASH_ATTN, cur, il});
+diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
+index 9a8e69efe..aeaa76a55 100644
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -9399,6 +9399,26 @@ struct test_flash_attn_ext_banded_sinks : public test_flash_attn_ext_banded {
+     }
+ };
+ 
++// ring-rotated K/V cells (wrapped SWA cache): the relative distance uses the logical cell index
++struct test_flash_attn_ext_banded_rot : public test_flash_attn_ext_banded_sinks {
++    const int32_t kv_rot;
++
++    std::string vars() override {
++        return test_flash_attn_ext_banded_sinks::vars() + ",kv_rot=" + std::to_string(kv_rot);
++    }
++
++    test_flash_attn_ext_banded_rot(int64_t d, int64_t n_head, int64_t n_head_kv, int64_t n_q, int64_t n_kv, int64_t rel_extent,
++            int mask_kind, ggml_type kv_type, int sinks, int32_t kv_rot)
++        : test_flash_attn_ext_banded_sinks(d, n_head, n_head_kv, n_q, n_kv, rel_extent, mask_kind, kv_type, GGML_TYPE_F32, sinks),
++          kv_rot(kv_rot) {}
++
++    ggml_tensor * build_graph(ggml_context * ctx) override {
++        ggml_tensor * out = test_flash_attn_ext_banded_sinks::build_graph(ctx);
++        ggml_flash_attn_ext_banded_set_kv_rot(out, kv_rot);
++        return out;
++    }
++};
++
+ // large Q values, so the online softmax has to rescale the partial results
+ struct test_flash_attn_ext_large_logits : public test_flash_attn_ext {
+     static constexpr int q_range = 20;
+@@ -13583,6 +13603,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+         test_cases.emplace_back(new test_flash_attn_ext_banded_sinks(128, 24, 8,  512,  8704, 1024, 1, GGML_TYPE_Q8_0, GGML_TYPE_F32, sinks));
+         test_cases.emplace_back(new test_flash_attn_ext_banded_sinks(128, 24, 8,    1,  8704, 1024, 1, GGML_TYPE_Q8_0, GGML_TYPE_F32, sinks));
+         test_cases.emplace_back(new test_flash_attn_ext_banded_sinks(128, 24, 8,   37,  2048, 1024, 1, GGML_TYPE_F16,  GGML_TYPE_F32, sinks));
++        for (int32_t rot : {1, 511, 1024, 1535}) {
++            test_cases.emplace_back(new test_flash_attn_ext_banded_rot(128, 24, 8, 512, 1536, 1024, 1, GGML_TYPE_Q8_0, sinks, rot));
++            test_cases.emplace_back(new test_flash_attn_ext_banded_rot(128, 24, 8, 512, 1536, 1024, 1, GGML_TYPE_F16,  sinks, rot));
++        }
++        test_cases.emplace_back(new test_flash_attn_ext_banded_rot(128, 24, 8, 100, 1536, 1024, 1, GGML_TYPE_Q8_0, sinks, 700));
+         test_cases.emplace_back(new test_flash_attn_ext_banded_sinks(128,  8, 1, 2048,  2048, 1024, 1, GGML_TYPE_F16, GGML_TYPE_F32,  sinks));
+         test_cases.emplace_back(new test_flash_attn_ext_banded_sinks(128,  8, 1,  511, 16403, 1024, 1, GGML_TYPE_F16, GGML_TYPE_F32,  sinks));
+     }
+-- 
+2.43.0
+
+
+From 4bf7eed705493e149cbad6550448a5592504cbf6 Mon Sep 17 00:00:00 2001
+From: paleluna82-del <260293746+paleluna82-del@users.noreply.github.com>
+Date: Sun, 22 Nov 2026 23:58:52 +0900
+Subject: [PATCH 3/8] inkling2: pad an unrotated banded K/V cell count to the
+ FA KV stride
+
+A contiguous full-attention cache has exactly pos_max + 1 cells, so a decode-sized append (e.g. 128 tokens at
+depth 13312) gave n_kv % 256 != 0 and the WMMA banded path fell back to the scalar kernel (7 ms per call).
+Pad to a multiple of 256 within the mask width and express the offset as a rotation of n (logical index
+(cell - n) mod n_pad), so the queries stay aligned to the tail of the real cells; the padded cells hold no
+position of the sequence and are masked. Backends without rotated banded attention keep the unpadded layout.
+The graph-reuse check compares the cache's raw (n, rot) and the mask width.
+
+R9700: pp128 @ d13312 234 -> 654 t/s, pp300 @ d13312 943, pp512 @ d13312 1387 (Unsloth b12588: 475 / - / 602).
+PPL c640 b512 x30 6.3401 (dense 6.3415). Greedy on a 2242-token prompt matches the dense path until a near-tie
+(7.85% vs 7.32% top-2) at token 36.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/llama-graph.cpp     |  6 ++++--
+ src/llama-graph.h       |  4 ++++
+ src/models/inkling2.cpp | 26 +++++++++++++++++++++++++-
+ 3 files changed, 33 insertions(+), 3 deletions(-)
+
+diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
+index 524324404..416c773ca 100644
+--- a/src/llama-graph.cpp
++++ b/src/llama-graph.cpp
+@@ -1478,8 +1478,10 @@ bool llm_graph_input_mem_hybrid_iswa_rel::can_reuse(const llm_graph_params & par
+ 
+     if (banded) {
+         uint32_t rot[2];
+-        res &= attn_ctx->get_base()->get_n_kv_pos_ring(rot[0]) == n_kv_banded[0] && rot[0] == kv_rot_banded[0];
+-        res &= attn_ctx->get_swa()->get_n_kv_pos_ring(rot[1])  == n_kv_banded[1] && rot[1] == kv_rot_banded[1];
++        res &= attn_ctx->get_base()->get_n_kv_pos_ring(rot[0]) == n_kv_banded_raw[0] && rot[0] == kv_rot_banded_raw[0];
++        res &= attn_ctx->get_swa()->get_n_kv_pos_ring(rot[1])  == n_kv_banded_raw[1] && rot[1] == kv_rot_banded_raw[1];
++        res &= attn_ctx->get_base()->get_n_kv() == n_kv_banded_mask[0];
++        res &= attn_ctx->get_swa()->get_n_kv()  == n_kv_banded_mask[1];
+     }
+ 
+     res &= inp_rs->s_copy->ne[0] == mctx->get_recr()->get_n_rs();
+diff --git a/src/llama-graph.h b/src/llama-graph.h
+index 9d6fc5603..ad4ad2390 100644
+--- a/src/llama-graph.h
++++ b/src/llama-graph.h
+@@ -815,6 +815,10 @@ public:
+     uint32_t n_kv_banded[2] = { 0, 0 };
+     // [base, swa] ring rotation of the banded K/V cells, 0 = position order
+     uint32_t kv_rot_banded[2] = { 0, 0 };
++    // [base, swa] what the cache reported before padding; the graph-reuse check compares these
++    uint32_t n_kv_banded_raw[2]  = { 0, 0 };
++    uint32_t kv_rot_banded_raw[2] = { 0, 0 };
++    uint32_t n_kv_banded_mask[2]  = { 0, 0 }; // mask width (cells) the padding was decided against
+     bool     banded         = false;
+ 
+     const uint32_t extent;
+diff --git a/src/models/inkling2.cpp b/src/models/inkling2.cpp
+index 4afceb635..402aebd25 100644
+--- a/src/models/inkling2.cpp
++++ b/src/models/inkling2.cpp
+@@ -353,7 +353,31 @@ ggml_tensor * llama_model_inkling2::graph::build_inputs() {
+     // banded FA needs a position-contiguous cache; small ubatches stay dense for graph reuse
+     inp->banded = cparams.flash_attn && n_tokens > n_tokens_banded_min;
+     for (int i = 0; i < 2 && inp->banded; ++i) {
+-        inp->n_kv_banded[i] = (i ? attn->mctx->get_swa() : attn->mctx->get_base())->get_n_kv_pos_ring(inp->kv_rot_banded[i]);
++        const auto * cache = i ? attn->mctx->get_swa() : attn->mctx->get_base();
++        inp->n_kv_banded[i] = inp->n_kv_banded_raw[i] = cache->get_n_kv_pos_ring(inp->kv_rot_banded_raw[i]);
++        inp->kv_rot_banded[i] = inp->kv_rot_banded_raw[i];
++        inp->n_kv_banded_mask[i] = cache->get_n_kv();
++        // pad an unrotated cell count to the FA KV stride: kernels that need it (the WMMA path) can then run. The
++        // extra cells hold no position of this sequence, so the mask hides them, and a rotation of n keeps the
++        // queries aligned to the tail of the real cells: logical index (cell - n) mod n_pad = cell + n_pad - n.
++        const uint32_t n   = inp->n_kv_banded[i];
++        const uint32_t pad = GGML_PAD(n, 256u);
++        if (n > 0 && inp->kv_rot_banded[i] == 0 && pad != n && pad <= inp->n_kv_banded_mask[i]) {
++            inp->n_kv_banded[i]   = pad;
++            inp->kv_rot_banded[i] = n;
++            // a backend without rotated banded attention keeps the unpadded layout instead of falling back to dense
++            int il_rep = -1;
++            for (int il = 0; il < n_layer && il_rep < 0; ++il) {
++                if (hparams.is_swa(il) == (i == 1)) {
++                    il_rep = il;
++                }
++            }
++            if (il_rep >= 0 && !use_banded(il_rep, i == 1)) {
++                inp->n_kv_banded[i]   = n;
++                inp->kv_rot_banded[i] = 0;
++                banded_dev_ok.clear();
++            }
++        }
+     }
+ 
+     ggml_tensor * inp_pos = build_inp_pos();
+-- 
+2.43.0
+
+
+From d52ce600a1c9ac0c4c9ae0d73342dd3a773fcb8e Mon Sep 17 00:00:00 2001
+From: paleluna82-del <260293746+paleluna82-del@users.noreply.github.com>
+Date: Mon, 23 Nov 2026 00:23:37 +0900
+Subject: [PATCH 4/8] inkling2: no per-token batched GEMMs in the rel table and
+ the one-query depth mix
+
+Both were n_tokens batched tiny GEMMs (rel table 1024x24x16, mix 2304x1xB), which hipBLASLt runs with
+the GPU mostly idle (pp2048 767 t/s by default, 1257 with ROCBLAS_USE_HIPBLASLT_BATCHED=0).
+- rel table: one GEMM over all heads and tokens (same bias matrix), Rcur flattened to 2D.
+- depth mix with one query: sum over blocks as a broadcast multiply and a row sum.
+R9700 with default hipBLASLt, with #400-#402 applied: pp512 1519 / pp2048 1460 / pp16384 1377 / tg128 41.8, i.e. the env
+variable is no longer needed. KLD vs the previous build 0.0023, top-1 97.8% (switching only the BLAS
+library on the previous build: 0.0021 / 97.9%).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/models/inkling2.cpp | 12 +++++++++++-
+ 1 file changed, 11 insertions(+), 1 deletion(-)
+
+diff --git a/src/models/inkling2.cpp b/src/models/inkling2.cpp
+index 402aebd25..f3375cc42 100644
+--- a/src/models/inkling2.cpp
++++ b/src/models/inkling2.cpp
+@@ -239,6 +239,13 @@ ggml_tensor * llama_model_inkling2::graph::mix(const std::vector<ggml_tensor *>
+     ggml_tensor * scores = ggml_mul_mat(ctx0, states, queries);
+     scores = ggml_soft_max_ext(ctx0, scores, nullptr, 1.0f/sqrtf(n_embd), 0.0f);
+ 
++    if (scores->ne[1] == 1) {
++        // one query: out[e,t] = sum_b states_t[b,e,t]*scores[b,t] as a broadcast multiply and a row sum. As a GEMM it
++        // is n_tokens batched 2304x1xB products, which BLAS libraries run poorly (hipBLASLt leaves the GPU idle)
++        ggml_tensor * out = ggml_sum_rows(ctx0, ggml_mul(ctx0, states_t, scores));
++        return ggml_reshape_3d(ctx0, out, n_embd, 1, n_tokens);
++    }
++
+     return ggml_mul_mat(ctx0, states_t, scores);
+ }
+ 
+@@ -534,7 +541,10 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
+                         mask->nb[1], mask->nb[2], mask->nb[3], 0));
+             }
+             // exp(s + b)/(exp(t) + sum(exp(s + b))): the dense mask b - t with a zero sink
+-            ggml_tensor * rel_b = ggml_mul_mat(ctx0, layer.attn_rel_bias, Rcur);
++            // one GEMM over all heads and tokens instead of a batch of n_tokens small ones (same bias matrix)
++            ggml_tensor * R2 = ggml_is_contiguous(Rcur) ? Rcur : ggml_cont(ctx0, Rcur);
++            R2 = ggml_reshape_2d(ctx0, R2, R2->ne[0], R2->ne[1]*R2->ne[2]);
++            ggml_tensor * rel_b = ggml_mul_mat(ctx0, layer.attn_rel_bias, R2);
+             rel_b = ggml_reshape_4d(ctx0, rel_b, rel_b->ne[0], n_head, n_tokens, 1);
+             cur = ggml_flash_attn_ext_banded(ctx0, q_fa, k_fa, v_fa, m, rel_b, 1.0f/sqrtf(n_embd_head), rel_b->ne[0]);
+             if (inp->kv_rot_banded[is_swa]) {
+-- 
+2.43.0
+
+
+From 10e4805e216d2cb0c30b6e668c77e14fc1e37f03 Mon Sep 17 00:00:00 2001
+From: paleluna82-del <260293746+paleluna82-del@users.noreply.github.com>
+Date: Mon, 23 Nov 2026 00:57:37 +0900
+Subject: [PATCH 5/8] inkling2 : fuse short-conv residual and loop-controller
+ gate on CUDA/HIP
+
+Decode on this model is bound by the number of small kernels (~5600 per
+token), and each tiny elementwise kernel costs ~2.2 us inside a HIP graph.
+
+- ssm_conv: optionally fuse a residual add and a scale,
+  (res + conv(x, w))*s, as SSM_CONV -> ADD -> SCALE. inkling2 builds the
+  non-dynamic short convolutions in that order (192 per token).
+- new fused tanh gate mix, (x - tanh(f)*x) + tanh(g)*m, for the
+  UNARY(TANH) -> MUL -> SUB -> UNARY(TANH) -> MUL -> ADD subgraph of the
+  loop controllers. inkling2 expands the projections and the message
+  first so that the elementwise tail is contiguous.
+- test-backend-ops cases for both.
+
+R9700, Q4_K_M, q8_0 KV, with #400-#402 applied: tg128 41.8 -> 45.8 t/s, pp512 1519 -> 1559.
+PPL unchanged at c512 (7.6923 -> 7.6899), KLD 0.001 vs the unfused path.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ ggml/src/ggml-cuda/ggml-cuda.cu | 113 ++++++++++++++++++++++++++++++++
+ ggml/src/ggml-cuda/ssm-conv.cu  |  39 ++++++++---
+ ggml/src/ggml-cuda/ssm-conv.cuh |   3 +-
+ src/models/inkling2.cpp         |  29 ++++++--
+ tests/test-backend-ops.cpp      |  77 ++++++++++++++++++++++
+ 5 files changed, 245 insertions(+), 16 deletions(-)
+
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index fa36e9abb..5f3d397da 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -4198,6 +4198,34 @@ static bool ggml_cuda_match_moe_weighted_reduction(
+ }
+ 
+ 
++// y = (x - tanh(f)*x) + tanh(g)*m, rows of ne0 floats with per-operand row strides
++static __global__ void k_tanh_gate_mix(const float * x, const float * f, const float * g, const float * m, float * y,
++        const int64_t ne0, const int64_t nrows, const int64_t sx, const int64_t sf, const int64_t sg, const int64_t sm, const int64_t sy) {
++    const int64_t i0  = (int64_t) blockIdx.x*blockDim.x + threadIdx.x;
++    const int64_t row = blockIdx.y;
++    if (i0 >= ne0 || row >= nrows) {
++        return;
++    }
++    const float xv = x[row*sx + i0];
++    const float a  = __fsub_rn(xv, __fmul_rn(tanhf(f[row*sf + i0]), xv));
++    const float b  = __fmul_rn(tanhf(g[row*sg + i0]), m[row*sm + i0]);
++    y[row*sy + i0] = __fadd_rn(a, b);
++}
++
++static void ggml_cuda_op_tanh_gate_mix(ggml_backend_cuda_context & ctx, ggml_tensor * const * n) {
++    const ggml_tensor * x = n[2]->src[0];
++    const ggml_tensor * m = n[4]->src[0] == n[3] ? n[4]->src[1] : n[4]->src[0];
++    const ggml_tensor * f = n[0]->src[0];
++    const ggml_tensor * g = n[3]->src[0];
++    ggml_tensor * y = n[5];
++    const int64_t ne0 = y->ne[0], nrows = y->ne[1];
++    const int threads = 256;
++    const dim3 grid((ne0 + threads - 1)/threads, nrows, 1);
++    k_tanh_gate_mix<<<grid, threads, 0, ctx.stream()>>>((const float *) x->data, (const float *) f->data, (const float *) g->data,
++            (const float *) m->data, (float *) y->data, ne0, nrows,
++            x->nb[1]/sizeof(float), f->nb[1]/sizeof(float), g->nb[1]/sizeof(float), m->nb[1]/sizeof(float), y->nb[1]/sizeof(float));
++}
++
+ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
+                                int                                       node_idx,
+                                std::initializer_list<enum ggml_op>       ops,
+@@ -4307,6 +4335,49 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
+         return false;
+     }
+ 
++    std::initializer_list<enum ggml_op> tanh_gate_mix_ops = { GGML_OP_UNARY, GGML_OP_MUL, GGML_OP_SUB, GGML_OP_UNARY, GGML_OP_MUL, GGML_OP_ADD };
++    if (is_equal(tanh_gate_mix_ops, ops)) {
++        // (x - tanh(f)*x) + tanh(g)*m
++        if (!ggml_can_fuse_subgraph(cgraph, node_idx, ops, { node_idx + 5 })) {
++            return false;
++        }
++        const ggml_tensor * const * n = cgraph->nodes + node_idx;
++        if (ggml_get_unary_op(n[0]) != GGML_UNARY_OP_TANH || ggml_get_unary_op(n[3]) != GGML_UNARY_OP_TANH) {
++            return false;
++        }
++        if ((n[1]->src[0] != n[0] && n[1]->src[1] != n[0]) || n[2]->src[1] != n[1] ||
++            (n[4]->src[0] != n[3] && n[4]->src[1] != n[3]) ||
++            !((n[5]->src[0] == n[2] && n[5]->src[1] == n[4]) || (n[5]->src[0] == n[4] && n[5]->src[1] == n[2]))) {
++            return false;
++        }
++        const ggml_tensor * x  = n[2]->src[0];
++        const ggml_tensor * x1 = n[1]->src[0] == n[0] ? n[1]->src[1] : n[1]->src[0];
++        const ggml_tensor * m  = n[4]->src[0] == n[3] ? n[4]->src[1] : n[4]->src[0];
++        const ggml_tensor * f  = n[0]->src[0];
++        const ggml_tensor * g  = n[3]->src[0];
++        if (x1->data != x->data || memcmp(x1->nb, x->nb, sizeof(x->nb)) != 0) {
++            return false;
++        }
++        const ggml_tensor * out = n[5];
++        for (const ggml_tensor * t : { x, m, f, g, out, n[0], n[1], n[2], n[3], n[4] }) {
++            if (t->type != GGML_TYPE_F32 || !ggml_are_same_shape(t, out) || t->nb[0] != sizeof(float) || t->ne[2] != 1 || t->ne[3] != 1) {
++                return false;
++            }
++        }
++        // each thread reads its element of every input before writing the same element of the output, so an input
++        // may share the output memory only element for element
++        const char * y0 = (const char *) out->data;
++        const char * y1 = y0 + ggml_nbytes(out);
++        for (const ggml_tensor * t : { x, m, f, g }) {
++            const char * t0 = (const char *) t->data;
++            const char * t1 = t0 + ggml_nbytes(t);
++            if (t0 < y1 && y0 < t1 && !(t0 == y0 && t->nb[1] == out->nb[1])) {
++                return false;
++            }
++        }
++        return true;
++    }
++
+     if (!ggml_can_fuse(cgraph, node_idx, ops)) {
+         return false;
+     }
+@@ -4405,6 +4476,37 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
+         return true;
+     }
+ 
++    if (ops.size() == 3 && ops.begin()[0] == GGML_OP_SSM_CONV && ops.begin()[1] == GGML_OP_ADD && ops.begin()[2] == GGML_OP_SCALE) {
++        // (residual + ssm_conv)*scale with a residual of the conv output shape
++        if (!ggml_can_fuse(cgraph, node_idx, ops)) {
++            return false;
++        }
++        const ggml_tensor * ssm_conv = cgraph->nodes[node_idx];
++        const ggml_tensor * add      = cgraph->nodes[node_idx+1];
++        const ggml_tensor * scale    = cgraph->nodes[node_idx+2];
++        if (add->src[0] != ssm_conv && add->src[1] != ssm_conv) {
++            return false;
++        }
++        if (scale->src[0] != add) {
++            return false;
++        }
++        const ggml_tensor * res = add->src[0] == ssm_conv ? add->src[1] : add->src[0];
++        // the conv reads several inputs per output, so the output must not share the conv input memory; the residual
++        // is read element for element and may be the output memory itself
++        const ggml_tensor * x = ssm_conv->src[0];
++        const char * y0 = (const char *) scale->data, * y1 = y0 + ggml_nbytes(scale);
++        const char * x0 = (const char *) x->data,     * x1 = x0 + ggml_nbytes(x);
++        const char * r0 = (const char *) res->data,   * r1 = r0 + ggml_nbytes(res);
++        if ((x0 < y1 && y0 < x1) || (r0 < y1 && y0 < r1 && r0 != y0)) {
++            return false;
++        }
++        float bias;
++        memcpy(&bias, (const float *) scale->op_params + 1, sizeof(float));
++        return bias == 0.0f && ssm_conv->type == GGML_TYPE_F32 && add->type == GGML_TYPE_F32 && scale->type == GGML_TYPE_F32 &&
++               res->type == GGML_TYPE_F32 && ggml_is_contiguous(res) && ggml_are_same_shape(res, ssm_conv) &&
++               ggml_are_same_shape(add, ssm_conv) && ggml_is_contiguous(scale);
++    }
++
+     if (ops.size() == 3 && ops.begin()[0] == GGML_OP_SSM_CONV && ops.begin()[1] == GGML_OP_ADD
+      && ops.begin()[2] == GGML_OP_UNARY && unary_ops.size() == 1 && unary_ops.begin()[0] == GGML_UNARY_OP_SILU) {
+         const ggml_tensor * ssm_conv = cgraph->nodes[node_idx];
+@@ -5323,6 +5425,17 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+         return 1;
+     }
+ 
++    if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_UNARY, GGML_OP_MUL, GGML_OP_SUB, GGML_OP_UNARY, GGML_OP_MUL, GGML_OP_ADD },
++                { GGML_UNARY_OP_TANH, GGML_UNARY_OP_TANH })) {
++        ggml_cuda_op_tanh_gate_mix(*cuda_ctx, cgraph->nodes + i);
++        return 5;
++    }
++
++    if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_SSM_CONV, GGML_OP_ADD, GGML_OP_SCALE }, {})) {
++        ggml_cuda_op_ssm_conv(*cuda_ctx, node, nullptr, nullptr, cgraph->nodes[i + 1], cgraph->nodes[i + 2]);
++        return 2;
++    }
++
+     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_SSM_CONV, GGML_OP_ADD, GGML_OP_UNARY }, { GGML_UNARY_OP_SILU })) {
+         ggml_cuda_op_ssm_conv(*cuda_ctx, node, cgraph->nodes[i + 1], cgraph->nodes[i + 2]);
+         return 2;
+diff --git a/ggml/src/ggml-cuda/ssm-conv.cu b/ggml/src/ggml-cuda/ssm-conv.cu
+index bf22243d3..c4bb11a08 100644
+--- a/ggml/src/ggml-cuda/ssm-conv.cu
++++ b/ggml/src/ggml-cuda/ssm-conv.cu
+@@ -4,7 +4,7 @@
+ 
+ template <bool apply_silu, size_t split_d_inner, size_t d_conv>
+ static __global__ void ssm_conv_f32(const float * src0_ptr, const float * src1_ptr,
+-                                    const float * bias_ptr,
++                                    const float * bias_ptr, const float * res_ptr, const float res_scale,
+                                     const int64_t src0_nb0, const int64_t src0_nb1, const int64_t src0_nb2, const int64_t src1_nb1,
+                                     float * dst_ptr, const int64_t dst_nb0, const int64_t dst_nb1, const int64_t dst_nb2,
+                                     const int64_t n_t) {
+@@ -53,13 +53,16 @@ static __global__ void ssm_conv_f32(const float * src0_ptr, const float * src1_p
+             sumf += x[(i + j) % d_conv] * w[j];
+         }
+         sumf += b;
++        if (res_ptr != nullptr) {
++            sumf = (res_ptr[bidx * (dst_nb2 / sizeof(float)) + i * stride_y + bidy * split_d_inner + tid] + sumf) * res_scale;
++        }
+         y_block[i * stride_y + tid] = apply_silu ? ggml_cuda_op_silu_single(sumf) : sumf;
+     }
+ }
+ 
+ template <bool apply_silu, size_t split_d_inner, size_t d_conv, int64_t split_n_t>
+ static __global__ void ssm_conv_long_token_f32(const float * __restrict__ src0, const float * __restrict__ src1,
+-                                               const float * __restrict__ bias,
++                                               const float * __restrict__ bias, const float * __restrict__ res, const float res_scale,
+                                                const int64_t src0_nb0, const int64_t src0_nb1, const int64_t src0_nb2,
+                                                const int64_t src1_nb1, float * __restrict__ dst, const int64_t dst_nb0,
+                                                const int64_t dst_nb1, const int64_t dst_nb2, const int64_t n_t) {
+@@ -119,12 +122,15 @@ static __global__ void ssm_conv_long_token_f32(const float * __restrict__ src0,
+             sumf += smem[tid * n_cols + i + j] * w[j];
+         }
+         sumf += b;
++        if (res != nullptr) {
++            sumf = (res[bidx * (dst_nb2 / sizeof(float)) + (bidz * split_n_t + i) * stride_y + bidy * split_d_inner + tid] + sumf) * res_scale;
++        }
+         y_block[i * stride_y + tid] = apply_silu ? ggml_cuda_op_silu_single(sumf) : sumf;
+     }
+ }
+ 
+ template <bool apply_silu>
+-static void ssm_conv_f32_cuda(const float * src0, const float * src1, const float * bias, const int64_t src0_nb0, const int64_t src0_nb1,
++static void ssm_conv_f32_cuda(const float * src0, const float * src1, const float * bias, const float * res, const float res_scale, const int64_t src0_nb0, const int64_t src0_nb1,
+                               const int64_t src0_nb2, const int64_t src1_nb1, float * dst, const int64_t dst_nb0, const int64_t dst_nb1,
+                               const int64_t dst_nb2, const int64_t nc, const int64_t nr, const int64_t n_t,
+                               const int64_t n_s, cudaStream_t stream) {
+@@ -136,14 +142,14 @@ static void ssm_conv_f32_cuda(const float * src0, const float * src1, const floa
+         if (n_t <= 32) {
+             const dim3 blocks(n_s, (nr + threads - 1) / threads, 1);
+             const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(blocks, threads, 0, stream);
+-            ggml_cuda_kernel_launch(ssm_conv_f32<apply_silu, threads, kNC>, launch_params, src0, src1, bias, src0_nb0, src0_nb1,
++            ggml_cuda_kernel_launch(ssm_conv_f32<apply_silu, threads, kNC>, launch_params, src0, src1, bias, res, res_scale, src0_nb0, src0_nb1,
+                                                                         src0_nb2, src1_nb1, dst, dst_nb0, dst_nb1, dst_nb2, n_t);
+         } else {
+             const int64_t split_n_t = 32;
+             dim3          blocks(n_s, (nr + threads - 1) / threads, (n_t + split_n_t - 1) / split_n_t);
+             const size_t  smem_size = threads * (kNC - 1 + split_n_t) * sizeof(float);
+             ssm_conv_long_token_f32<apply_silu, threads, kNC, split_n_t><<<blocks, threads, smem_size, stream>>>(
+-                src0, src1, bias, src0_nb0, src0_nb1, src0_nb2, src1_nb1, dst, dst_nb0, dst_nb1, dst_nb2, n_t);
++                src0, src1, bias, res, res_scale, src0_nb0, src0_nb1, src0_nb2, src1_nb1, dst, dst_nb0, dst_nb1, dst_nb2, n_t);
+         }
+     };
+ 
+@@ -159,7 +165,8 @@ static void ssm_conv_f32_cuda(const float * src0, const float * src1, const floa
+     }
+ }
+ 
+-void ggml_cuda_op_ssm_conv(ggml_backend_cuda_context & ctx, ggml_tensor * dst, ggml_tensor * bias_add_node, ggml_tensor * silu_dst) {
++void ggml_cuda_op_ssm_conv(ggml_backend_cuda_context & ctx, ggml_tensor * dst, ggml_tensor * bias_add_node, ggml_tensor * silu_dst,
++        ggml_tensor * res_add_node, ggml_tensor * scale_node) {
+     const struct ggml_tensor * src0 = dst->src[0];  // conv_x
+     const struct ggml_tensor * src1 = dst->src[1];  // conv1d.weight
+     const bool fuse_bias = bias_add_node != nullptr;
+@@ -171,8 +178,19 @@ void ggml_cuda_op_ssm_conv(ggml_backend_cuda_context & ctx, ggml_tensor * dst, g
+     // The bias (when fused) is the non-conv operand of the ADD node.
+     const struct ggml_tensor * bias = fuse_bias ? (bias_add_node->src[0] == dst ? bias_add_node->src[1] : bias_add_node->src[0]) : nullptr;
+ 
+-    // When fusing, write to silu_dst (the node downstream references).
+-    const struct ggml_tensor * out = fuse_silu ? silu_dst : dst;
++    // (residual + conv)*scale: the residual is the non-conv operand of the ADD node, the SCALE node is the output
++    const bool fuse_res = res_add_node != nullptr;
++    GGML_ASSERT(!fuse_res || (!fuse_bias && !fuse_silu && scale_node != nullptr));
++    const struct ggml_tensor * res = fuse_res ? (res_add_node->src[0] == dst ? res_add_node->src[1] : res_add_node->src[0]) : nullptr;
++    float res_scale = 1.0f;
++    if (fuse_res) {
++        memcpy(&res_scale, scale_node->op_params, sizeof(float));
++        GGML_ASSERT(res->type == GGML_TYPE_F32 && ggml_is_contiguous(res) && ggml_are_same_shape(res, dst));
++    }
++
++    // When fusing, write to the last fused node (the node downstream references).
++    const struct ggml_tensor * out = fuse_res ? scale_node : fuse_silu ? silu_dst : dst;
++    GGML_ASSERT(!fuse_res || ggml_is_contiguous(out));
+ 
+     const int64_t nc  = src1->ne[0];                // d_conv
+     const int64_t nr  = src0->ne[1];                // d_inner
+@@ -187,6 +205,7 @@ void ggml_cuda_op_ssm_conv(ggml_backend_cuda_context & ctx, ggml_tensor * dst, g
+     const float * src0_d = (const float *) src0->data;
+     const float * src1_d = (const float *) src1->data;
+     const float * bias_d = fuse_bias ? (const float *) bias->data : nullptr;
++    const float * res_d  = fuse_res ? (const float *) res->data : nullptr;
+     float *       dst_d  = (float *) out->data;
+     cudaStream_t  stream = ctx.stream();
+ 
+@@ -199,10 +218,10 @@ void ggml_cuda_op_ssm_conv(ggml_backend_cuda_context & ctx, ggml_tensor * dst, g
+     }
+ 
+     if (fuse_silu) {
+-        ssm_conv_f32_cuda<true>(src0_d, src1_d, bias_d, src0->nb[0], src0->nb[1], src0->nb[2], src1->nb[1], dst_d, out->nb[0], out->nb[1],
++        ssm_conv_f32_cuda<true>(src0_d, src1_d, bias_d, res_d, res_scale, src0->nb[0], src0->nb[1], src0->nb[2], src1->nb[1], dst_d, out->nb[0], out->nb[1],
+                           out->nb[2], nc, nr, n_t, n_s, stream);
+     } else {
+-        ssm_conv_f32_cuda<false>(src0_d, src1_d, bias_d, src0->nb[0], src0->nb[1], src0->nb[2], src1->nb[1], dst_d, out->nb[0], out->nb[1],
++        ssm_conv_f32_cuda<false>(src0_d, src1_d, bias_d, res_d, res_scale, src0->nb[0], src0->nb[1], src0->nb[2], src1->nb[1], dst_d, out->nb[0], out->nb[1],
+                           out->nb[2], nc, nr, n_t, n_s, stream);
+     }
+ }
+diff --git a/ggml/src/ggml-cuda/ssm-conv.cuh b/ggml/src/ggml-cuda/ssm-conv.cuh
+index 8514ca849..4d9dbda08 100644
+--- a/ggml/src/ggml-cuda/ssm-conv.cuh
++++ b/ggml/src/ggml-cuda/ssm-conv.cuh
+@@ -1,3 +1,4 @@
+ #include "common.cuh"
+ 
+-void ggml_cuda_op_ssm_conv(ggml_backend_cuda_context & ctx, ggml_tensor * dst, ggml_tensor * bias_add_node = nullptr, ggml_tensor * silu_dst = nullptr);
++void ggml_cuda_op_ssm_conv(ggml_backend_cuda_context & ctx, ggml_tensor * dst, ggml_tensor * bias_add_node = nullptr, ggml_tensor * silu_dst = nullptr,
++        ggml_tensor * res_add_node = nullptr, ggml_tensor * scale_node = nullptr);
+diff --git a/src/models/inkling2.cpp b/src/models/inkling2.cpp
+index f3375cc42..3d7d684f2 100644
+--- a/src/models/inkling2.cpp
++++ b/src/models/inkling2.cpp
+@@ -266,15 +266,25 @@ ggml_tensor * llama_model_inkling2::graph::convolve(
+ 
+     ggml_tensor * past = ggml_view_3d(ctx0, history, n_conv - 1, n_channels, n_seqs, history->nb[1], history->nb[2], offset*history->nb[1]);
+ 
+-    ggml_tensor * x = ggml_transpose(ctx0, ggml_reshape_3d(ctx0, cur, n_channels, n_seq_tokens, n_seqs));
++    // created first so that the residual add follows the conv directly in the graph, which lets a backend fuse
++    // the conv, the residual add and the scale
++    ggml_tensor * cur_3d = ggml_reshape_3d(ctx0, cur, n_channels, n_seq_tokens, n_seqs);
++
++    ggml_tensor * x = ggml_transpose(ctx0, cur_3d);
+     x = ggml_concat(ctx0, past, x, 0);
+ 
+     build_conv_state_store(inp, state, x, n_conv - 1, offset*(n_conv - 1)*ggml_element_size(state));
+ 
+     ggml_tensor * out = ggml_ssm_conv(ctx0, x, weight);
++
++    if (!dynamic) {
++        out = ggml_scale(ctx0, ggml_add(ctx0, cur_3d, out), 1.0f/sqrtf(n_conv + 1));
++        return ggml_reshape_2d(ctx0, out, n_channels, n_tokens);
++    }
++
+     out = ggml_reshape_2d(ctx0, out, n_channels, n_tokens);
+ 
+-    if (dynamic) {
++    {
+         const int64_t n_heads = dynamic->ne[0]/n_conv;
+ 
+         dynamic = ggml_reshape_3d(ctx0, dynamic, n_conv, n_heads, n_tokens);
+@@ -294,7 +304,7 @@ ggml_tensor * llama_model_inkling2::graph::convolve(
+         }
+     }
+ 
+-    return ggml_scale(ctx0, ggml_add(ctx0, cur, out), 1.0f/sqrtf((dynamic ? 2 : 1)*n_conv + 1));
++    return ggml_scale(ctx0, ggml_add(ctx0, cur, out), 1.0f/sqrtf(2*n_conv + 1));
+ }
+ 
+ // mix a cross-pass message into a looped layer input: (1 - forget)*cur + gain*message, both gated on cur and message
+@@ -304,8 +314,17 @@ ggml_tensor * llama_model_inkling2::graph::control(ggml_tensor * cur, ggml_tenso
+     ggml_tensor * gate = ggml_concat(ctx0, cur_norm, message_norm, 0);
+     gate = build_lora_mm(loop.ctrl_down[ctrl], gate);
+ 
+-    ggml_tensor * gain   = ggml_tanh(ctx0, build_lora_mm(loop.ctrl_gain[ctrl],   gate));
+-    ggml_tensor * forget = ggml_tanh(ctx0, build_lora_mm(loop.ctrl_forget[ctrl], gate));
++    ggml_tensor * gain_pre   = build_lora_mm(loop.ctrl_gain[ctrl],   gate);
++    ggml_tensor * forget_pre = build_lora_mm(loop.ctrl_forget[ctrl], gate);
++
++    // the projections and the message first, so that the elementwise tail is contiguous in the graph and a backend
++    // can fuse it
++    ggml_build_forward_expand(gf, forget_pre);
++    ggml_build_forward_expand(gf, gain_pre);
++    ggml_build_forward_expand(gf, message);
++
++    ggml_tensor * gain   = ggml_tanh(ctx0, gain_pre);
++    ggml_tensor * forget = ggml_tanh(ctx0, forget_pre);
+ 
+     return ggml_add(ctx0, ggml_sub(ctx0, cur, ggml_mul(ctx0, forget, cur)), ggml_mul(ctx0, gain, message));
+ }
+diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
+index aeaa76a55..da176aea0 100644
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -4976,6 +4976,74 @@ struct test_ssm_conv_bias_silu : public test_case {
+     }
+ };
+ 
++// (residual + GGML_OP_SSM_CONV)*scale (fused operation)
++struct test_ssm_conv_res_scale : public test_case {
++    const std::array<int64_t, 4> ne_a;
++    const std::array<int64_t, 4> ne_b;
++
++    std::string op_desc(ggml_tensor * t) override {
++        GGML_UNUSED(t);
++        return "SSM_CONV_RES_SCALE";
++    }
++
++    bool run_whole_graph() override { return true; }
++
++    std::string vars() override {
++        return VARS_TO_STR2(ne_a, ne_b);
++    }
++
++    test_ssm_conv_res_scale(std::array<int64_t, 4> ne_a, std::array<int64_t, 4> ne_b)
++        : ne_a(ne_a), ne_b(ne_b) {}
++
++    ggml_tensor * build_graph(ggml_context * ctx) override {
++        ggml_tensor * a = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne_a.data());
++        ggml_tensor * b = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne_b.data());
++        ggml_set_name(a, "a");
++        ggml_set_name(b, "b");
++
++        ggml_tensor * conv = ggml_ssm_conv(ctx, a, b);
++        ggml_tensor * res  = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, conv->ne);
++        ggml_set_name(res, "res");
++
++        ggml_tensor * out = ggml_scale(ctx, ggml_add(ctx, res, conv), 0.4472136f);
++        ggml_set_name(out, "out");
++        return out;
++    }
++};
++
++// (x - tanh(f)*x) + tanh(g)*m (fused operation)
++struct test_tanh_gate_mix : public test_case {
++    const std::array<int64_t, 2> ne;
++
++    std::string op_desc(ggml_tensor * t) override {
++        GGML_UNUSED(t);
++        return "TANH_GATE_MIX";
++    }
++
++    bool run_whole_graph() override { return true; }
++
++    std::string vars() override {
++        return VARS_TO_STR1(ne);
++    }
++
++    test_tanh_gate_mix(std::array<int64_t, 2> ne) : ne(ne) {}
++
++    ggml_tensor * build_graph(ggml_context * ctx) override {
++        ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, ne[0], ne[1]);
++        ggml_tensor * f = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, ne[0], ne[1]);
++        ggml_tensor * g = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, ne[0], ne[1]);
++        ggml_tensor * m = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, ne[0], ne[1]);
++        ggml_set_name(x, "x");
++        ggml_set_name(f, "f");
++        ggml_set_name(g, "g");
++        ggml_set_name(m, "m");
++
++        ggml_tensor * out = ggml_add(ctx, ggml_sub(ctx, x, ggml_mul(ctx, ggml_tanh(ctx, f), x)), ggml_mul(ctx, ggml_tanh(ctx, g), m));
++        ggml_set_name(out, "out");
++        return out;
++    }
++};
++
+ // GGML_OP_SSM_SCAN
+ struct test_ssm_scan : public test_case {
+     const ggml_type type;
+@@ -12088,6 +12156,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+         }
+     }
+ 
++    for (int64_t n_t : {1, 3, 64}) {
++        test_cases.emplace_back(new test_ssm_conv_res_scale({3 + n_t, 1024, 1, 1}, {4, 1024, 1, 1}));
++        test_cases.emplace_back(new test_ssm_conv_res_scale({3 + n_t, 256, 2, 1}, {4, 256, 1, 1}));
++    }
++    for (int64_t n_t : {1, 7, 512}) {
++        test_cases.emplace_back(new test_tanh_gate_mix({2304, n_t}));
++    }
++    test_cases.emplace_back(new test_tanh_gate_mix({100, 3}));
++
+     test_cases.emplace_back(new test_ssm_scan(GGML_TYPE_F32, 16, 1, 1024, 1, 32, 4)); // Mamba-1
+     test_cases.emplace_back(new test_ssm_scan(GGML_TYPE_F32, 64, 64, 112, 2, 32, 4)); // Zamba2 (real hparams: d_inner=7168, dt_rank=112, n_group=2 -> head_dim=7168/112=64)
+     test_cases.emplace_back(new test_ssm_scan(GGML_TYPE_F32, 64, 64, 112, 2, 1, 1)); // Zamba2 decode (single-token, matches real per-token decode workload)
+-- 
+2.43.0
+
+
+From 502842e1da62a0584e0dd7f5c850dfa404f41fe8 Mon Sep 17 00:00:00 2001
+From: paleluna82-del <260293746+paleluna82-del@users.noreply.github.com>
+Date: Mon, 23 Nov 2026 01:05:41 +0900
+Subject: [PATCH 6/8] inkling2 : fuse the short-conv input concat and state
+ store into the conv on CUDA/HIP
+
+Each non-dynamic short convolution concatenates the past columns from the
+recurrent state with the new inputs, copies the last columns back to the
+state, convolves, adds the residual and scales: five kernels, 192 times
+per token. Fuse CONCAT -> VIEW -> VIEW -> CPY -> SSM_CONV -> ADD -> SCALE
+into one kernel that reads the past from the state, keeps the window in
+registers and writes the new past back (n_t <= 32, d_conv 4). inkling2
+expands the conv output right after the state store so that the nodes are
+adjacent. Disable with GGML_CUDA_DISABLE_SSM_CONV_HIST_FUSION.
+
+R9700, Q4_K_M, q8_0 KV, with #400-#402 applied: tg128 45.8 -> 47.5 t/s. KLD vs unfused 0.000000
+(max 5.6e-5) with ubatch 16 and with 4 sequences per ubatch.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ ggml/src/ggml-cuda/ggml-cuda.cu |  45 ++++++++++
+ ggml/src/ggml-cuda/ssm-conv.cu  | 153 ++++++++++++++++++++++++++++++++
+ ggml/src/ggml-cuda/ssm-conv.cuh |   4 +
+ src/models/inkling2.cpp         |   2 +
+ 4 files changed, 204 insertions(+)
+
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index 5f3d397da..3cd45bac4 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -4198,6 +4198,42 @@ static bool ggml_cuda_match_moe_weighted_reduction(
+ }
+ 
+ 
++// CONCAT(past, cur) -> VIEW(last) -> VIEW(state cell) -> CPY(last, cell) -> SSM_CONV -> ADD(res) -> SCALE
++static int ggml_cuda_try_fuse_ssm_conv_hist(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
++    static const ggml_op ops[7] = { GGML_OP_CONCAT, GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_CPY, GGML_OP_SSM_CONV, GGML_OP_ADD, GGML_OP_SCALE };
++    const int n = 7;
++    if (i + n > cgraph->n_nodes) {
++        return 0;
++    }
++    ggml_tensor ** nd = cgraph->nodes + i;
++    for (int k = 0; k < n; ++k) {
++        if (nd[k]->op != ops[k] || (nd[k]->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
++            return 0;
++        }
++    }
++    if (nd[1]->view_src != nd[0] || nd[3]->src[0] != nd[1] || nd[3]->src[1] != nd[2] || nd[4]->src[0] != nd[0] ||
++        (nd[5]->src[0] != nd[4] && nd[5]->src[1] != nd[4]) || nd[6]->src[0] != nd[5]) {
++        return 0;
++    }
++    // the concat feeds the stored view and the conv only, the last view the copy only, and the conv and the add
++    // their next node only; the cell view and the copy are views of and writes to the state
++    if (ggml_node_get_use_count(cgraph, i) != 2 || ggml_node_get_use_count(cgraph, i + 1) != 1 ||
++        ggml_node_get_use_count(cgraph, i + 2) != 1 || ggml_node_get_use_count(cgraph, i + 3) != 0 ||
++        ggml_node_get_use_count(cgraph, i + 4) != 1 || ggml_node_get_use_count(cgraph, i + 5) != 1) {
++        return 0;
++    }
++    for (int k : { 0, 1, 4, 5 }) {
++        if (nd[k]->flags & GGML_TENSOR_FLAG_OUTPUT) {
++            return 0;
++        }
++    }
++    if (!ggml_cuda_ssm_conv_hist_supported(nd)) {
++        return 0;
++    }
++    ggml_cuda_op_ssm_conv_hist(*cuda_ctx, nd);
++    return n - 1;
++}
++
+ // y = (x - tanh(f)*x) + tanh(g)*m, rows of ne0 floats with per-operand row strides
+ static __global__ void k_tanh_gate_mix(const float * x, const float * f, const float * g, const float * m, float * y,
+         const int64_t ne0, const int64_t nrows, const int64_t sx, const int64_t sf, const int64_t sg, const int64_t sm, const int64_t sy) {
+@@ -4762,6 +4798,15 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+         }
+     }
+ 
++    // short convolution with its past in the recurrent state
++    if (node->op == GGML_OP_CONCAT) {
++        static const bool ssm_conv_hist_disabled = ggml_cuda_env_flag("GGML_CUDA_DISABLE_SSM_CONV_HIST_FUSION");
++        const int n_fused = ssm_conv_hist_disabled ? 0 : ggml_cuda_try_fuse_ssm_conv_hist(cuda_ctx, cgraph, i);
++        if (n_fused > 0) {
++            return n_fused;
++        }
++    }
++
+     //RoPE + view + set-rows
+     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_ROPE, GGML_OP_VIEW, GGML_OP_SET_ROWS }, {})) {
+         ggml_tensor * rope     = cgraph->nodes[i];
+diff --git a/ggml/src/ggml-cuda/ssm-conv.cu b/ggml/src/ggml-cuda/ssm-conv.cu
+index c4bb11a08..077160e15 100644
+--- a/ggml/src/ggml-cuda/ssm-conv.cu
++++ b/ggml/src/ggml-cuda/ssm-conv.cu
+@@ -225,3 +225,156 @@ void ggml_cuda_op_ssm_conv(ggml_backend_cuda_context & ctx, ggml_tensor * dst, g
+                           out->nb[2], nc, nr, n_t, n_s, stream);
+     }
+ }
++
++// short convolution over [past, cur] with the past (d_conv - 1 columns per channel) read from the recurrent state, a
++// residual add and a scale, and the new past written back: CONCAT -> VIEW -> VIEW -> CPY -> SSM_CONV -> ADD -> SCALE
++// one thread per channel and sequence, so the state may be read and written in place
++template <size_t d_conv>
++static __global__ void ssm_conv_hist_f32(
++        const float * __restrict__ past, const int64_t past_s1, const int64_t past_s2,
++        const float * cur, const int64_t cur_s0, const int64_t cur_s1, const int64_t cur_s2,
++        const float * __restrict__ w_ptr, const int64_t w_s1,
++        const float * res, const int64_t res_s1, const int64_t res_s2, const float res_scale,
++        float * y, const int64_t y_s1, const int64_t y_s2,
++        float * state, const int64_t state_s1,
++        const int64_t nr, const int64_t n_t) {
++    const int64_t c = (int64_t) blockIdx.y*blockDim.x + threadIdx.x;
++    const int64_t s = blockIdx.x;
++    if (c >= nr) {
++        return;
++    }
++
++    float x[d_conv];
++    float w[d_conv];
++#pragma unroll
++    for (size_t j = 0; j < d_conv; j++) {
++        w[j] = w_ptr[c*w_s1 + j];
++    }
++#pragma unroll
++    for (size_t j = 0; j < d_conv - 1; j++) {
++        x[j] = past[s*past_s2 + c*past_s1 + j];
++    }
++    const float b = 0.0f;
++
++    for (int64_t i = 0; i < n_t; i++) {
++        x[d_conv - 1] = cur[s*cur_s2 + i*cur_s0 + c*cur_s1];
++
++        float sumf = 0.0f;
++#pragma unroll
++        for (size_t j = 0; j < d_conv; j++) {
++            sumf += x[j] * w[j];
++        }
++        sumf += b;
++        sumf = (res[s*res_s2 + i*res_s1 + c] + sumf) * res_scale;
++        y[s*y_s2 + i*y_s1 + c] = sumf;
++
++#pragma unroll
++        for (size_t j = 0; j < d_conv - 1; j++) {
++            x[j] = x[j + 1];
++        }
++    }
++
++#pragma unroll
++    for (size_t j = 0; j < d_conv - 1; j++) {
++        state[s*state_s1 + c*(d_conv - 1) + j] = x[j];
++    }
++}
++
++bool ggml_cuda_ssm_conv_hist_supported(ggml_tensor * const * n) {
++    const ggml_tensor * concat = n[0];
++    const ggml_tensor * cpy    = n[3];
++    const ggml_tensor * conv   = n[4];
++    const ggml_tensor * add    = n[5];
++    const ggml_tensor * scale  = n[6];
++    const ggml_tensor * past   = concat->src[0];
++    const ggml_tensor * cur    = concat->src[1];
++    const ggml_tensor * w      = conv->src[1];
++    const ggml_tensor * res    = add->src[0] == conv ? add->src[1] : add->src[0];
++    const ggml_tensor * last   = cpy->src[0];
++    const ggml_tensor * cell   = cpy->src[1];
++
++    const int64_t nc  = w->ne[0];
++    const int64_t nr  = conv->ne[0];
++    const int64_t n_t = conv->ne[1];
++    const int64_t n_s = conv->ne[2];
++
++    if (nc != 4 || n_t > 32 || ggml_get_op_params_i32(concat, 0) != 0) {
++        return false;
++    }
++    for (const ggml_tensor * t : { concat, past, cur, w, res, last, cell, conv, add, scale }) {
++        if (t->type != GGML_TYPE_F32) {
++            return false;
++        }
++    }
++    // the inputs: the past [nc - 1, nr, n_s] and cur [n_t, nr, n_s], each with contiguous rows of past or one element
++    if (past->ne[0] != nc - 1 || past->ne[1] != nr || past->ne[2] != n_s || past->nb[0] != sizeof(float) ||
++        cur->ne[0] != n_t || cur->ne[1] != nr || cur->ne[2] != n_s || concat->ne[0] != nc - 1 + n_t || !ggml_is_contiguous(concat)) {
++        return false;
++    }
++    // the stored past is the last nc - 1 columns of the conv input, copied into nr*(nc - 1) contiguous floats per sequence
++    if (last->view_src != concat || last->view_offs != (size_t) n_t*sizeof(float) || last->ne[0] != nc - 1 ||
++        last->ne[1] != nr || last->ne[2] != n_s || last->nb[1] != concat->nb[1] || last->nb[2] != concat->nb[2] ||
++        cell->ne[0] != (nc - 1)*nr || cell->ne[1] != n_s || cell->nb[0] != sizeof(float) || ggml_nelements(cell) != ggml_nelements(last)) {
++        return false;
++    }
++    if (!ggml_are_same_shape(res, conv) || !ggml_is_contiguous(res) || !ggml_is_contiguous(scale) || w->nb[0] != sizeof(float)) {
++        return false;
++    }
++    float bias;
++    memcpy(&bias, (const float *) scale->op_params + 1, sizeof(float));
++    if (bias != 0.0f) {
++        return false;
++    }
++
++    // memory: the output may be the residual itself (element for element); the state may be the past itself (one
++    // thread reads its channel before it writes it), otherwise no overlaps between written and read memory
++    auto overlap = [](const ggml_tensor * a, const ggml_tensor * b) {
++        const char * a0 = (const char *) a->data, * a1 = a0 + ggml_nbytes(a);
++        const char * b0 = (const char *) b->data, * b1 = b0 + ggml_nbytes(b);
++        return a0 < b1 && b0 < a1;
++    };
++    if ((overlap(scale, res) && scale->data != res->data) || overlap(scale, past) || overlap(scale, w) || overlap(scale, cell)) {
++        return false;
++    }
++    if (overlap(scale, cur) && !(scale->data == cur->data && cur->nb[1] == sizeof(float) && cur->nb[0] == scale->nb[1] &&
++                                 cur->nb[2] == scale->nb[2])) {
++        return false;
++    }
++    if ((overlap(cell, past) && !(cell->data == past->data && n_s == 1 && past->nb[1] == (nc - 1)*sizeof(float))) ||
++        overlap(cell, cur) || overlap(cell, res) || overlap(cell, w)) {
++        return false;
++    }
++    return true;
++}
++
++void ggml_cuda_op_ssm_conv_hist(ggml_backend_cuda_context & ctx, ggml_tensor * const * n) {
++    const ggml_tensor * concat = n[0];
++    const ggml_tensor * cpy    = n[3];
++    const ggml_tensor * conv   = n[4];
++    const ggml_tensor * add    = n[5];
++    ggml_tensor       * scale  = n[6];
++    const ggml_tensor * past   = concat->src[0];
++    const ggml_tensor * cur    = concat->src[1];
++    const ggml_tensor * w      = conv->src[1];
++    const ggml_tensor * res    = add->src[0] == conv ? add->src[1] : add->src[0];
++    const ggml_tensor * cell   = cpy->src[1];
++
++    float res_scale;
++    memcpy(&res_scale, scale->op_params, sizeof(float));
++
++    const int64_t nr  = conv->ne[0];
++    const int64_t n_t = conv->ne[1];
++    const int64_t n_s = conv->ne[2];
++
++    const int threads = 128;
++    const dim3 blocks(n_s, (nr + threads - 1)/threads, 1);
++    const size_t f = sizeof(float);
++    ssm_conv_hist_f32<4><<<blocks, threads, 0, ctx.stream()>>>(
++        (const float *) past->data, past->nb[1]/f, past->nb[2]/f,
++        (const float *) cur->data, cur->nb[0]/f, cur->nb[1]/f, cur->nb[2]/f,
++        (const float *) w->data, w->nb[1]/f,
++        (const float *) res->data, res->nb[1]/f, res->nb[2]/f, res_scale,
++        (float *) scale->data, scale->nb[1]/f, scale->nb[2]/f,
++        (float *) cell->data, cell->nb[1]/f,
++        nr, n_t);
++}
+diff --git a/ggml/src/ggml-cuda/ssm-conv.cuh b/ggml/src/ggml-cuda/ssm-conv.cuh
+index 4d9dbda08..d2abaaab5 100644
+--- a/ggml/src/ggml-cuda/ssm-conv.cuh
++++ b/ggml/src/ggml-cuda/ssm-conv.cuh
+@@ -2,3 +2,7 @@
+ 
+ void ggml_cuda_op_ssm_conv(ggml_backend_cuda_context & ctx, ggml_tensor * dst, ggml_tensor * bias_add_node = nullptr, ggml_tensor * silu_dst = nullptr,
+         ggml_tensor * res_add_node = nullptr, ggml_tensor * scale_node = nullptr);
++
++// CONCAT -> VIEW -> VIEW -> CPY -> SSM_CONV -> ADD -> SCALE: a short convolution with its past in the recurrent state
++bool ggml_cuda_ssm_conv_hist_supported(ggml_tensor * const * nodes);
++void ggml_cuda_op_ssm_conv_hist(ggml_backend_cuda_context & ctx, ggml_tensor * const * nodes);
+diff --git a/src/models/inkling2.cpp b/src/models/inkling2.cpp
+index 3d7d684f2..230d5ca01 100644
+--- a/src/models/inkling2.cpp
++++ b/src/models/inkling2.cpp
+@@ -279,6 +279,8 @@ ggml_tensor * llama_model_inkling2::graph::convolve(
+ 
+     if (!dynamic) {
+         out = ggml_scale(ctx0, ggml_add(ctx0, cur_3d, out), 1.0f/sqrtf(n_conv + 1));
++        // right after the state store, so that a backend can fuse the input concat, the store and the conv
++        ggml_build_forward_expand(gf, out);
+         return ggml_reshape_2d(ctx0, out, n_channels, n_tokens);
+     }
+ 
+-- 
+2.43.0
+
+
+From c389899fe4d8e1e7c387c160aae637e9287fd5bc Mon Sep 17 00:00:00 2001
+From: paleluna82-del <260293746+paleluna82-del@users.noreply.github.com>
+Date: Mon, 23 Nov 2026 02:10:21 +0900
+Subject: [PATCH 7/8] CUDA/HIP : reuse the q8_1 src1 of mul_mat_vec_q across
+ products of the same input
+
+Several projections of one input (Q, rel, sink, gate, ...) each quantized
+the same src1 to q8_1 again: 385 quantize kernels per token on
+Inkling-2-Mini decode for ~290 products. Keep the q8_1 copy of the last
+mul_mat_vec_q src1 in a per-context buffer and reuse it when the next
+mul_mat_vec_q has the same src1 tensor, data, shape and strides. The graph
+loop invalidates it when any node writes the src1 memory, at every graph
+evaluation and off the main stream. The buffer (4 MiB) is allocated
+outside stream capture and kept until the context is freed, so captured
+graphs stay valid. Disable with GGML_CUDA_DISABLE_Q8_1_REUSE.
+
+R9700, Inkling-2-Mini Q4_K_M, with #400-#402 applied: tg128 47.6 -> 48.4
+t/s, bitwise identical (KLD 0 with ubatch 16, 4 sequences). New
+test-backend-ops case MUL_MAT_SHARED_SRC1.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ ggml/src/ggml-cuda/common.cuh    | 17 ++++++++++++
+ ggml/src/ggml-cuda/ggml-cuda.cu  | 38 ++++++++++++++++++++++++++
+ ggml/src/ggml-cuda/mmvq.cu       | 47 +++++++++++++++++++++++++++++---
+ ggml/src/ggml-cuda/vendors/hip.h |  3 ++
+ tests/test-backend-ops.cpp       | 46 +++++++++++++++++++++++++++++++
+ 5 files changed, 147 insertions(+), 4 deletions(-)
+
+diff --git a/ggml/src/ggml-cuda/common.cuh b/ggml/src/ggml-cuda/common.cuh
+index 8cd2366ed..55da115c2 100644
+--- a/ggml/src/ggml-cuda/common.cuh
++++ b/ggml/src/ggml-cuda/common.cuh
+@@ -1410,6 +1410,23 @@ struct ggml_backend_cuda_context {
+ 
+     int curr_stream_no = 0;
+ 
++    // q8_1 copy of the last mul_mat_vec_q src1, reused by the next mul_mat_vec_q of the same src1 in one graph
++    // evaluation (inputs shared by several projections). The graph loop enables it on the main stream only and
++    // invalidates it when a node writes the src1 memory. The buffer is never freed before the context, so that
++    // captured CUDA graphs stay valid.
++    struct q8_1_cache_t {
++        bool                enabled = false;
++        bool                valid   = false;
++        char              * buf     = nullptr;
++        size_t              cap     = 0;
++        const ggml_tensor * src     = nullptr;
++        const void        * data    = nullptr;
++        int64_t             ne[4]   = {};
++        size_t              nb[4]   = {};
++        int64_t             ne10_padded = 0;
++        size_t              size    = 0;
++    } q8_1_cache;
++
+ #ifdef USE_CUDA_GRAPH
+     // Map from first_node_ptr to cuda_graph - allows multiple graphs per context
+     // when the computation is split across CPU/GPU (e.g., with --n-cpu-moe)
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index 3cd45bac4..cf00d5357 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -995,6 +995,10 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
+     if (copy_event != nullptr) {
+         CUDA_CHECK(cudaEventDestroy(copy_event));
+     }
++    if (q8_1_cache.buf != nullptr) {
++        ggml_cuda_set_device(device);
++        CUDA_CHECK(cudaFree(q8_1_cache.buf));
++    }
+     for (int i = 0; i < GGML_CUDA_MAX_DEVICES; ++i) {
+         for (int j = 0; j < GGML_CUDA_MAX_STREAMS; ++j) {
+             if (streams[i][j] != nullptr) {
+@@ -5516,7 +5520,32 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+     return 0;
+ }
+ 
++// drop the cached q8_1 src1 if one of the nodes i..i+n_skip wrote its memory
++static void ggml_cuda_q8_1_cache_invalidate_written(ggml_backend_cuda_context * cuda_ctx, const ggml_cgraph * cgraph, int i, int n_skip) {
++    auto & qc = cuda_ctx->q8_1_cache;
++    if (!qc.valid) {
++        return;
++    }
++    const char * c0 = (const char *) qc.data;
++    const char * c1 = c0 + qc.size;
++    for (int k = i; k <= i + n_skip && k < cgraph->n_nodes; ++k) {
++        const ggml_tensor * t = cgraph->nodes[k];
++        if (ggml_cuda_is_view_or_noop(t) || t->data == nullptr) {
++            continue;
++        }
++        const char * t0 = (const char *) t->data;
++        const char * t1 = t0 + ggml_nbytes(t);
++        if (t0 < c1 && c0 < t1) {
++            qc.valid = false;
++            return;
++        }
++    }
++}
++
+ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, const bool use_cuda_graph, const bool cuda_graph_update_required, const void * graph_key) {
++    static const bool q8_1_cache_disabled = ggml_cuda_env_flag("GGML_CUDA_DISABLE_Q8_1_REUSE");
++    cuda_ctx->q8_1_cache.valid   = false;
++    cuda_ctx->q8_1_cache.enabled = false;
+     bool graph_evaluated_or_captured = false;
+ 
+     // flag used to determine whether it is an integrated_gpu
+@@ -5672,7 +5701,13 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+                     continue;
+                 }
+ 
++                cuda_ctx->q8_1_cache.enabled = !is_concurrent_event_active && cuda_ctx->curr_stream_no == 0 && !q8_1_cache_disabled;
++                if (!cuda_ctx->q8_1_cache.enabled) {
++                    cuda_ctx->q8_1_cache.valid = false;
++                }
++
+                 int nodes_to_skip = ggml_cuda_try_fuse(cuda_ctx, cgraph, i);
++                ggml_cuda_q8_1_cache_invalidate_written(cuda_ctx, cgraph, i, nodes_to_skip);
+ 
+                 if (nodes_to_skip != 0) {
+ #ifdef GGML_CUDA_DEBUG
+@@ -5702,6 +5737,9 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+ #endif  // NDEBUG
+ 
+                 bool ok = ggml_cuda_compute_forward(*cuda_ctx, node);
++                if (node->op != GGML_OP_MUL_MAT && node->op != GGML_OP_MUL_MAT_ID) {
++                    ggml_cuda_q8_1_cache_invalidate_written(cuda_ctx, cgraph, i, 0);
++                }
+                 if (!ok) {
+                     GGML_LOG_ERROR("%s: op not supported %s (%s)\n", __func__, node->name, ggml_op_name(node->op));
+                 }
+diff --git a/ggml/src/ggml-cuda/mmvq.cu b/ggml/src/ggml-cuda/mmvq.cu
+index 390fe2ba7..b872911be 100644
+--- a/ggml/src/ggml-cuda/mmvq.cu
++++ b/ggml/src/ggml-cuda/mmvq.cu
+@@ -1621,12 +1621,51 @@ void ggml_cuda_mul_mat_vec_q(
+     }
+ 
+     const int64_t ne10_padded = GGML_PAD(ne10, MATRIX_ROW_PADDING);
+-    ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool(), ne13*ne12 * ne11*ne10_padded * sizeof(block_q8_1)/QK8_1);
+-    {
++    const size_t  q8_1_size   = ne13*ne12 * ne11*ne10_padded * sizeof(block_q8_1)/QK8_1;
++
++    // reuse the q8_1 src1 of the previous mul_mat_vec_q when it is the same tensor and nothing wrote it since
++    auto & qc = ctx.q8_1_cache;
++    const bool qc_hit = qc.enabled && qc.valid && qc.src == src1 && qc.data == src1->data && qc.ne10_padded == ne10_padded &&
++        memcmp(qc.ne, src1->ne, sizeof(qc.ne)) == 0 && memcmp(qc.nb, src1->nb, sizeof(qc.nb)) == 0;
++    bool qc_store = false;
++    if (!qc_hit && qc.enabled) {
++        if (q8_1_size > qc.cap) {
++            // grow outside of a stream capture only: a captured graph may still read the old buffer
++            cudaStreamCaptureStatus capture_status = cudaStreamCaptureStatusNone;
++            CUDA_CHECK(cudaStreamIsCapturing(stream, &capture_status));
++            const size_t cap_max = 4u << 20;
++            if (capture_status == cudaStreamCaptureStatusNone && q8_1_size <= cap_max && qc.buf == nullptr) {
++                CUDA_CHECK(cudaMalloc((void **) &qc.buf, cap_max));
++                qc.cap = cap_max;
++            }
++        }
++        qc_store = q8_1_size <= qc.cap;
++    }
++
++    ggml_cuda_pool_alloc<char> src1_q8_1_pool;
++    char * src1_q8_1 = nullptr;
++    if (qc_hit) {
++        src1_q8_1 = qc.buf;
++    } else {
++        if (qc_store) {
++            src1_q8_1 = qc.buf;
++        } else {
++            src1_q8_1 = src1_q8_1_pool.alloc(ctx.pool(), q8_1_size);
++            qc.valid = false;
++        }
+         const int64_t s11 = src1->nb[1] / ts_src1;
+         const int64_t s12 = src1->nb[2] / ts_src1;
+         const int64_t s13 = src1->nb[3] / ts_src1;
+-        quantize_row_q8_1_cuda(src1_d, src1_q8_1.get(), ne10, s11, s12, s13, ne10_padded, ne11, ne12, ne13, stream);
++        quantize_row_q8_1_cuda(src1_d, src1_q8_1, ne10, s11, s12, s13, ne10_padded, ne11, ne12, ne13, stream);
++        if (qc_store) {
++            qc.valid = true;
++            qc.src   = src1;
++            qc.data  = src1->data;
++            memcpy(qc.ne, src1->ne, sizeof(qc.ne));
++            memcpy(qc.nb, src1->nb, sizeof(qc.nb));
++            qc.ne10_padded = ne10_padded;
++            qc.size  = ggml_nbytes(src1);
++        }
+     }
+ 
+     const int64_t s01 = src0->nb[1] / ts_src0;
+@@ -1652,7 +1691,7 @@ void ggml_cuda_mul_mat_vec_q(
+     const int64_t ids_stride = ids ? ids->nb[1] / ggml_type_size(ids->type) : 0;
+ 
+     mul_mat_vec_q_switch_type(
+-        src0->data, src0->type, src1_q8_1.get(), ids_d, fusion_local, dst_d, ne00,
++        src0->data, src0->type, src1_q8_1, ids_d, fusion_local, dst_d, ne00,
+         ne01,              ncols_dst,     s01, stride_col_y,     stride_col_dst,
+         ne02, nchannels_y, nchannels_dst, s02, stride_channel_y, stride_channel_dst,
+         ne03,              ne3,           s03, s13,              s3,               ids_stride, stream);
+diff --git a/ggml/src/ggml-cuda/vendors/hip.h b/ggml/src/ggml-cuda/vendors/hip.h
+index a43814799..ff94c43a5 100644
+--- a/ggml/src/ggml-cuda/vendors/hip.h
++++ b/ggml/src/ggml-cuda/vendors/hip.h
+@@ -146,6 +146,9 @@ typedef uint64_t ggml_cuda_thread_mask_t;
+ #define cudaGraphExecUpdate hipGraphExecUpdate
+ #define cudaStreamCaptureModeRelaxed hipStreamCaptureModeRelaxed
+ #define cudaStreamBeginCapture hipStreamBeginCapture
++#define cudaStreamIsCapturing hipStreamIsCapturing
++#define cudaStreamCaptureStatus hipStreamCaptureStatus
++#define cudaStreamCaptureStatusNone hipStreamCaptureStatusNone
+ #define cudaGraph_t hipGraph_t
+ #define cudaStream_t hipStream_t
+ #define cudaSuccess hipSuccess
+diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
+index da176aea0..f28d2d118 100644
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -5011,6 +5011,47 @@ struct test_ssm_conv_res_scale : public test_case {
+     }
+ };
+ 
++// mul_mat(a, x) + mul_mat(b, scale(mul_mat(c, x))): two products of the same src1, then one of a new one
++struct test_mul_mat_shared_src1 : public test_case {
++    const ggml_type type_a;
++    const int64_t m, n, k;
++
++    std::string op_desc(ggml_tensor * t) override {
++        GGML_UNUSED(t);
++        return "MUL_MAT_SHARED_SRC1";
++    }
++
++    bool run_whole_graph() override { return true; }
++
++    std::string vars() override {
++        return VARS_TO_STR4(type_a, m, n, k);
++    }
++
++    double max_nmse_err() override {
++        return 5e-4;
++    }
++
++    test_mul_mat_shared_src1(ggml_type type_a, int64_t m, int64_t n, int64_t k) : type_a(type_a), m(m), n(n), k(k) {}
++
++    ggml_tensor * build_graph(ggml_context * ctx) override {
++        ggml_tensor * a = ggml_new_tensor_2d(ctx, type_a, k, m);
++        ggml_tensor * b = ggml_new_tensor_2d(ctx, type_a, k, m);
++        ggml_tensor * c = ggml_new_tensor_2d(ctx, type_a, k, k);
++        ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, n);
++        ggml_set_name(a, "a");
++        ggml_set_name(b, "b");
++        ggml_set_name(c, "c");
++        ggml_set_name(x, "x");
++
++        ggml_tensor * y0 = ggml_mul_mat(ctx, a, x);
++        ggml_tensor * x1 = ggml_scale(ctx, ggml_mul_mat(ctx, c, x), 0.5f);
++        ggml_tensor * y1 = ggml_mul_mat(ctx, b, x1);
++        ggml_tensor * out = ggml_add(ctx, y0, y1);
++        ggml_set_name(out, "out");
++        return out;
++    }
++};
++
+ // (x - tanh(f)*x) + tanh(g)*m (fused operation)
+ struct test_tanh_gate_mix : public test_case {
+     const std::array<int64_t, 2> ne;
+@@ -12164,6 +12205,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+         test_cases.emplace_back(new test_tanh_gate_mix({2304, n_t}));
+     }
+     test_cases.emplace_back(new test_tanh_gate_mix({100, 3}));
++    for (ggml_type t : {GGML_TYPE_Q8_0, GGML_TYPE_Q4_K, GGML_TYPE_Q4_0}) {
++        for (int64_t n : {1, 3, 8}) {
++            test_cases.emplace_back(new test_mul_mat_shared_src1(t, 256, n, 512));
++        }
++    }
+ 
+     test_cases.emplace_back(new test_ssm_scan(GGML_TYPE_F32, 16, 1, 1024, 1, 32, 4)); // Mamba-1
+     test_cases.emplace_back(new test_ssm_scan(GGML_TYPE_F32, 64, 64, 112, 2, 32, 4)); // Zamba2 (real hparams: d_inner=7168, dt_rank=112, n_group=2 -> head_dim=7168/112=64)
+-- 
+2.43.0
+
+
+From b29d515403660f9f6aade5ab424258936473ad02 Mon Sep 17 00:00:00 2001
+From: paleluna82-del <260293746+paleluna82-del@users.noreply.github.com>
+Date: Mon, 23 Nov 2026 02:20:18 +0900
+Subject: [PATCH 8/8] inkling2 : fuse the one-query depth mix on CUDA/HIP
+
+The depth mix (attention over the RMS-normalized earlier block outputs
+with a learned query) was RMS_NORM -> RESHAPE -> CONCAT -> CONCAT ->
+MUL_MAT -> SOFT_MAX -> MUL -> SUM_ROWS, 88 times per token. Fuse it into
+one kernel per token that reads the stacked states and the current state
+once (squares, scores), does the softmax in registers and writes the
+weighted sum. The kernel reads the stack in its [E, n, T] layout only, so
+the fusion checks that the transposed stack is built from the same
+normalized states by the same concats. inkling2 expands the per-token
+query repeat first so that the nodes stay adjacent for ubatches > 1.
+Disable with GGML_CUDA_DISABLE_DEPTH_MIX_FUSION.
+
+R9700, Inkling-2-Mini Q4_K_M, with #400-#402 applied: tg128 48.3 -> 50.8
+t/s, pp512 1550 -> 1640. KLD vs unfused 0.0024 at ubatch 16 (rounding
+from the reordered reductions; PPL c512 7.6899 -> 7.6851). New
+test-backend-ops case DEPTH_MIX.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ ggml/src/ggml-cuda/ggml-cuda.cu | 217 ++++++++++++++++++++++++++++++++
+ src/models/inkling2.cpp         |   3 +
+ tests/test-backend-ops.cpp      |  56 +++++++++
+ 3 files changed, 276 insertions(+)
+
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index cf00d5357..8e27052f5 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -4202,6 +4202,215 @@ static bool ggml_cuda_match_moe_weighted_reduction(
+ }
+ 
+ 
++// one-query attention over stacked RMS-normalized states (depth mix): for each token t,
++//   x = rms_norm(cur_t), p = softmax(scale*[S_t,0..n_prev-1 . q_t, x . q_t]), out_t = sum_b p_b*S_t,b + p_n*x
++#define DEPTH_MIX_NMAX 15
++template <int NP>
++static __global__ void k_depth_mix1(
++        const float * __restrict__ cur, const int64_t cur_s2,
++        const float * __restrict__ S, const int64_t S_s1, const int64_t S_s2,
++        const float * __restrict__ q, const int64_t q_s2,
++        float * __restrict__ out, const int64_t out_s2,
++        const int E, const float eps, const float scale) {
++    extern __shared__ float smem[];
++    float * xs  = smem;                 // E
++    float * red = smem + E;             // nwarps*(NP + 1)
++
++    const int t      = blockIdx.x;
++    const int tid    = threadIdx.x;
++    const int lane   = tid % WARP_SIZE;
++    const int warp   = tid / WARP_SIZE;
++    const int nwarps = blockDim.x / WARP_SIZE;
++
++    const float * c  = cur + t*cur_s2;
++    const float * St = S   + t*S_s2;
++    const float * qt = q   + t*q_s2;
++
++    // one pass: the squares of cur and the products of the stacked states and q
++    float acc[NP + 2];
++#pragma unroll
++    for (int b = 0; b < NP + 2; ++b) {
++        acc[b] = 0.0f;
++    }
++    for (int e = tid; e < E; e += blockDim.x) {
++        const float v  = c[e];
++        const float qe = qt[e];
++        xs[e] = v;
++        acc[NP + 1] += v*v;
++        acc[NP]     += v*qe;
++#pragma unroll
++        for (int b = 0; b < NP; ++b) {
++            acc[b] += St[b*S_s1 + e]*qe;
++        }
++    }
++#pragma unroll
++    for (int b = 0; b < NP + 2; ++b) {
++        const float v = warp_reduce_sum(acc[b]);
++        if (lane == 0) {
++            red[warp*(NP + 2) + b] = v;
++        }
++    }
++    __syncthreads();
++
++    float r[NP + 2];
++#pragma unroll
++    for (int b = 0; b < NP + 2; ++b) {
++        r[b] = 0.0f;
++        for (int w = 0; w < nwarps; ++w) {
++            r[b] += red[w*(NP + 2) + b];
++        }
++    }
++    // rms_norm(cur) . q = rs*(cur . q)
++    const float rs = rsqrtf(r[NP + 1]/E + eps);
++    r[NP] *= rs;
++
++    float mx = -INFINITY;
++#pragma unroll
++    for (int b = 0; b <= NP; ++b) {
++        r[b] *= scale;
++        mx = fmaxf(mx, r[b]);
++    }
++    float sum = 0.0f;
++#pragma unroll
++    for (int b = 0; b <= NP; ++b) {
++        r[b] = expf(r[b] - mx);
++        sum += r[b];
++    }
++    const float inv = 1.0f/sum;
++#pragma unroll
++    for (int b = 0; b <= NP; ++b) {
++        r[b] *= inv;
++    }
++    const float px = r[NP]*rs;
++
++    float * ot = out + t*out_s2;
++    for (int e = tid; e < E; e += blockDim.x) {
++        float v = 0.0f;
++#pragma unroll
++        for (int b = 0; b < NP; ++b) {
++            v += St[b*S_s1 + e]*r[b];
++        }
++        ot[e] = v + xs[e]*px;
++    }
++}
++
++// true if st is the transposed stack of s built by the same concats: st = concat(.., reshape(x), 0) for
++// s = concat(.., x, 1), down to single [1, E, T] reshapes of [E, 1, T] states
++static bool ggml_cuda_depth_mix_same_stack(const ggml_tensor * st, const ggml_tensor * s, int depth) {
++    if (depth > DEPTH_MIX_NMAX) {
++        return false;
++    }
++    if (st->op == GGML_OP_RESHAPE || st->op == GGML_OP_VIEW) {
++        return st->view_src == s && st->view_offs == 0 && st->ne[0] == 1 && s->ne[1] == 1 && st->ne[1] == s->ne[0] &&
++               st->ne[2] == s->ne[2] && ggml_is_contiguous(s);
++    }
++    if (st->op == GGML_OP_CONCAT && s->op == GGML_OP_CONCAT &&
++        ggml_get_op_params_i32(st, 0) == 0 && ggml_get_op_params_i32(s, 0) == 1) {
++        return ggml_cuda_depth_mix_same_stack(st->src[0], s->src[0], depth + 1) &&
++               ggml_cuda_depth_mix_same_stack(st->src[1], s->src[1], depth + 1);
++    }
++    return false;
++}
++
++// RMS_NORM(cur) -> RESHAPE -> CONCAT(S_t, normed_t, 0) -> CONCAT(S, normed, 1) -> MUL_MAT(states, q) -> SOFT_MAX
++// -> MUL(states_t, p) -> SUM_ROWS: the one-query depth mix
++static int ggml_cuda_try_fuse_depth_mix(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
++    static const ggml_op ops[8] = { GGML_OP_RMS_NORM, GGML_OP_RESHAPE, GGML_OP_CONCAT, GGML_OP_CONCAT, GGML_OP_MUL_MAT,
++                                    GGML_OP_SOFT_MAX, GGML_OP_MUL, GGML_OP_SUM_ROWS };
++    const int n = 8;
++    if (i + n > cgraph->n_nodes) {
++        return 0;
++    }
++    ggml_tensor ** nd = cgraph->nodes + i;
++    for (int k = 0; k < n; ++k) {
++        if (nd[k]->op != ops[k] || nd[k]->type != GGML_TYPE_F32) {
++            return 0;
++        }
++    }
++    ggml_tensor * norm = nd[0], * norm_t = nd[1], * cat_t = nd[2], * cat = nd[3], * scores = nd[4], * sm = nd[5],
++                * prod = nd[6], * outp = nd[7];
++    const ggml_tensor * cur = norm->src[0];
++    const ggml_tensor * S_t = cat_t->src[0];
++    const ggml_tensor * S   = cat->src[0];
++    const ggml_tensor * q   = scores->src[1];
++    if (norm_t->view_src != norm || cat_t->src[1] != norm_t || cat->src[1] != norm || scores->src[0] != cat ||
++        sm->src[0] != scores || sm->src[1] != nullptr || prod->src[0] != cat_t || prod->src[1] != sm || outp->src[0] != prod) {
++        return 0;
++    }
++    if (ggml_get_op_params_i32(cat_t, 0) != 0 || ggml_get_op_params_i32(cat, 0) != 1) {
++        return 0;
++    }
++    // the kernel reads the stacked states once, in the [E, n_prev, T] layout of S, so S_t must hold the same values
++    if (!ggml_cuda_depth_mix_same_stack(S_t, S, 0)) {
++        return 0;
++    }
++    const int64_t E = norm->ne[0], T = norm->ne[2], n_prev = S->ne[1];
++    if (norm->ne[1] != 1 || norm->ne[3] != 1 || cur->nb[0] != sizeof(float) || cur->ne[1] != 1 ||
++        n_prev < 1 || n_prev > DEPTH_MIX_NMAX || E > 8192 ||
++        S->type != GGML_TYPE_F32 || S->ne[0] != E || S->ne[2] != T || S->ne[3] != 1 || S->nb[0] != sizeof(float) ||
++        S_t->ne[0] != n_prev || S_t->ne[1] != E || S_t->ne[2] != T ||
++        q->type != GGML_TYPE_F32 || q->ne[0] != E || q->ne[1] != 1 || (q->ne[2] != 1 && q->ne[2] != T) || q->ne[3] != 1 ||
++        q->nb[0] != sizeof(float) || scores->ne[0] != n_prev + 1 || scores->ne[1] != 1 || scores->ne[2] != T ||
++        outp->ne[0] != 1 || outp->ne[1] != E || outp->ne[2] != T || !ggml_is_contiguous(outp)) {
++        return 0;
++    }
++    float sm_scale, sm_max_bias;
++    memcpy(&sm_scale,    (const float *) sm->op_params + 0, sizeof(float));
++    memcpy(&sm_max_bias, (const float *) sm->op_params + 1, sizeof(float));
++    if (sm_max_bias != 0.0f || sm->src[2] != nullptr) {
++        return 0;
++    }
++    // intermediates used inside the chain only
++    const int uses[7] = { 2, 1, 1, 1, 1, 1, 1 };
++    for (int k = 0; k < 7; ++k) {
++        if (ggml_node_get_use_count(cgraph, i + k) != uses[k] || (nd[k]->flags & GGML_TENSOR_FLAG_OUTPUT)) {
++            return 0;
++        }
++    }
++    auto overlap = [](const ggml_tensor * a, const ggml_tensor * b) {
++        const char * a0 = (const char *) a->data, * a1 = a0 + ggml_nbytes(a);
++        const char * b0 = (const char *) b->data, * b1 = b0 + ggml_nbytes(b);
++        return a0 < b1 && b0 < a1;
++    };
++    if (overlap(outp, cur) || overlap(outp, S) || overlap(outp, q)) {
++        return 0;
++    }
++    float eps;
++    memcpy(&eps, norm->op_params, sizeof(float));
++
++    const int threads = 512;
++    const size_t smem = (E + (threads/WARP_SIZE)*(DEPTH_MIX_NMAX + 2))*sizeof(float);
++    const size_t f = sizeof(float);
++    const float * cur_d = (const float *) cur->data;
++    const float * S_d   = (const float *) S->data;
++    const float * q_d   = (const float *) q->data;
++    float       * out_d = (float *) outp->data;
++    const int64_t q_s2  = q->ne[2] == 1 ? 0 : q->nb[2]/f;
++    auto launch = [&](auto NP) {
++        k_depth_mix1<decltype(NP)::value><<<T, threads, smem, cuda_ctx->stream()>>>(
++            cur_d, cur->nb[2]/f, S_d, S->nb[1]/f, S->nb[2]/f, q_d, q_s2, out_d, outp->nb[2]/f, (int) E, eps, sm_scale);
++    };
++    switch (n_prev) {
++        case  1: launch(std::integral_constant<int,  1>{}); break;
++        case  2: launch(std::integral_constant<int,  2>{}); break;
++        case  3: launch(std::integral_constant<int,  3>{}); break;
++        case  4: launch(std::integral_constant<int,  4>{}); break;
++        case  5: launch(std::integral_constant<int,  5>{}); break;
++        case  6: launch(std::integral_constant<int,  6>{}); break;
++        case  7: launch(std::integral_constant<int,  7>{}); break;
++        case  8: launch(std::integral_constant<int,  8>{}); break;
++        case  9: launch(std::integral_constant<int,  9>{}); break;
++        case 10: launch(std::integral_constant<int, 10>{}); break;
++        case 11: launch(std::integral_constant<int, 11>{}); break;
++        case 12: launch(std::integral_constant<int, 12>{}); break;
++        case 13: launch(std::integral_constant<int, 13>{}); break;
++        case 14: launch(std::integral_constant<int, 14>{}); break;
++        case 15: launch(std::integral_constant<int, 15>{}); break;
++        default: GGML_ABORT("unsupported depth mix size");
++    }
++    return n - 1;
++}
++
+ // CONCAT(past, cur) -> VIEW(last) -> VIEW(state cell) -> CPY(last, cell) -> SSM_CONV -> ADD(res) -> SCALE
+ static int ggml_cuda_try_fuse_ssm_conv_hist(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
+     static const ggml_op ops[7] = { GGML_OP_CONCAT, GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_CPY, GGML_OP_SSM_CONV, GGML_OP_ADD, GGML_OP_SCALE };
+@@ -4664,6 +4873,14 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+ 
+     ggml_tensor * node = cgraph->nodes[i];
+ 
++    if (node->op == GGML_OP_RMS_NORM) {
++        static const bool depth_mix_disabled = ggml_cuda_env_flag("GGML_CUDA_DISABLE_DEPTH_MIX_FUSION");
++        const int n_fused = depth_mix_disabled ? 0 : ggml_cuda_try_fuse_depth_mix(cuda_ctx, cgraph, i);
++        if (n_fused > 0) {
++            return n_fused;
++        }
++    }
++
+     if (node->op == GGML_OP_MUL_MAT_ID && cuda_ctx->stream_context().concurrent_events.empty() &&
+             ggml_cuda_match_shared_expert(cgraph, i, i + 3) &&
+             ggml_cuda_should_fuse_mul_mat_vec_q(cgraph->nodes[i + 2]->src[1])) {
+diff --git a/src/models/inkling2.cpp b/src/models/inkling2.cpp
+index 230d5ca01..fde092f90 100644
+--- a/src/models/inkling2.cpp
++++ b/src/models/inkling2.cpp
+@@ -235,6 +235,9 @@ ggml_tensor * llama_model_inkling2::graph::mix(const std::vector<ggml_tensor *>
+     // one token: the query broadcasts as is
+     ggml_tensor * queries = n_tokens == 1 ? query :
+         ggml_repeat(ctx0, query, ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, n_embd, query->ne[1], n_tokens));
++    // the repeat first, so that the normalization, the stacking, the scores and the sum stay adjacent for a backend
++    // to fuse
++    ggml_build_forward_expand(gf, queries);
+ 
+     ggml_tensor * scores = ggml_mul_mat(ctx0, states, queries);
+     scores = ggml_soft_max_ext(ctx0, scores, nullptr, 1.0f/sqrtf(n_embd), 0.0f);
+diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
+index f28d2d118..1e5091109 100644
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -5052,6 +5052,56 @@ struct test_mul_mat_shared_src1 : public test_case {
+     }
+ };
+ 
++// one-query attention over a stack of RMS-normalized states (inkling2 depth mix), built like the model:
++// the stack row-major and transposed by the same concats, the current state last
++struct test_depth_mix : public test_case {
++    const int64_t E, n_prev, T;
++    const bool q_per_token;
++
++    std::string op_desc(ggml_tensor * t) override {
++        GGML_UNUSED(t);
++        return "DEPTH_MIX";
++    }
++
++    bool run_whole_graph() override { return true; }
++
++    std::string vars() override {
++        return VARS_TO_STR4(E, n_prev, T, q_per_token);
++    }
++
++    test_depth_mix(int64_t E, int64_t n_prev, int64_t T, bool q_per_token) : E(E), n_prev(n_prev), T(T), q_per_token(q_per_token) {}
++
++    ggml_tensor * build_graph(ggml_context * ctx) override {
++        ggml_tensor * S   = nullptr;
++        ggml_tensor * S_t = nullptr;
++        for (int64_t b = 0; b < n_prev; ++b) {
++            ggml_tensor * blk = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, E, 1, T);
++            ggml_set_name(blk, "block");
++            ggml_tensor * nb   = ggml_rms_norm(ctx, blk, 1e-6f);
++            ggml_tensor * nb_t = ggml_reshape_3d(ctx, nb, 1, E, T);
++            S   = S   ? ggml_concat(ctx, nb,   S,   1) : nb;
++            S_t = S_t ? ggml_concat(ctx, nb_t, S_t, 0) : nb_t;
++        }
++        ggml_tensor * cur = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, E, 1, T);
++        ggml_tensor * q   = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, E, 1, q_per_token ? T : 1);
++        ggml_set_name(cur, "cur");
++        ggml_set_name(q, "q");
++        // in the model the stack is built before the mix (earlier mixes share it); make cur depend on it so that
++        // the stack is evaluated first here too
++        cur = ggml_add(ctx, cur, ggml_scale(ctx, ggml_view_3d(ctx, S, E, 1, T, S->nb[1], S->nb[2], 0), 0.25f));
++
++        ggml_tensor * normed   = ggml_rms_norm(ctx, cur, 1e-6f);
++        ggml_tensor * normed_t = ggml_reshape_3d(ctx, normed, 1, E, T);
++        ggml_tensor * states_t = ggml_concat(ctx, S_t, normed_t, 0);
++        ggml_tensor * states   = ggml_concat(ctx, S, normed, 1);
++
++        ggml_tensor * scores = ggml_soft_max_ext(ctx, ggml_mul_mat(ctx, states, q), nullptr, 1.0f/sqrtf(E), 0.0f);
++        ggml_tensor * out    = ggml_sum_rows(ctx, ggml_mul(ctx, states_t, scores));
++        ggml_set_name(out, "out");
++        return out;
++    }
++};
++
+ // (x - tanh(f)*x) + tanh(g)*m (fused operation)
+ struct test_tanh_gate_mix : public test_case {
+     const std::array<int64_t, 2> ne;
+@@ -12205,6 +12255,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+         test_cases.emplace_back(new test_tanh_gate_mix({2304, n_t}));
+     }
+     test_cases.emplace_back(new test_tanh_gate_mix({100, 3}));
++    for (int64_t n_prev : {1, 2, 4, 9}) {
++        for (int64_t T : {1, 4, 33}) {
++            test_cases.emplace_back(new test_depth_mix(2304, n_prev, T, T > 1));
++        }
++    }
++    test_cases.emplace_back(new test_depth_mix(1000, 3, 2, true));
+     for (ggml_type t : {GGML_TYPE_Q8_0, GGML_TYPE_Q4_K, GGML_TYPE_Q4_0}) {
+         for (int64_t n : {1, 3, 8}) {
+             test_cases.emplace_back(new test_mul_mat_shared_src1(t, 256, n, 512));
+-- 
+2.43.0
+
