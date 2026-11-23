@@ -19,7 +19,7 @@ permissions:
 env:
   LLAMA_REPO: "https://github.com/unslothai/llama.cpp"
   BASE_SHA: "6348de261e825d9abcd9cbc33d578c4ff076f1cd"
-  MODEL_URL: "https://huggingface.co/unsloth/Inkling-2-Mini-GGUF/resolve/main/Inkling-2-Mini-UD-IQ1_S.gguf"
+  MODEL_URL: "https://huggingface.co/unsloth/Inkling-2-Mini-GGUF/resolve/main/Mainline_Support/Inkling-2-Mini-UD-IQ1_S.gguf_file"
   ROCM_GFX: "gfx1151"
 
 jobs:
@@ -121,7 +121,7 @@ jobs:
             --patch "$GITHUB_WORKSPACE/pr406.patch" \
             --root "$AMD_CI_WORK" --out "$AMD_CI_WORK/out/states.json"
 
-      - name: Download Inkling-2-Mini UD-IQ1_S
+      - name: Download Inkling-2-Mini UD-IQ1_S (Mainline_Support layout, which the 386 base tree reads)
         timeout-minutes: 60
         run: |
           set +e
