@@ -44,9 +44,13 @@ def main():
     runs = [("CUR", "CUR", {}), ("CUR_aa", "CUR", {}), ("HEAD", "HEAD", {})]
     runs += [(f"HEAD-{s}", "HEAD", {f"GGML_CUDA_DISABLE_{s}": "1"}) for s in SW]
     runs += [("HEAD-alloff", "HEAD", {f"GGML_CUDA_DISABLE_{s}": "1" for s in SW})]
+    runs += [("HEAD-alloff-curlibs", "HEAD", {**{f"GGML_CUDA_DISABLE_{s}": "1" for s in SW}, "_CURLIBS": "1"})]
     R = {"therock": rver, "head_note": note, "runs": {}}
     for label, arm, extra in runs:
         env = T.arm_env(arms, arm, [], {}, libs)
+        if extra.pop("_CURLIBS", None):  # HEAD on CUR's bundled ROCm runtime instead of TheRock's: rules the runtime in or out
+            key = "PATH" if A.WIN else "LD_LIBRARY_PATH"
+            env[key] = os.pathsep.join([str(Path(arms["HEAD"]["bench"]).parent), str(Path(arms["CUR"]["bench"]).parent), env.get(key, "")])
         env.update(extra)
         pbin = T.find_bin(Path(arms[arm]["bench"]).parent, "llama-perplexity")
         cmd = [str(pbin), "-m", model, "-f", str(wiki), "-c", "512", "--chunks", "4", "-ngl", "99", "-fa", "on"]
