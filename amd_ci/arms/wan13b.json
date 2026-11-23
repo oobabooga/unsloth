@@ -1,0 +1,74 @@
+[
+ {
+  "tag": "W1",
+  "model": "Wan-AI/Wan2.1-T2V-1.3B-Diffusers",
+  "auto": true,
+  "renders": 2,
+  "gen": {
+   "width": 640,
+   "height": 384,
+   "num_frames": 9,
+   "steps": 4
+  }
+ },
+ {
+  "tag": "W2",
+  "model": "Wan-AI/Wan2.1-T2V-1.3B-Diffusers",
+  "auto": true,
+  "renders": 2,
+  "gen": {
+   "width": 640,
+   "height": 384,
+   "num_frames": 9,
+   "steps": 4
+  }
+ },
+ {
+  "tag": "W3",
+  "model": "Wan-AI/Wan2.1-T2V-1.3B-Diffusers",
+  "auto": true,
+  "renders": 2,
+  "gen": {
+   "width": 640,
+   "height": 384,
+   "num_frames": 9,
+   "steps": 4
+  }
+ },
+ {
+  "tag": "W4",
+  "model": "Wan-AI/Wan2.1-T2V-1.3B-Diffusers",
+  "auto": true,
+  "renders": 2,
+  "gen": {
+   "width": 640,
+   "height": 384,
+   "num_frames": 9,
+   "steps": 4
+  }
+ },
+ {
+  "tag": "X1",
+  "model": "Wan-AI/Wan2.1-T2V-1.3B-Diffusers",
+  "auto": true,
+  "renders": 2,
+  "gen": {
+   "width": 832,
+   "height": 480,
+   "num_frames": 17,
+   "steps": 8
+  }
+ },
+ {
+  "tag": "X2",
+  "model": "Wan-AI/Wan2.1-T2V-1.3B-Diffusers",
+  "auto": true,
+  "renders": 2,
+  "gen": {
+   "width": 832,
+   "height": 480,
+   "num_frames": 17,
+   "steps": 8
+  }
+ }
+]
