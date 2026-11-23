@@ -1,0 +1,44 @@
+[
+ {
+  "tag": "L1",
+  "kind": "image",
+  "model": "krea/Krea-2-Turbo",
+  "auto": true,
+  "fresh_cc": true,
+  "renders": 5,
+  "gen": {
+   "width": 1024,
+   "height": 1024,
+   "steps": 8,
+   "guidance": 0.0
+  }
+ },
+ {
+  "tag": "L2",
+  "kind": "image",
+  "model": "krea/Krea-2-Turbo",
+  "auto": true,
+  "fresh_cc": true,
+  "renders": 5,
+  "gen": {
+   "width": 1024,
+   "height": 1024,
+   "steps": 8,
+   "guidance": 0.0
+  }
+ },
+ {
+  "tag": "L3",
+  "kind": "image",
+  "model": "krea/Krea-2-Turbo",
+  "auto": true,
+  "fresh_cc": true,
+  "renders": 5,
+  "gen": {
+   "width": 1024,
+   "height": 1024,
+   "steps": 8,
+   "guidance": 0.0
+  }
+ }
+]
