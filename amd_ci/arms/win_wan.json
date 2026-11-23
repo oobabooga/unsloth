@@ -1,0 +1,149 @@
+[
+ {
+  "tag": "P1",
+  "gen": {
+   "width": 640,
+   "height": 384,
+   "num_frames": 9,
+   "steps": 4
+  },
+  "renders": 2
+ },
+ {
+  "tag": "A1",
+  "gen": {
+   "width": 640,
+   "height": 384,
+   "num_frames": 9,
+   "steps": 4
+  },
+  "renders": 2,
+  "auto": true
+ },
+ {
+  "tag": "P2",
+  "gen": {
+   "width": 640,
+   "height": 384,
+   "num_frames": 9,
+   "steps": 4
+  },
+  "renders": 2
+ },
+ {
+  "tag": "A2",
+  "gen": {
+   "width": 640,
+   "height": 384,
+   "num_frames": 9,
+   "steps": 4
+  },
+  "renders": 2,
+  "auto": true
+ },
+ {
+  "tag": "P3",
+  "gen": {
+   "width": 640,
+   "height": 384,
+   "num_frames": 9,
+   "steps": 4
+  },
+  "renders": 2
+ },
+ {
+  "tag": "A3",
+  "gen": {
+   "width": 640,
+   "height": 384,
+   "num_frames": 9,
+   "steps": 4
+  },
+  "renders": 2,
+  "auto": true
+ },
+ {
+  "tag": "P4",
+  "gen": {
+   "width": 640,
+   "height": 384,
+   "num_frames": 9,
+   "steps": 4
+  },
+  "renders": 2
+ },
+ {
+  "tag": "A4",
+  "gen": {
+   "width": 640,
+   "height": 384,
+   "num_frames": 9,
+   "steps": 4
+  },
+  "renders": 2,
+  "auto": true
+ },
+ {
+  "tag": "T1",
+  "gen": {
+   "width": 832,
+   "height": 480,
+   "num_frames": 17,
+   "steps": 8
+  },
+  "renders": 3
+ },
+ {
+  "tag": "U1",
+  "gen": {
+   "width": 832,
+   "height": 480,
+   "num_frames": 17,
+   "steps": 8
+  },
+  "renders": 3,
+  "auto": true
+ },
+ {
+  "tag": "T2",
+  "gen": {
+   "width": 832,
+   "height": 480,
+   "num_frames": 17,
+   "steps": 8
+  },
+  "renders": 3
+ },
+ {
+  "tag": "U2",
+  "gen": {
+   "width": 832,
+   "height": 480,
+   "num_frames": 17,
+   "steps": 8
+  },
+  "renders": 3,
+  "auto": true
+ },
+ {
+  "tag": "T3",
+  "gen": {
+   "width": 832,
+   "height": 480,
+   "num_frames": 17,
+   "steps": 8
+  },
+  "renders": 3
+ },
+ {
+  "tag": "U3",
+  "gen": {
+   "width": 832,
+   "height": 480,
+   "num_frames": 17,
+   "steps": 8
+  },
+  "renders": 3,
+  "auto": true
+ }
+]
