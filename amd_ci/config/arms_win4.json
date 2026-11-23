@@ -1,0 +1,57 @@
+[
+ {
+  "name": "warm",
+  "state": "main",
+  "precisions": "bf16"
+ },
+ {
+  "name": "gccol_a",
+  "state": "main",
+  "env": {
+   "ACC_GC_COLLECT": "1"
+  },
+  "precisions": "bf16"
+ },
+ {
+  "name": "bud_a",
+  "state": "main",
+  "precisions": "bf16"
+ },
+ {
+  "name": "gccol_b",
+  "state": "main",
+  "env": {
+   "ACC_GC_COLLECT": "1"
+  },
+  "precisions": "bf16"
+ },
+ {
+  "name": "gcoff_a",
+  "state": "main",
+  "env": {
+   "ACC_GC_OFF": "1"
+  },
+  "precisions": "bf16"
+ },
+ {
+  "name": "bud_b",
+  "state": "main",
+  "precisions": "bf16"
+ },
+ {
+  "name": "gcoff_b",
+  "state": "main",
+  "env": {
+   "ACC_GC_OFF": "1"
+  },
+  "precisions": "bf16"
+ },
+ {
+  "name": "gccol_c",
+  "state": "main",
+  "env": {
+   "ACC_GC_COLLECT": "1"
+  },
+  "precisions": "bf16"
+ }
+]
