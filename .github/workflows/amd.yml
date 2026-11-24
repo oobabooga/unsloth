@@ -13,6 +13,7 @@ jobs:
     steps:
       - name: Pip debug
         run: |
+          set +e
           W="$RUNNER_TEMP/w"; mkdir -p $W/tmp; export TMPDIR=$W/tmp
           cat /opt/rocm/.info/version 2>/dev/null; ls /opt/rocm/lib | grep -E "libamdhip64" | head -3
           env | grep -iE "^PIP_|^UV_|INDEX" || echo "no pip env"
