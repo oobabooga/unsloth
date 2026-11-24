@@ -1,0 +1,120 @@
+name: "AMD CI: M22 Wan2.2-TI2V-5B LoRA step profile, attention-backward share (gfx1151 Linux)"
+
+# Measurement only: no secret is referenced, every download is public. Studio = unsloth origin/main e2775e3393.
+
+on:
+  push:
+    branches: [amd-ci-m22-feather-profile]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  UPSTREAM: "https://github.com/unslothai/unsloth"
+  BASE_SHA: "e2775e3393c5ea2543e9b7d6b4b6793f6a651fec"
+
+jobs:
+
+  profile:
+    name: "amd:gfx1151-linux Wan 5B LoRA step profile (exclusive GPU)"
+    runs-on: [self-hosted, Linux, strix-halo, devlab-dispatch]
+    timeout-minutes: 300
+    concurrency:
+      group: amd-ci-gfx1151-gpu
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+        with: { persist-credentials: false }
+
+      - name: Preamble
+        run: |
+          source amd_ci/lib/preamble.sh "m22-profile"
+
+      - name: Disk, memory, cores
+        run: |
+          set +e
+          df -h "$RUNNER_TEMP"; free -g; nproc
+          exit 0
+
+      - name: Studio install (install.sh --local at BASE_SHA)
+        timeout-minutes: 60
+        run: |
+          set -euo pipefail
+          git clone -q --filter=blob:none "$UPSTREAM" "$AMD_CI_WORK/repo"
+          git -C "$AMD_CI_WORK/repo" checkout -q --detach "$BASE_SHA"
+          cd "$AMD_CI_WORK/repo"
+          export UNSLOTH_STUDIO_HOME="$AMD_CI_WORK/studio"
+          echo "UNSLOTH_STUDIO_HOME=$UNSLOTH_STUDIO_HOME" >> "$GITHUB_ENV"
+          export UV_EXTRA_INDEX_URL="https://pypi.org/simple"
+          set +e
+          bash install.sh --local 2>&1 | tail -15
+          rc=${PIPESTATUS[0]}
+          set -e
+          [ "$rc" -eq 0 ] || exit "$rc"
+          V=""
+          for c in "$UNSLOTH_STUDIO_HOME"/unsloth_studio "$UNSLOTH_STUDIO_HOME"/.venv_t5_*; do
+            [ -x "$c/bin/python" ] && { V="$c"; break; }
+          done
+          [ -n "$V" ] || { echo "FATAL: no Studio venv"; exit 1; }
+          echo "AMD_CI_PY=$V/bin/python" >> "$GITHUB_ENV"
+          "$V/bin/python" "$GITHUB_WORKSPACE/amd_ci/lib/gate.py" --require rocm gpu \
+            --expect-arch gfx1151 --min-gpus 1 --out "$AMD_CI_WORK/out/host.json"
+          "$V/bin/python" -c "import torch, diffusers, transformers, triton; print('studio torch', torch.__version__, 'hip', torch.version.hip, 'diffusers', diffusers.__version__, 'transformers', transformers.__version__, 'triton', triton.__version__)" | tee "$AMD_CI_WORK/out/stack.txt"
+
+      - name: Prefetch Wan2.2-TI2V-5B (public, no token)
+        timeout-minutes: 60
+        run: |
+          set +e
+          unset HF_TOKEN HUGGING_FACE_HUB_TOKEN
+          export HF_HOME="$AMD_CI_WORK/hf_home" HF_XET_HIGH_PERFORMANCE=1
+          echo "HF_HOME=$HF_HOME" >> "$GITHUB_ENV"
+          T0=$(date +%s)
+          "$AMD_CI_PY" -c "from huggingface_hub import snapshot_download; print(snapshot_download('Wan-AI/Wan2.2-TI2V-5B-Diffusers'))" > "$AMD_CI_WORK/out/prefetch.log" 2>&1
+          echo "prefetch rc=$? in $(( $(date +%s) - T0 )) s"; tail -3 "$AMD_CI_WORK/out/prefetch.log"
+          du -sh "$HF_HOME" 2>/dev/null
+          exit 0
+
+      - name: Profile 20 steps, 704 px (Studio default) then 1024 px, fresh process each
+        timeout-minutes: 150
+        run: |
+          set +e
+          unset CI HF_TOKEN HUGGING_FACE_HUB_TOKEN
+          cd "$AMD_CI_WORK"
+          for RES in 704 1024; do
+            T0=$(date +%s)
+            timeout 3600 "$AMD_CI_PY" "$GITHUB_WORKSPACE/bench/wan_step_profile.py" --backend "$AMD_CI_WORK/repo/studio/backend" \
+              --res "$RES" --steps 20 --work "$AMD_CI_WORK/w_$RES" --out "$AMD_CI_WORK/out/profile_$RES.json" > "$AMD_CI_WORK/out/profile_$RES.log" 2>&1
+            echo "res $RES rc=$? in $(( $(date +%s) - T0 )) s"; tail -5 "$AMD_CI_WORK/out/profile_$RES.log"
+          done
+          exit 0
+
+      - name: Stop anything this job started
+        if: always()
+        run: |
+          set +e
+          W="${AMD_CI_WORK:-}"
+          case "$W" in /?*/?*) ;; *) echo "no usable AMD_CI_WORK root ('$W'): nothing to stop"; exit 0 ;; esac
+          [ -d "$W" ] || exit 0
+          W="${W%/}"
+          for sig in TERM KILL; do
+            for d in /proc/[0-9]*; do
+              pid=${d#/proc/}
+              [ "$pid" = "$$" ] && continue
+              cwd=$(readlink "$d/cwd" 2>/dev/null)
+              case "$cwd" in
+                "$W"|"$W"/*) echo "$sig pid $pid (cwd $cwd)"; kill -$sig "$pid" 2>/dev/null ;;
+              esac
+            done
+            sleep 5
+          done
+          exit 0
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: m22-profile
+          path: |
+            ${{ env.AMD_CI_WORK }}/out
+          retention-days: 14
+          if-no-files-found: warn
