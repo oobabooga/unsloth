@@ -1,0 +1,6 @@
+[
+ {"tag": "A1", "model": "Wan-AI/Wan2.2-T2V-A14B-Diffusers", "load": {}, "gen": {"width": 832, "height": 480, "num_frames": 17},
+  "renders": 2, "png": 1, "timeout": 12600, "stop_on_fail": true},
+ {"tag": "A2", "model": "Wan-AI/Wan2.2-T2V-A14B-Diffusers", "load": {}, "gen": {"width": 832, "height": 480},
+  "renders": 1, "png": 10, "timeout": 5400}
+]

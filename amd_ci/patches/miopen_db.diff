@@ -1,0 +1,747 @@
+diff --git a/.gitattributes b/.gitattributes
+index e871563592..f0d3776b53 100644
+--- a/.gitattributes
++++ b/.gitattributes
+@@ -33,3 +33,6 @@ studio/backend/requirements/engines/** -text
+ # Vendored third-party files are pinned by sha256 in studio/backend/vendor/*_manifest.json. A Windows clone
+ # (core.autocrlf=true) would rewrite their LICENSE files to CRLF and fail those digests.
+ studio/backend/vendor/** -text
++
++# MIOpen db records ship byte-exact (MIOpen parses them line by line; a CRLF checkout would add a stray \r).
++studio/backend/core/inference/rocm_miopen_db/** -text
+diff --git a/pyproject.toml b/pyproject.toml
+index a45f6291c8..efd8d1a391 100644
+--- a/pyproject.toml
++++ b/pyproject.toml
+@@ -92,6 +92,8 @@ studio = [
+     "backend/core/inference/nvfp4_gate_record.json",
+     # ROCm GEMM tables: if missing from the wheel, gfx1151 silently falls back to the slower pick.
+     "backend/core/inference/rocm_gemm_tables/*.csv",
++    # ROCm MIOpen find-db / perf-db per exact stack: if missing from the wheel, gfx1151 VAE convs take the slower pick.
++    "backend/core/inference/rocm_miopen_db/*/*",
+     "backend/core/data_recipe/oxc-validator/*.json",
+     "backend/core/data_recipe/oxc-validator/*.mjs",
+     "backend/core/inference/bundled_skills/**/*.md",
+diff --git a/studio/backend/core/inference/diffusion_rocm_miopen_db.py b/studio/backend/core/inference/diffusion_rocm_miopen_db.py
+new file mode 100644
+index 0000000000..4387758048
+--- /dev/null
++++ b/studio/backend/core/inference/diffusion_rocm_miopen_db.py
+@@ -0,0 +1,291 @@
++# SPDX-License-Identifier: AGPL-3.0-only
++# Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
++
++"""ROCm MIOpen find-db / perf-db for diffusion VAE convs on gfx1151. Studio runs MIOpen in immediate mode, which
++takes a conv's solver from the user find-db when it has a record and otherwise from MIOpen's heuristic; the heuristic
++pick is slower on the Wan VAE. Running Find on the user's machine costs minutes per shape, so Studio ships the db AMD
++CI measured, one directory per exact stack in ``rocm_miopen_db/`` (arch, torch, HIP and MIOpen versions must all
++match; MIOpen itself also keys the files on its build). ``UNSLOTH_DIFFUSION_ROCM_MIOPEN_DB=0`` turns it off.
++
++MIOpen reads ``MIOPEN_USER_DB_PATH`` once, on the process's first conv: a db installed after another pipeline already
++ran a conv in this process does not apply until the next process, and release restores the variable (for child
++processes) but cannot unload a db MIOpen already opened."""
++
++from __future__ import annotations
++
++import hashlib
++import json
++import os
++import sys
++import threading
++import weakref
++from pathlib import Path
++from typing import Any, Optional
++
++from .rocm_bf16 import is_rocm_torch
++
++MIOPEN_DB_ENV = "UNSLOTH_DIFFUSION_ROCM_MIOPEN_DB"
++USER_DB_ENV = "MIOPEN_USER_DB_PATH"
++# A user who set any of these runs MIOpen their own way (their own db, or Find): Studio stays out.
++_USER_ENVS = (USER_DB_ENV, "MIOPEN_FIND_MODE", "MIOPEN_FIND_ENFORCE")
++# Measured archs only; widen with evidence.
++TUNED_ARCHES = frozenset({"gfx1151"})
++MANIFEST = "manifest.json"
++STACK_KEYS = ("arch", "torch", "hip", "miopen", "platform")
++_OWNER_ATTR = "_unsloth_miopen_db_owner"
++_SHIPPED_MARK = ".unsloth_shipped"
++
++_DB_DIR = Path(__file__).resolve().parent / "rocm_miopen_db"
++_LOCK = threading.RLock()
++_UNSET = object()
++_STATE: dict = {"active": False, "path": None, "snapshot": _UNSET, "owners": set(), "db": None}
++
++
++def _env() -> str:
++    return (os.environ.get(MIOPEN_DB_ENV) or "").strip().lower()
++
++
++def disabled() -> bool:
++    return _env() in ("0", "off", "false", "no")
++
++
++def _user_owns_miopen() -> bool:
++    for k in _USER_ENVS:
++        v = os.environ.get(k)
++        if v is None:
++            continue
++        if k == USER_DB_ENV and _STATE["active"] and v == _STATE["path"]:
++            continue  # ours
++        return True
++    return False
++
++
++def _arch(device: Any = None) -> Optional[str]:
++    try:
++        import torch
++
++        props = torch.cuda.get_device_properties(
++            device if device is not None else torch.cuda.current_device()
++        )
++        name = str(getattr(props, "gcnArchName", "") or "")
++        return name.split(":", 1)[0] or None
++    except Exception:  # noqa: BLE001
++        return None
++
++
++def _device_count(torch: Any) -> int:
++    try:
++        return int(torch.cuda.device_count())
++    except Exception:  # noqa: BLE001
++        return 0
++
++
++def current_stack(arch: str) -> dict:
++    """The keys a shipped db must match exactly; the MIOpen version comes from torch (MIOpen's own number)."""
++    import torch
++
++    try:
++        miopen = torch.backends.cudnn.version()
++    except Exception:  # noqa: BLE001
++        miopen = None
++    return {
++        "arch": str(arch),
++        "torch": str(torch.__version__),
++        "hip": str(getattr(torch.version, "hip", None)),
++        "miopen": str(miopen),
++        "platform": sys.platform,
++    }
++
++
++def _manifest(path: Path) -> dict:
++    try:
++        data = json.loads((path / MANIFEST).read_text(encoding = "utf-8"))
++    except (OSError, ValueError):
++        return {}
++    return data if isinstance(data, dict) else {}
++
++
++def _db_files(path: Path, manifest: dict) -> list:
++    names = manifest.get("files") or []
++    files = [path / str(n) for n in names if isinstance(n, str) and "/" not in n and "\\" not in n]
++    return files if files and all(f.is_file() for f in files) else []
++
++
++def shipped_db(stack: dict) -> Optional[Path]:
++    """The shipped db directory measured on exactly this stack, else None. A manifest missing a key never matches."""
++    want = {k: str(stack.get(k)) for k in STACK_KEYS}
++    for path in sorted(_DB_DIR.glob(f"{stack.get('arch')}_*")):
++        if not path.is_dir():
++            continue
++        m = _manifest(path)
++        have = m.get("stack") if isinstance(m.get("stack"), dict) else {}
++        if {k: str(have.get(k)) for k in STACK_KEYS} == want and all(k in have for k in STACK_KEYS):
++            if _db_files(path, m):
++                return path
++    return None
++
++
++def eligible(device: Any = None) -> tuple:
++    if disabled():
++        return False, f"{MIOPEN_DB_ENV}=0"
++    if _user_owns_miopen():
++        return False, "MIOPEN_USER_DB_PATH / MIOPEN_FIND_* set by the user"
++    try:
++        import torch
++    except Exception:  # noqa: BLE001
++        return False, "no torch"
++    if not is_rocm_torch(torch) or not torch.cuda.is_available():
++        return False, "not ROCm"
++    arch = _arch(device)
++    if arch not in TUNED_ARCHES:
++        return False, f"arch {arch} not measured"
++    # MIOpen's user db is process-wide: every visible card must share the arch the db was measured on.
++    others = {_arch(i) for i in range(_device_count(torch))} - {arch}
++    if others:
++        return False, f"mixed archs {sorted(map(str, others))} beside {arch}"
++    return True, arch
++
++
++def _digest(files: list) -> str:
++    h = hashlib.sha256()
++    for f in files:
++        h.update(f.name.encode())
++        h.update(f.read_bytes())
++    return h.hexdigest()
++
++
++def _materialise(src: Path, manifest: dict) -> Path:
++    """Copy the shipped files into a writable per-stack dir (MIOpen may append records there). A dir already seeded
++    from the same shipped bytes is kept as is, so records MIOpen added since survive; a new shipped db replaces it."""
++    from .diffusion_compile_cache import cache_root
++
++    files = _db_files(src, manifest)
++    dest = cache_root() / "miopen_db" / src.name
++    digest = _digest(files)
++    mark = dest / _SHIPPED_MARK
++    try:
++        if mark.read_text(encoding = "utf-8").strip() == digest and all((dest / f.name).is_file() for f in files):
++            return dest
++    except OSError:
++        pass
++    dest.mkdir(parents = True, exist_ok = True)
++    for f in files:
++        tmp = dest / f".{f.name}.{os.getpid()}.tmp"
++        # MIOpen parses records line by line: a CRLF checkout must not leave "\r" in the last solver field.
++        tmp.write_bytes(f.read_bytes().replace(b"\r\n", b"\n"))
++        os.replace(tmp, dest / f.name)
++    mark.write_text(digest + "\n", encoding = "utf-8")
++    return dest
++
++
++def _activate(arch: str, logger: Any = None) -> bool:
++    with _LOCK:
++        if _STATE["active"]:
++            return True
++        src = shipped_db(current_stack(arch))
++        if src is None:
++            return False
++        manifest = _manifest(src)
++        try:
++            dest = _materialise(src, manifest)
++        except OSError as exc:
++            if logger is not None:
++                logger.info("diffusion.rocm_miopen_db: could not seed %s (%s); MIOpen keeps its own db", src.name, exc)
++            return False
++        _STATE.update(
++            active = True,
++            path = str(dest),
++            snapshot = os.environ.get(USER_DB_ENV, _UNSET),
++            db = src.name,
++        )
++        os.environ[USER_DB_ENV] = str(dest)
++    if logger is not None:
++        logger.info(
++            "diffusion.rocm_miopen_db: %s convs read the measured MIOpen db %s (%s)",
++            arch,
++            src.name,
++            manifest.get("measured") or "",
++        )
++    return True
++
++
++def _restore() -> None:
++    # Caller holds _LOCK.
++    if _STATE["active"]:
++        snap = _STATE["snapshot"]
++        if os.environ.get(USER_DB_ENV) == _STATE["path"]:
++            if snap is _UNSET:
++                os.environ.pop(USER_DB_ENV, None)
++            else:
++                os.environ[USER_DB_ENV] = snap
++    _STATE["owners"].clear()
++    _STATE.update(active = False, path = None, snapshot = _UNSET, db = None)
++
++
++def install_for_pipe(pipe: Any, device: Any = None, logger: Any = None) -> bool:
++    ok, why = eligible(device)
++    if not ok:
++        if _STATE["active"]:  # a declined load (another arch, opted out) must not inherit an earlier load's db
++            uninstall(None)
++        return False
++    with _LOCK:
++        if not _activate(why, logger):
++            return False
++        _claim(pipe)
++    return True
++
++
++def _claim(pipe: Any) -> None:
++    token = getattr(pipe, _OWNER_ATTR, None)
++    if token is None:
++        token = object()
++        try:
++            setattr(pipe, _OWNER_ATTR, token)
++        except Exception:  # noqa: BLE001 - untaggable: never released, stays on as before
++            return
++        root = pipe
++        while "_pipe" in getattr(root, "__dict__", {}):  # a view: the claim lives on the pipe it wraps
++            root = root.__dict__["_pipe"]
++        try:
++            weakref.finalize(root, _drop, token)
++        except TypeError:
++            pass
++    with _LOCK:
++        _STATE["owners"].add(token)
++
++
++def _drop(token: object) -> None:
++    with _LOCK:
++        if token not in _STATE["owners"]:
++            return
++        _STATE["owners"].discard(token)
++        if _STATE["active"] and not _STATE["owners"]:
++            _restore()
++
++
++def release(pipe: Any) -> None:
++    """Pipeline teardown: drop its claim; the last owner out restores MIOPEN_USER_DB_PATH."""
++    if pipe is None:
++        return
++    token = getattr(pipe, _OWNER_ATTR, None)
++    if token is None:
++        return
++    try:
++        delattr(pipe, _OWNER_ATTR)
++    except Exception:  # noqa: BLE001
++        pass
++    _drop(token)
++
++
++def uninstall(pipe: Any = None) -> None:
++    with _LOCK:
++        _restore()
++    if pipe is not None:
++        try:
++            delattr(pipe, _OWNER_ATTR)
++        except Exception:  # noqa: BLE001
++            pass
++
++
++def is_active() -> bool:
++    return bool(_STATE["active"])
+diff --git a/studio/backend/core/inference/diffusion_speed.py b/studio/backend/core/inference/diffusion_speed.py
+index 0e41866474..a97a8c8aaf 100644
+--- a/studio/backend/core/inference/diffusion_speed.py
++++ b/studio/backend/core/inference/diffusion_speed.py
+@@ -193,14 +193,17 @@ def snapshot_backend_flags() -> Optional[dict]:
+ 
+ 
+ def release_rocm_tunableop(pipe: Any) -> None:
+-    """Unload: drop this pipe's TunableOp claim (process-global, so not in snapshot_backend_flags)."""
+-    mod = sys.modules.get(f"{__package__}.diffusion_rocm_tunableop")
+-    if mod is None or pipe is None:
++    """Unload: drop this pipe's TunableOp and MIOpen db claims (process-global, so not in snapshot_backend_flags)."""
++    if pipe is None:
+         return
+-    try:
+-        mod.release(pipe)
+-    except Exception:  # noqa: BLE001 - teardown is best effort
+-        pass
++    for name in ("diffusion_rocm_tunableop", "diffusion_rocm_miopen_db"):
++        mod = sys.modules.get(f"{__package__}.{name}")
++        if mod is None:
++            continue
++        try:
++            mod.release(pipe)
++        except Exception:  # noqa: BLE001 - teardown is best effort
++            pass
+ 
+ 
+ def restore_backend_flags(state: Optional[dict]) -> None:
+@@ -571,6 +574,14 @@ def apply_speed_optims(
+                 rocm_tunableop.install_for_pipe(pipe, getattr(target, "device", None), logger)
+         except Exception as exc:  # noqa: BLE001 - keep torch's default GEMM pick
+             _warn(logger, "rocm tunableop", exc)
++        try:
++            from . import diffusion_rocm_miopen_db as rocm_miopen_db
++            if mode == SPEED_OFF:
++                rocm_miopen_db.uninstall(pipe)
++            else:
++                rocm_miopen_db.install_for_pipe(pipe, getattr(target, "device", None), logger)
++        except Exception as exc:  # noqa: BLE001 - keep MIOpen's own solver pick
++            _warn(logger, "rocm miopen db", exc)
+     # TF32 (max) and cudnn.benchmark (any non-off CUDA load) are process-global; the caller restores them so a later
+     # `off` load never inherits them.
+     if mode == SPEED_OFF:
+diff --git a/studio/backend/core/inference/rocm_miopen_db/gfx1151_torch2.11.0_hip714_win_wan22ti2v5b/gfx1151_20.HIP.3_5_2_cd957402.udb.txt b/studio/backend/core/inference/rocm_miopen_db/gfx1151_torch2.11.0_hip714_win_wan22ti2v5b/gfx1151_20.HIP.3_5_2_cd957402.udb.txt
+new file mode 100644
+index 0000000000..a318ac859c
+--- /dev/null
++++ b/studio/backend/core/inference/rocm_miopen_db/gfx1151_torch2.11.0_hip714_win_wan22ti2v5b/gfx1151_20.HIP.3_5_2_cd957402.udb.txt
+@@ -0,0 +1,43 @@
++3x48x44x80x31x2x2x1x3072x1x0x0x0x2x2x1x1x1x1x0x1xNCDHWxBF16xF=ConvHipImplicitGemm3DGroupFwdXdlops:DeviceGroupedConvFwdMultipleABD_Xdl_CShuffle_WmmaPorted<128, 128, 64, 32, Default, 32, 32, 2, 2, 8, 8, 8, 1, 1, 1>
++3x48x44x80x31x2x2x1x3072x2x0x0x0x2x2x1x1x1x1x0x1xNCDHWxBF16xF=ConvHipImplicitGemm3DGroupFwdXdlops:DeviceGroupedConvFwdMultipleD_Wmma_CShuffle_V3_Large_Tensor<128, 128, 128, Default, 16, 16, 4, 4, 8, 8, 1, 1, 1>
++2x48x44x80x1x3x3x1x256x1x1x1x0x1x1x0x1x1x0x0x1xNCHWxFP16xF=ConvBinWinogradRxSf3x2:38;ConvHipImplicitGemmGroupFwdXdlops:DeviceGroupedConvFwdMultipleABD_Wmma_CShuffle_V3<64, 64, 64, 32, OddC, 16, 16, 4, 2, 8, 8, 8, 1, 1, BlkGemmPipelineScheduler: Intrawave, BlkGemmPipelineVersion: v1, 1>
++2x512x44x80x1x3x3x1x256x1x1x1x0x1x1x0x1x1x0x0x1xNCHWxFP16xF=ConvBinWinogradRxSf3x2:40;ConvHipImplicitGemmGroupFwdXdlops:DeviceGroupedConvFwdMultipleABD_Wmma_CShuffle_V3<256, 128, 128, 64, Default, 16, 16, 4, 2, 8, 8, 1, 1, 1, BlkGemmPipelineScheduler: Intrawave, BlkGemmPipelineVersion: v1, 1>
++2x256x44x80x1x3x3x1x256x1x1x1x0x1x1x0x1x1x0x0x1xNCHWxFP16xF=ConvBinWinogradRxSf3x2:35;ConvHipImplicitGemmGroupFwdXdlops:DeviceGroupedConvFwdMultipleABD_Wmma_CShuffle_V3<256, 128, 128, 64, Default, 16, 16, 4, 2, 8, 8, 1, 1, 1, BlkGemmPipelineScheduler: Intrawave, BlkGemmPipelineVersion: v1, 1>
++2x256x88x160x1x1x1x1x256x1x0x0x0x1x1x0x1x1x0x0x1xNCHWxFP16xF=ConvBinWinogradRxSf3x2:40;ConvHipImplicitGemmGroupFwdXdlops:DeviceGroupedConvFwdMultipleABD_Xdl_CShuffle_WmmaPorted<256, 256, 128, 32, Default, 32, 32, 4, 2, 8, 8, 8, 1, 1, 1>
++2x256x88x160x1x3x3x1x128x1x1x1x0x1x1x0x1x1x0x0x1xNCHWxFP16xF=ConvBinWinogradRxSf3x2:37;ConvHipImplicitGemmGroupFwdXdlops:DeviceGroupedConvFwdMultipleABD_Wmma_CShuffle_V3<256, 128, 128, 64, Default, 16, 16, 4, 2, 8, 8, 1, 1, 1, BlkGemmPipelineScheduler: Intrawave, BlkGemmPipelineVersion: v1, 1>
++2x128x88x160x1x3x3x1x128x1x1x1x0x1x1x0x1x1x0x0x1xNCHWxFP16xF=ConvBinWinogradRxSf3x2:34;ConvHipImplicitGemmGroupFwdXdlops:DeviceGroupedConvFwdMultipleABD_Xdl_CShuffle_WmmaPorted<256, 256, 128, 32, Default, 32, 32, 4, 2, 8, 8, 8, 1, 1, 1>
++2x128x176x320x1x1x1x1x256x1x0x0x0x1x1x0x1x1x0x0x1xNCHWxFP16xF=ConvBinWinogradRxSf3x2:40;ConvHipImplicitGemmGroupFwdXdlops:DeviceGroupedConvFwdMultipleABD_Wmma_CShuffle_V3<128, 64, 128, 64, Filter1x1Stride1Pad0, 16, 16, 4, 2, 8, 8, 8, 1, 1, BlkGemmPipelineScheduler: Intrawave, BlkGemmPipelineVersion: v1, 1>
++2x128x176x320x1x3x3x1x64x2x1x1x0x1x1x0x1x1x0x0x1xNCHWxFP16xF=ConvBinWinogradRxSf3x2:40;ConvHipImplicitGemmGroupFwdXdlops:DeviceGroupedConvFwdMultipleABD_Wmma_CShuffle_V3<128, 128, 64, 64, Default, 16, 16, 2, 4, 8, 8, 8, 1, 1, BlkGemmPipelineScheduler: Intrawave, BlkGemmPipelineVersion: v1, 1>
++2x64x176x320x1x3x3x1x64x2x1x1x0x1x1x0x1x1x0x0x1xNCHWxFP16xF=ConvBinWinogradRxSf3x2:40;ConvHipImplicitGemmGroupFwdXdlops:DeviceGroupedConvFwdMultipleABD_Wmma_CShuffle_V3<64, 64, 64, 32, OddC, 16, 16, 4, 2, 8, 8, 8, 1, 1, BlkGemmPipelineScheduler: Intrawave, BlkGemmPipelineVersion: v1, 1>
++2x64x352x640x1x1x1x1x128x2x0x0x0x1x1x0x1x1x0x0x1xNCHWxFP16xF=ConvBinWinogradRxSf3x2:29;ConvHipImplicitGemmGroupFwdXdlops:DeviceGroupedConvFwdMultipleABD_Wmma_CShuffle_V3<128, 64, 32, 64, Filter1x1Pad0, 16, 16, 2, 1, 8, 8, 1, 1, 1, BlkGemmPipelineScheduler: Intrawave, BlkGemmPipelineVersion: v1, 1>
++2x64x352x640x1x3x3x1x64x4x1x1x0x1x1x0x1x1x0x0x1xNCHWxFP16xF=ConvBinWinogradRxSf3x2:39;ConvHipImplicitGemmGroupFwdXdlops:DeviceGroupedConvFwdMultipleABD_Wmma_CShuffle_V3<64, 64, 64, 32, OddC, 16, 16, 4, 2, 8, 8, 8, 1, 1, BlkGemmPipelineScheduler: Intrawave, BlkGemmPipelineVersion: v1, 1>
++2x64x352x640x1x3x3x1x12x4x1x1x0x1x1x0x1x1x0x0x1xNCHWxFP16xF=ConvBinWinogradRxSf3x2:39;ConvHipImplicitGemmGroupFwdXdlops:DeviceGroupedConvFwdMultipleABD_Xdl_CShuffle_V3_WmmaPorted<128, 128, 16, 64, OddC, 16, 16, 4, 1, 8, 8, 2, 1, 1, BlkGemmPipelineScheduler: Intrawave, BlkGemmPipelineVersion: v2>
++3x48x44x80x31x1x1x1x48x1x0x0x0x1x1x1x1x1x1x0x1xNCDHWxBF16xF=ConvHipImplicitGemm3DGroupFwdXdlops:DeviceGroupedConvFwdMultipleABD_Wmma_CShuffle_V3<128, 128, 48, 64, Filter1x1Stride1Pad0, 16, 16, 2, 3, 8, 8, 8, 1, 1, BlkGemmPipelineScheduler: Intrawave, BlkGemmPipelineVersion: v1, 1>
++3x48x46x82x3x3x3x3x1024x1x0x0x0x1x1x1x1x1x1x0x1xNCDHWxBF16xF=ConvHipImplicitGemm3DGroupFwdXdlops:DeviceGroupedConvFwdMultipleABD_Wmma_CShuffle_V3<256, 128, 256, 32, Default, 16, 16, 4, 4, 8, 8, 8, 1, 1, BlkGemmPipelineScheduler: Intrawave, BlkGemmPipelineVersion: v1, 1>
++3x1024x46x82x3x3x3x3x1024x1x0x0x0x1x1x1x1x1x1x0x1xNCDHWxBF16xF=ConvHipImplicitGemm3DGroupFwdXdlops:DeviceGroupedConvFwdMultipleABD_Xdl_CShuffle_WmmaPorted<256, 256, 128, 32, Default, 32, 32, 4, 2, 8, 8, 8, 1, 1, 1>
++2x1024x44x80x1x1x1x1x3072x1x0x0x0x1x1x0x1x1x0x0x1xNCHWxBF16xF=ConvHipImplicitGemmGroupFwdXdlops:DeviceGroupedConvFwdMultipleABD_Wmma_CShuffle_V3<256, 128, 96, 64, Filter1x1Stride1Pad0, 16, 16, 2, 3, 8, 8, 1, 1, 1, BlkGemmPipelineScheduler: Intrawave, BlkGemmPipelineVersion: v1, 1>
++2x1024x44x80x1x1x1x1x1024x1x0x0x0x1x1x0x1x1x0x0x1xNCHWxBF16xF=ConvHipImplicitGemmGroupFwdXdlops:DeviceGroupedConvFwdMultipleABD_Wmma_CShuffle_V3<128, 64, 128, 64, Filter1x1Stride1Pad0, 16, 16, 4, 2, 8, 8, 8, 1, 1, BlkGemmPipelineScheduler: Intrawave, BlkGemmPipelineVersion: v1, 1>
++2x1024x88x160x1x3x3x1x1024x1x1x1x0x1x1x0x1x1x0x0x1xNCHWxBF16xF=ConvHipImplicitGemmGroupFwdXdlops:DeviceGroupedConvFwdMultipleABD_Wmma_CShuffle_V3<256, 128, 128, 64, Default, 16, 16, 4, 2, 8, 8, 1, 1, 1, BlkGemmPipelineScheduler: Intrawave, BlkGemmPipelineVersion: v1, 1>
++3x1024x90x162x3x3x3x3x1024x1x0x0x0x1x1x1x1x1x1x0x1xNCDHWxBF16xF=ConvHipImplicitGemm3DGroupFwdXdlops:DeviceGroupedConvFwdMultipleABD_Xdl_CShuffle_WmmaPorted<256, 256, 128, 32, Default, 32, 32, 4, 2, 8, 8, 8, 1, 1, 1>
++2x1024x176x320x1x3x3x1x1024x1x1x1x0x1x1x0x1x1x0x0x1xNCHWxBF16xF=ConvHipImplicitGemmGroupFwdXdlops:DeviceGroupedConvFwdMultipleABD_Xdl_CShuffle_WmmaPorted<256, 256, 128, 32, Default, 32, 32, 4, 2, 8, 8, 8, 1, 1, 1>
++3x1024x176x320x1x1x1x1x512x1x0x0x0x1x1x1x1x1x1x0x1xNCDHWxBF16xF=ConvHipImplicitGemm3DGroupFwdXdlops:DeviceGroupedConvFwdMultipleABD_Wmma_CShuffle_V3<256, 128, 128, 64, Filter1x1Pad0, 16, 16, 4, 2, 8, 8, 1, 1, 1, BlkGemmPipelineScheduler: Intrawave, BlkGemmPipelineVersion: v1, 1>
++3x1024x178x322x3x3x3x3x512x1x0x0x0x1x1x1x1x1x1x0x1xNCDHWxBF16xF=ConvHipImplicitGemm3DGroupFwdXdlops:DeviceGroupedConvFwdMultipleABD_Xdl_CShuffle_WmmaPorted<256, 128, 256, 32, Default, 32, 32, 2, 4, 8, 8, 8, 1, 1, 1>
++3x512x178x322x3x3x3x3x512x1x0x0x0x1x1x1x1x1x1x0x1xNCDHWxBF16xF=ConvHipImplicitGemm3DGroupFwdXdlops:DeviceGroupedConvFwdMultipleABD_Xdl_CShuffle_WmmaPorted<256, 256, 128, 32, Default, 32, 32, 4, 2, 8, 8, 8, 1, 1, 1>
++2x512x352x640x1x3x3x1x512x1x1x1x0x1x1x0x1x1x0x0x1xNCHWxBF16xF=ConvHipImplicitGemmGroupFwdXdlops:DeviceGroupedConvFwdMultipleABD_Wmma_CShuffle_V3<256, 128, 256, 32, OddC, 16, 16, 4, 4, 8, 8, 8, 1, 1, BlkGemmPipelineScheduler: Intrawave, BlkGemmPipelineVersion: v1, 1>
++3x512x352x640x1x1x1x1x256x1x0x0x0x1x1x1x1x1x1x0x1xNCDHWxBF16xF=ConvHipImplicitGemm3DGroupFwdXdlops:DeviceGroupedConvFwdMultipleABD_Wmma_CShuffle_V3<256, 128, 128, 64, Default, 16, 16, 4, 2, 8, 8, 1, 1, 1, BlkGemmPipelineScheduler: Intrawave, BlkGemmPipelineVersion: v1, 1>
++3x512x354x642x3x3x3x3x256x1x0x0x0x1x1x1x1x1x1x0x1xNCDHWxBF16xF=ConvHipImplicitGemm3DGroupFwdXdlops:DeviceGroupedConvFwdMultipleABD_Wmma_CShuffle_V3<256, 128, 128, 64, Default, 16, 16, 4, 2, 8, 8, 1, 1, 1, BlkGemmPipelineScheduler: Intrawave, BlkGemmPipelineVersion: v1, 1>
++3x256x354x642x3x3x3x3x256x1x0x0x0x1x1x1x1x1x1x0x1xNCDHWxBF16xF=ConvHipImplicitGemm3DGroupFwdXdlops:DeviceGroupedConvFwdMultipleABD_Wmma_CShuffle_V3<256, 128, 256, 32, Default, 16, 16, 4, 4, 8, 8, 8, 1, 1, BlkGemmPipelineScheduler: Intrawave, BlkGemmPipelineVersion: v1, 1>
++3x256x354x642x3x3x3x3x12x1x0x0x0x1x1x1x1x1x1x0x1xNCDHWxBF16xF=ConvHipImplicitGemm3DGroupFwdXdlops:DeviceGroupedConvFwdMultipleABD_Wmma_CShuffle_V3<128, 64, 32, 64, Default, 16, 16, 2, 1, 8, 8, 1, 1, 1, BlkGemmPipelineScheduler: Intrawave, BlkGemmPipelineVersion: v1, 1>
++3x1024x44x80x3x1x1x3x2048x1x0x0x0x1x1x1x1x1x1x0x1xNCDHWxBF16xF=ConvHipImplicitGemm3DGroupFwdXdlops:DeviceGroupedConvFwdMultipleD_Wmma_CShuffle_V3_Large_Tensor<256, 128, 128, Default, 16, 16, 4, 2, 8, 8, 1, 1, 1>
++2x1024x88x160x1x3x3x1x1024x2x1x1x0x1x1x0x1x1x0x0x1xNCHWxBF16xF=ConvHipImplicitGemmGroupFwdXdlops:DeviceGroupedConvFwdMultipleABD_Wmma_CShuffle_V3<256, 128, 128, 64, Default, 16, 16, 4, 2, 8, 8, 1, 1, 1, BlkGemmPipelineScheduler: Intrawave, BlkGemmPipelineVersion: v1, 1>
++3x1024x90x162x4x3x3x3x1024x1x0x0x0x1x1x1x1x1x1x0x1xNCDHWxBF16xF=ConvHipImplicitGemm3DGroupFwdXdlops:DeviceGroupedConvFwdMultipleABD_Xdl_CShuffle_WmmaPorted<256, 256, 128, 32, Default, 32, 32, 4, 2, 8, 8, 8, 1, 1, 1>
++3x1024x88x160x4x1x1x3x2048x1x0x0x0x1x1x1x1x1x1x0x1xNCDHWxBF16xF=ConvHipImplicitGemm3DGroupFwdXdlops:DeviceGroupedConvFwdMultipleABD_Wmma_CShuffle_V3<128, 64, 96, 64, Default, 16, 16, 2, 3, 8, 8, 1, 1, 1, BlkGemmPipelineScheduler: Intrawave, BlkGemmPipelineVersion: v1, 1>
++2x1024x176x320x1x3x3x1x1024x4x1x1x0x1x1x0x1x1x0x0x1xNCHWxBF16xF=ConvHipImplicitGemmGroupFwdXdlops:DeviceGroupedConvFwdMultipleABD_Wmma_CShuffle_V3<256, 128, 128, 64, OddC, 16, 16, 4, 2, 8, 8, 1, 1, 1, BlkGemmPipelineScheduler: Intrawave, BlkGemmPipelineVersion: v1, 1>
++3x1024x176x320x4x1x1x1x512x1x0x0x0x1x1x1x1x1x1x0x1xNCDHWxBF16xF=ConvHipImplicitGemm3DGroupFwdXdlops:DeviceGroupedConvFwdMultipleABD_Wmma_CShuffle_V3<256, 128, 128, 32, Filter1x1Stride1Pad0, 16, 16, 4, 2, 8, 8, 8, 1, 1, BlkGemmPipelineScheduler: Intrawave, BlkGemmPipelineVersion: v1, 1>
++3x1024x178x322x6x3x3x3x512x1x0x0x0x1x1x1x1x1x1x0x1xNCDHWxBF16xF=ConvHipImplicitGemm3DGroupFwdXdlops:DeviceGroupedConvFwdMultipleABD_Wmma_CShuffle_V3<256, 128, 128, 64, Default, 16, 16, 4, 2, 8, 8, 1, 1, 1, BlkGemmPipelineScheduler: Intrawave, BlkGemmPipelineVersion: v1, 1>
++3x512x178x322x6x3x3x3x512x1x0x0x0x1x1x1x1x1x1x0x1xNCDHWxBF16xF=ConvHipImplicitGemm3DGroupFwdXdlops:DeviceGroupedConvFwdMultipleABD_Wmma_CShuffle_V3<256, 128, 128, 64, Default, 16, 16, 4, 2, 8, 8, 1, 1, 1, BlkGemmPipelineScheduler: Intrawave, BlkGemmPipelineVersion: v1, 1>
++2x512x352x640x1x3x3x1x512x4x1x1x0x1x1x0x1x1x0x0x1xNCHWxBF16xF=ConvHipImplicitGemmGroupFwdXdlops:DeviceGroupedConvFwdMultipleABD_Wmma_CShuffle_V3<256, 128, 128, 32, OddC, 16, 16, 4, 2, 8, 8, 8, 1, 1, BlkGemmPipelineScheduler: Intrawave, BlkGemmPipelineVersion: v1, 1>
++3x512x352x640x4x1x1x1x256x1x0x0x0x1x1x1x1x1x1x0x1xNCDHWxBF16xF=ConvHipImplicitGemm3DGroupFwdXdlops:DeviceGroupedConvFwdMultipleABD_Wmma_CShuffle_V3<256, 128, 128, 32, Filter1x1Stride1Pad0, 16, 16, 4, 2, 1, 1, 8, 1, 1, BlkGemmPipelineScheduler: Intrawave, BlkGemmPipelineVersion: v1, 1>
++3x512x354x642x6x3x3x3x256x1x0x0x0x1x1x1x1x1x1x0x1xNCDHWxBF16xF=ConvHipImplicitGemm3DGroupFwdXdlops:DeviceGroupedConvFwdMultipleABD_Wmma_CShuffle_V3<256, 256, 64, 64, Default, 16, 16, 4, 2, 8, 8, 1, 1, 1, BlkGemmPipelineScheduler: Intrawave, BlkGemmPipelineVersion: v1, 1>
++3x256x354x642x6x3x3x3x256x1x0x0x0x1x1x1x1x1x1x0x1xNCDHWxBF16xF=ConvHipImplicitGemm3DGroupFwdXdlops:DeviceGroupedConvFwdMultipleABD_Wmma_CShuffle_V3<256, 128, 128, 64, Default, 16, 16, 4, 2, 8, 8, 1, 1, 1, BlkGemmPipelineScheduler: Intrawave, BlkGemmPipelineVersion: v1, 1>
++3x256x354x642x6x3x3x3x12x1x0x0x0x1x1x1x1x1x1x0x1xNCDHWxBF16xF=ConvHipImplicitGemm3DGroupFwdXdlops:DeviceGroupedConvFwdMultipleABD_Wmma_CShuffle_V3<128, 128, 48, 64, Default, 16, 16, 2, 3, 8, 8, 1, 1, 1, BlkGemmPipelineScheduler: Intrawave, BlkGemmPipelineVersion: v1, 1>
+diff --git a/studio/backend/core/inference/rocm_miopen_db/gfx1151_torch2.11.0_hip714_win_wan22ti2v5b/gfx1151_20.HIP.3_5_2_cd957402.ufdb.txt b/studio/backend/core/inference/rocm_miopen_db/gfx1151_torch2.11.0_hip714_win_wan22ti2v5b/gfx1151_20.HIP.3_5_2_cd957402.ufdb.txt
+new file mode 100644
+index 0000000000..3f7008c34b
+--- /dev/null
++++ b/studio/backend/core/inference/rocm_miopen_db/gfx1151_torch2.11.0_hip714_win_wan22ti2v5b/gfx1151_20.HIP.3_5_2_cd957402.ufdb.txt
+@@ -0,0 +1,43 @@
++48-31-44-80-1x2x2-3072-31-22-40-1-0x0x0-1x2x2-1x1x1-0-NCDHW-BF16-F=ConvHipImplicitGemm3DGroupFwdXdlops:14.2095,179263488,miopenConvolutionFwdAlgoImplicitGEMM;GemmFwdRest:1.40662,10475520,miopenConvolutionFwdAlgoGEMM
++48-31-44-80-1x2x2-3072-31-22-40-2-0x0x0-1x2x2-1x1x1-0-NCDHW-BF16-F=ConvHipImplicitGemm3DGroupFwdXdlops:24.0379,357347328,miopenConvolutionFwdAlgoImplicitGEMM;GemmFwdRest:4.2612,10475520,miopenConvolutionFwdAlgoGEMM
++48-44-80-3x3-256-44-80-1-1x1-1x1-1x1-0-NCHW-FP16-F=ConvWinoFuryRxS<2-3>:0.0628833,0,miopenConvolutionFwdAlgoWinograd;ConvHipImplicitGemmGroupFwdXdlops:0.174417,2361344,miopenConvolutionFwdAlgoImplicitGEMM;GemmFwdRest:0.088735,3041280,miopenConvolutionFwdAlgoGEMM;ConvBinWinogradRxSf3x2:0.103333,0,miopenConvolutionFwdAlgoWinograd;ConvBinWinogradRxSf2x3g1:0.07736,0,miopenConvolutionFwdAlgoWinograd
++512-44-80-3x3-256-44-80-1-1x1-1x1-1x1-0-NCHW-FP16-F=ConvWinoFuryRxS<2-3>:0.238967,0,miopenConvolutionFwdAlgoWinograd;ConvHipImplicitGemmGroupFwdXdlops:0.40119,7766016,miopenConvolutionFwdAlgoImplicitGEMM;GemmFwdRest:0.455248,32440320,miopenConvolutionFwdAlgoGEMM;ConvBinWinogradRxSf3x2:0.381329,0,miopenConvolutionFwdAlgoWinograd;ConvBinWinogradRxSf2x3g1:0.2664,0,miopenConvolutionFwdAlgoWinograd
++256-44-80-3x3-256-44-80-1-1x1-1x1-1x1-0-NCHW-FP16-F=ConvWinoFuryRxS<2-3>:0.131567,0,miopenConvolutionFwdAlgoWinograd;ConvHipImplicitGemmGroupFwdXdlops:0.261155,4784128,miopenConvolutionFwdAlgoImplicitGEMM;GemmFwdRest:0.192905,16220160,miopenConvolutionFwdAlgoGEMM;ConvBinWinogradRxSf3x2:0.2109,0,miopenConvolutionFwdAlgoWinograd;ConvBinWinogradRxSf2x3g1:0.1491,0,miopenConvolutionFwdAlgoWinograd
++256-88-160-1x1-256-88-160-1-0x0-1x1-1x1-0-NCHW-FP16-F=ConvWinoFuryRxS<2-3>:0.39035,0,miopenConvolutionFwdAlgoWinograd;ConvHipImplicitGemmGroupFwdXdlops:0.28574,14548992,miopenConvolutionFwdAlgoImplicitGEMM;ConvBinWinogradRxSf2x3g1:0.39692,0,miopenConvolutionFwdAlgoWinograd;GemmFwd1x1_0_1:0.0641843,0,miopenConvolutionFwdAlgoGEMM;ConvBinWinogradRxSf3x2:0.218814,0,miopenConvolutionFwdAlgoWinograd
++256-88-160-3x3-128-88-160-1-1x1-1x1-1x1-0-NCHW-FP16-F=ConvWinoFuryRxS<2-3>:0.200467,0,miopenConvolutionFwdAlgoWinograd;ConvHipImplicitGemmGroupFwdXdlops:0.432658,11403264,miopenConvolutionFwdAlgoImplicitGEMM;GemmFwdRest:0.883751,64880640,miopenConvolutionFwdAlgoGEMM;ConvBinWinogradRxSf3x2:0.386029,0,miopenConvolutionFwdAlgoWinograd;ConvBinWinogradRxSf2x3g1:0.261371,0,miopenConvolutionFwdAlgoWinograd
++128-88-160-3x3-128-88-160-1-1x1-1x1-1x1-0-NCHW-FP16-F=ConvWinoFuryRxS<2-3>:0.111667,0,miopenConvolutionFwdAlgoWinograd;ConvHipImplicitGemmGroupFwdXdlops:0.2709,7503872,miopenConvolutionFwdAlgoImplicitGEMM;GemmFwdRest:0.312456,32440320,miopenConvolutionFwdAlgoGEMM;ConvBinWinogradRxSf3x2:0.22165,0,miopenConvolutionFwdAlgoWinograd;ConvBinWinogradRxSf2x3g1:0.1491,0,miopenConvolutionFwdAlgoWinograd
++128-176-320-1x1-256-176-320-1-0x0-1x1-1x1-0-NCHW-FP16-F=ConvWinoFuryRxS<2-3>:0.740771,0,miopenConvolutionFwdAlgoWinograd;ConvHipImplicitGemmGroupFwdXdlops:1.1537,43319296,miopenConvolutionFwdAlgoImplicitGEMM;ConvBinWinogradRxSf2x3g1:0.94175,0,miopenConvolutionFwdAlgoWinograd;GemmFwd1x1_0_1:0.206622,0,miopenConvolutionFwdAlgoGEMM;ConvBinWinogradRxSf3x2:0.423917,0,miopenConvolutionFwdAlgoWinograd
++128-176-320-3x3-64-176-320-2-1x1-1x1-1x1-0-NCHW-FP16-F=ConvWinoFuryRxS<2-3>:0.3625,0,miopenConvolutionFwdAlgoWinograd;ConvHipImplicitGemmGroupFwdXdlops:1.2581,43401216,miopenConvolutionFwdAlgoImplicitGEMM;GemmFwdRest:3.08108,129761280,miopenConvolutionFwdAlgoGEMM;ConvBinWinogradRxSf3x2:0.7747,0,miopenConvolutionFwdAlgoWinograd;ConvBinWinogradRxSf2x3g1:0.528867,0,miopenConvolutionFwdAlgoWinograd
++64-176-320-3x3-64-176-320-2-1x1-1x1-1x1-0-NCHW-FP16-F=ConvWinoFuryRxS<2-3>:0.1818,0,miopenConvolutionFwdAlgoWinograd;ConvHipImplicitGemmGroupFwdXdlops:0.742657,28909568,miopenConvolutionFwdAlgoImplicitGEMM;GemmFwdRest:1.60349,64880640,miopenConvolutionFwdAlgoGEMM;ConvBinWinogradRxSf3x2:0.368929,0,miopenConvolutionFwdAlgoWinograd;ConvBinWinogradRxSf2x3g1:0.29815,0,miopenConvolutionFwdAlgoWinograd
++64-352-640-1x1-128-352-640-2-0x0-1x1-1x1-0-NCHW-FP16-F=ConvWinoFuryRxS<2-3>:1.484,0,miopenConvolutionFwdAlgoWinograd;ConvHipImplicitGemmGroupFwdXdlops:4.32899,173031424,miopenConvolutionFwdAlgoImplicitGEMM;ConvBinWinogradRxSf2x3g1:1.9167,0,miopenConvolutionFwdAlgoWinograd;GemmFwd1x1_0_1:1.03116,0,miopenConvolutionFwdAlgoGEMM;ConvBinWinogradRxSf3x2:1.4666,0,miopenConvolutionFwdAlgoWinograd
++64-352-640-3x3-64-352-640-4-1x1-1x1-1x1-0-NCHW-FP16-F=ConvWinoFuryRxS<2-3>:1.67356,0,miopenConvolutionFwdAlgoWinograd;ConvHipImplicitGemmGroupFwdXdlops:6.10387,230760448,miopenConvolutionFwdAlgoImplicitGEMM;GemmFwdRest:12.7078,259522560,miopenConvolutionFwdAlgoGEMM;ConvBinWinogradRxSf3x2:3.24782,0,miopenConvolutionFwdAlgoWinograd;ConvBinWinogradRxSf2x3g1:2.20889,0,miopenConvolutionFwdAlgoWinograd
++64-352-640-3x3-12-352-640-4-1x1-1x1-1x1-0-NCHW-FP16-F=ConvWinoFuryRxS<2-3>:0.688633,0,miopenConvolutionFwdAlgoWinograd;ConvHipImplicitGemmGroupFwdXdlops:3.104,136984064,miopenConvolutionFwdAlgoImplicitGEMM;GemmFwdRest:11.9718,259522560,miopenConvolutionFwdAlgoGEMM;ConvBinWinogradRxSf3x2:1.46551,0,miopenConvolutionFwdAlgoWinograd;ConvBinWinogradRxSf2x3g1:1.11233,0,miopenConvolutionFwdAlgoWinograd
++48-31-44-80-1x1x1-48-31-44-80-1-0x0x0-1x1x1-1x1x1-0-NCDHW-BF16-F=ConvHipImplicitGemm3DGroupFwdXdlops:0.400275,20955648,miopenConvolutionFwdAlgoImplicitGEMM;GemmFwd1x1_0_1:0.107353,0,miopenConvolutionFwdAlgoGEMM
++48-3-46-82-3x3x3-1024-1-44-80-1-0x0x0-1x1x1-1x1x1-0-NCDHW-BF16-F=ConvHipImplicitGemm3DGroupFwdXdlops:0.499842,10949632,miopenConvolutionFwdAlgoImplicitGEMM;GemmFwdRest:0.521574,9123840,miopenConvolutionFwdAlgoGEMM
++1024-3-46-82-3x3x3-1024-1-44-80-1-0x0x0-1x1x1-1x1x1-0-NCDHW-BF16-F=ConvHipImplicitGemm3DGroupFwdXdlops:8.05823,87007232,miopenConvolutionFwdAlgoImplicitGEMM;GemmFwdRest:24.0377,194641920,miopenConvolutionFwdAlgoGEMM
++1024-44-80-1x1-3072-44-80-1-0x0-1x1-1x1-0-NCHW-BF16-F=ConvHipImplicitGemmGroupFwdXdlops:2.05992,35127296,miopenConvolutionFwdAlgoImplicitGEMM;GemmFwd1x1_0_1:0.681604,0,miopenConvolutionFwdAlgoGEMM
++1024-44-80-1x1-1024-44-80-1-0x0-1x1-1x1-0-NCHW-BF16-F=ConvHipImplicitGemmGroupFwdXdlops:0.587661,16515072,miopenConvolutionFwdAlgoImplicitGEMM;GemmFwd1x1_0_1:0.231101,0,miopenConvolutionFwdAlgoGEMM
++1024-88-160-3x3-1024-88-160-1-1x1-1x1-1x1-0-NCHW-BF16-F=ConvHipImplicitGemmGroupFwdXdlops:10.9974,76546048,miopenConvolutionFwdAlgoImplicitGEMM;GemmFwdRest:21.4125,259522560,miopenConvolutionFwdAlgoGEMM
++1024-3-90-162-3x3x3-1024-1-88-160-1-0x0x0-1x1x1-1x1x1-0-NCDHW-BF16-F=ConvHipImplicitGemm3DGroupFwdXdlops:31.0633,175038464,miopenConvolutionFwdAlgoImplicitGEMM;GemmFwdRest:156.219,778567680,miopenConvolutionFwdAlgoGEMM
++1024-176-320-3x3-1024-176-320-1-1x1-1x1-1x1-0-NCHW-BF16-F=ConvHipImplicitGemmGroupFwdXdlops:45.3524,249561088,miopenConvolutionFwdAlgoImplicitGEMM;GemmFwdRest:106.065,1038090240,miopenConvolutionFwdAlgoGEMM
++1024-1-176-320-1x1x1-512-1-176-320-1-0x0x0-1x1x1-1x1x1-0-NCDHW-BF16-F=ConvHipImplicitGemm3DGroupFwdXdlops:8.37928,174063616,miopenConvolutionFwdAlgoImplicitGEMM;GemmFwd1x1_0_1:1.84473,0,miopenConvolutionFwdAlgoGEMM
++1024-3-178-322-3x3x3-512-1-176-320-1-0x0x0-1x1x1-1x1x1-0-NCDHW-BF16-F=ConvHipImplicitGemm3DGroupFwdXdlops:119.942,438132736,miopenConvolutionFwdAlgoImplicitGEMM;GemmFwdRest:199.188,3114270720,miopenConvolutionFwdAlgoGEMM
++512-3-178-322-3x3x3-512-1-176-320-1-0x0x0-1x1x1-1x1x1-0-NCDHW-BF16-F=ConvHipImplicitGemm3DGroupFwdXdlops:32.4577,247902208,miopenConvolutionFwdAlgoImplicitGEMM;GemmFwdRest:175.733,1557135360,miopenConvolutionFwdAlgoGEMM
++512-352-640-3x3-512-352-640-1-1x1-1x1-1x1-0-NCHW-BF16-F=ConvHipImplicitGemmGroupFwdXdlops:45.6636,466092032,miopenConvolutionFwdAlgoImplicitGEMM;GemmFwdRest:65.5082,2076180480,miopenConvolutionFwdAlgoGEMM
++512-1-352-640-1x1x1-256-1-352-640-1-0x0x0-1x1x1-1x1x1-0-NCDHW-BF16-F=ConvHipImplicitGemm3DGroupFwdXdlops:14.9711,346292224,miopenConvolutionFwdAlgoImplicitGEMM;GemmFwd1x1_0_1:2.0879,0,miopenConvolutionFwdAlgoGEMM
++512-3-354-642-3x3x3-256-1-352-640-1-0x0x0-1x1x1-1x1x1-0-NCDHW-BF16-F=ConvHipImplicitGemm3DGroupFwdXdlops:67.7246,820588544,miopenConvolutionFwdAlgoImplicitGEMM;GemmFwdRest:1273.88,6228541440,miopenConvolutionFwdAlgoGEMM
++256-3-354-642-3x3x3-256-1-352-640-1-0x0x0-1x1x1-1x1x1-0-NCDHW-BF16-F=ConvHipImplicitGemm3DGroupFwdXdlops:31.8559,467965952,miopenConvolutionFwdAlgoImplicitGEMM;GemmFwdRest:246.961,3114270720,miopenConvolutionFwdAlgoGEMM
++256-3-354-642-3x3x3-12-1-352-640-1-0x0x0-1x1x1-1x1x1-0-NCDHW-BF16-F=ConvHipImplicitGemm3DGroupFwdXdlops:11.5084,354656256,miopenConvolutionFwdAlgoImplicitGEMM;GemmFwdRest:250.627,3114270720,miopenConvolutionFwdAlgoGEMM
++1024-3-44-80-3x1x1-2048-1-44-80-1-0x0x0-1x1x1-1x1x1-0-NCDHW-BF16-F=ConvHipImplicitGemm3DGroupFwdXdlops:3.48329,48627712,miopenConvolutionFwdAlgoImplicitGEMM;GemmFwdRest:2.02143,21626880,miopenConvolutionFwdAlgoGEMM
++1024-88-160-3x3-1024-88-160-2-1x1-1x1-1x1-0-NCHW-BF16-F=ConvHipImplicitGemmGroupFwdXdlops:20.5062,134217728,miopenConvolutionFwdAlgoImplicitGEMM;GemmFwdRest:32.8432,259522560,miopenConvolutionFwdAlgoGEMM
++1024-4-90-162-3x3x3-1024-2-88-160-1-0x0x0-1x1x1-1x1x1-0-NCDHW-BF16-F=ConvHipImplicitGemm3DGroupFwdXdlops:80.9639,233734144,miopenConvolutionFwdAlgoImplicitGEMM;GemmFwdRest:403.986,1557135360,miopenConvolutionFwdAlgoGEMM
++1024-4-88-160-3x1x1-2048-2-88-160-1-0x0x0-1x1x1-1x1x1-0-NCDHW-BF16-F=ConvHipImplicitGemm3DGroupFwdXdlops:26.2698,243269632,miopenConvolutionFwdAlgoImplicitGEMM;GemmFwdRest:18.8993,173015040,miopenConvolutionFwdAlgoGEMM
++1024-176-320-3x3-1024-176-320-4-1x1-1x1-1x1-0-NCHW-BF16-F=ConvHipImplicitGemmGroupFwdXdlops:194.931,941621248,miopenConvolutionFwdAlgoImplicitGEMM;GemmFwdRest:386.395,1038090240,miopenConvolutionFwdAlgoGEMM
++1024-4-176-320-1x1x1-512-4-176-320-1-0x0x0-1x1x1-1x1x1-0-NCDHW-BF16-F=ConvHipImplicitGemm3DGroupFwdXdlops:59.042,693108736,miopenConvolutionFwdAlgoImplicitGEMM;GemmFwd1x1_0_1:7.99749,0,miopenConvolutionFwdAlgoGEMM
++1024-6-178-322-3x3x3-512-4-176-320-1-0x0x0-1x1x1-1x1x1-0-NCDHW-BF16-F=ConvHipImplicitGemm3DGroupFwdXdlops:317.385,963297280,miopenConvolutionFwdAlgoImplicitGEMM;GemmFwdRest:2372,12457082880,miopenConvolutionFwdAlgoGEMM
++512-6-178-322-3x3x3-512-4-176-320-1-0x0x0-1x1x1-1x1x1-0-NCDHW-BF16-F=ConvHipImplicitGemm3DGroupFwdXdlops:121.123,596992000,miopenConvolutionFwdAlgoImplicitGEMM;GemmFwdRest:822.772,6228541440,miopenConvolutionFwdAlgoGEMM
++512-352-640-3x3-512-352-640-4-1x1-1x1-1x1-0-NCHW-BF16-F=ConvHipImplicitGemmGroupFwdXdlops:255.947,1850212352,miopenConvolutionFwdAlgoImplicitGEMM;GemmFwdRest:233.115,2076180480,miopenConvolutionFwdAlgoGEMM
++512-4-352-640-1x1x1-256-4-352-640-1-0x0x0-1x1x1-1x1x1-0-NCDHW-BF16-F=ConvHipImplicitGemm3DGroupFwdXdlops:96.0406,1384382464,miopenConvolutionFwdAlgoImplicitGEMM;GemmFwd1x1_0_1:7.79514,0,miopenConvolutionFwdAlgoGEMM
++512-6-354-642-3x3x3-256-4-352-640-1-0x0x0-1x1x1-1x1x1-0-NCDHW-BF16-F=ConvHipImplicitGemm3DGroupFwdXdlops:344.905,1864785920,miopenConvolutionFwdAlgoImplicitGEMM;GemmFwdRest:6402.75,24914165760,miopenConvolutionFwdAlgoGEMM
++256-6-354-642-3x3x3-256-4-352-640-1-0x0x0-1x1x1-1x1x1-0-NCDHW-BF16-F=ConvHipImplicitGemm3DGroupFwdXdlops:127.627,1163079680,miopenConvolutionFwdAlgoImplicitGEMM;GemmFwdRest:2332.4,12457082880,miopenConvolutionFwdAlgoGEMM
++256-6-354-642-3x3x3-12-4-352-640-1-0x0x0-1x1x1-1x1x1-0-NCDHW-BF16-F=ConvHipImplicitGemm3DGroupFwdXdlops:36.895,719960064,miopenConvolutionFwdAlgoImplicitGEMM;GemmFwdRest:1856.97,12457082880,miopenConvolutionFwdAlgoGEMM
+diff --git a/studio/backend/core/inference/rocm_miopen_db/gfx1151_torch2.11.0_hip714_win_wan22ti2v5b/manifest.json b/studio/backend/core/inference/rocm_miopen_db/gfx1151_torch2.11.0_hip714_win_wan22ti2v5b/manifest.json
+new file mode 100644
+index 0000000000..84d7066449
+--- /dev/null
++++ b/studio/backend/core/inference/rocm_miopen_db/gfx1151_torch2.11.0_hip714_win_wan22ti2v5b/manifest.json
+@@ -0,0 +1,14 @@
++{
++ "stack": {
++  "arch": "gfx1151",
++  "torch": "2.11.0+rocm7.14.0",
++  "hip": "7.14.60850",
++  "miopen": "3005002",
++  "platform": "win32"
++ },
++ "files": [
++  "gfx1151_20.HIP.3_5_2_cd957402.ufdb.txt",
++  "gfx1151_20.HIP.3_5_2_cd957402.udb.txt"
++ ],
++ "measured": "Wan2.2-TI2V-5B 1280x704x121 decode 141.6 -> 120.1 s (Radeon 8060S, Windows 11, AMD CI)"
++}
+diff --git a/studio/backend/tests/test_diffusion_rocm_miopen_db.py b/studio/backend/tests/test_diffusion_rocm_miopen_db.py
+new file mode 100644
+index 0000000000..74304fc72e
+--- /dev/null
++++ b/studio/backend/tests/test_diffusion_rocm_miopen_db.py
+@@ -0,0 +1,258 @@
++# SPDX-License-Identifier: AGPL-3.0-only
++# Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
++
++"""Shipped ROCm MIOpen db for diffusion VAEs: exact-stack match, opt-out, release restores (no GPU)."""
++
++from __future__ import annotations
++
++import json
++import re
++import types
++from pathlib import Path
++
++import pytest
++
++torch = pytest.importorskip("torch")
++
++from core.inference import diffusion_rocm_miopen_db as md  # noqa: E402
++
++STACK = {
++    "arch": "gfx1151",
++    "torch": "2.11.0+rocm7.14.0",
++    "hip": "7.14.60850-fake",
++    "miopen": "3005002",
++    "platform": "win32",
++}
++DB_NAME = "gfx1151_20.HIP.3_5_2_cd957402"
++
++
++def _ship(root: Path, name: str = "gfx1151_win_test", stack: dict = STACK, files: tuple = ("ufdb", "udb")) -> Path:
++    d = root / name
++    d.mkdir(parents = True)
++    names = []
++    for kind in files:
++        f = d / f"{DB_NAME}.{kind}.txt"
++        f.write_text(f"{kind}-record=Solver:1.0\n", encoding = "utf-8")
++        names.append(f.name)
++    (d / md.MANIFEST).write_text(json.dumps({"stack": stack, "files": names, "measured": "test"}), encoding = "utf-8")
++    return d
++
++
++@pytest.fixture
++def env(monkeypatch, tmp_path):
++    monkeypatch.setattr(md, "is_rocm_torch", lambda _t: True)
++    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
++    monkeypatch.setattr(md, "_arch", lambda device = None: "gfx1151")
++    monkeypatch.setattr(md, "_device_count", lambda _t: 1)
++    monkeypatch.setattr(md, "current_stack", lambda arch: dict(STACK, arch = arch))
++    monkeypatch.setattr(md, "_DB_DIR", tmp_path / "shipped")
++    monkeypatch.setenv("UNSLOTH_DIFFUSION_COMPILE_CACHE_DIR", str(tmp_path / "cache"))
++    for k in [k for k in __import__("os").environ if k.startswith("MIOPEN_")] + [md.MIOPEN_DB_ENV]:
++        monkeypatch.delenv(k, raising = False)
++    md._STATE["owners"].clear()
++    md._STATE.update(active = False, path = None, snapshot = md._UNSET, db = None)
++    yield tmp_path
++    md._STATE["owners"].clear()
++    md._STATE.update(active = False, path = None, snapshot = md._UNSET, db = None)
++
++
++def _pipe():
++    return types.SimpleNamespace(vae = object())
++
++
++def test_matching_db_is_seeded_and_release_restores(env, monkeypatch):
++    import os
++
++    _ship(env / "shipped")
++    pipe = _pipe()
++    assert md.install_for_pipe(pipe)
++    dest = Path(os.environ[md.USER_DB_ENV])
++    assert dest == env / "cache" / "miopen_db" / "gfx1151_win_test"
++    assert (dest / f"{DB_NAME}.ufdb.txt").read_text(encoding = "utf-8") == "ufdb-record=Solver:1.0\n"
++    assert md.is_active()
++    md.release(pipe)
++    assert md.USER_DB_ENV not in os.environ
++    assert not md.is_active()
++
++
++@pytest.mark.parametrize("key", md.STACK_KEYS)
++def test_any_stack_difference_leaves_miopen_alone(env, key):
++    import os
++
++    _ship(env / "shipped", stack = dict(STACK, **{key: "other"}))
++    assert not md.install_for_pipe(_pipe())
++    assert md.USER_DB_ENV not in os.environ
++
++
++@pytest.mark.parametrize("key", md.STACK_KEYS)
++def test_a_manifest_missing_a_key_never_matches(env, key):
++    stack = {k: v for k, v in STACK.items() if k != key}
++    _ship(env / "shipped", stack = stack)
++    assert md.shipped_db(STACK) is None
++
++
++def test_a_manifest_naming_a_missing_file_never_matches(env):
++    d = _ship(env / "shipped")
++    (d / f"{DB_NAME}.udb.txt").unlink()
++    assert md.shipped_db(STACK) is None
++
++
++@pytest.mark.parametrize(
++    "var,value",
++    [
++        (md.USER_DB_ENV, "/home/u/my_db"),
++        ("MIOPEN_FIND_MODE", "1"),
++        ("MIOPEN_FIND_ENFORCE", "4"),
++        (md.MIOPEN_DB_ENV, "0"),
++    ],
++)
++def test_user_settings_and_opt_out_decline(env, monkeypatch, var, value):
++    import os
++
++    _ship(env / "shipped")
++    monkeypatch.setenv(var, value)
++    assert not md.install_for_pipe(_pipe())
++    assert os.environ.get(md.USER_DB_ENV) == (value if var == md.USER_DB_ENV else None)
++
++
++def test_opting_out_after_a_load_restores_on_the_next_load(env, monkeypatch):
++    import os
++
++    _ship(env / "shipped")
++    assert md.install_for_pipe(_pipe())
++    monkeypatch.setenv(md.MIOPEN_DB_ENV, "0")
++    assert not md.install_for_pipe(_pipe())
++    assert md.USER_DB_ENV not in os.environ and not md.is_active()
++
++
++@pytest.mark.parametrize("case", ["cuda", "arch", "mixed"])
++def test_non_matching_hosts_decline(env, monkeypatch, case):
++    import os
++
++    _ship(env / "shipped")
++    if case == "cuda":
++        monkeypatch.setattr(md, "is_rocm_torch", lambda _t: False)
++    elif case == "arch":
++        monkeypatch.setattr(md, "_arch", lambda device = None: "gfx1100")
++    else:
++        monkeypatch.setattr(md, "_device_count", lambda _t: 2)
++        monkeypatch.setattr(md, "_arch", lambda device = None: "gfx1100" if device == 1 else "gfx1151")
++    assert not md.install_for_pipe(_pipe())
++    assert md.USER_DB_ENV not in os.environ
++
++
++def test_the_last_release_restores(env):
++    import os
++
++    _ship(env / "shipped")
++    a, b = _pipe(), _pipe()
++    assert md.install_for_pipe(a) and md.install_for_pipe(b)
++    md.release(a)
++    assert os.environ.get(md.USER_DB_ENV) and md.is_active()
++    md.release(b)
++    assert md.USER_DB_ENV not in os.environ
++
++
++def test_seeded_dir_keeps_miopen_records_until_the_shipped_db_changes(env):
++    import os
++
++    d = _ship(env / "shipped")
++    p = _pipe()
++    assert md.install_for_pipe(p)
++    dest = Path(os.environ[md.USER_DB_ENV]) / f"{DB_NAME}.ufdb.txt"
++    dest.write_text(dest.read_text(encoding = "utf-8") + "appended=X:2.0\n", encoding = "utf-8")
++    md.release(p)
++    p = _pipe()
++    assert md.install_for_pipe(p)
++    assert "appended" in dest.read_text(encoding = "utf-8")
++    md.release(p)
++    (d / f"{DB_NAME}.ufdb.txt").write_text("ufdb-record=Solver:0.5\n", encoding = "utf-8")
++    assert md.install_for_pipe(_pipe())
++    assert dest.read_text(encoding = "utf-8") == "ufdb-record=Solver:0.5\n"
++
++
++def test_a_crlf_checkout_is_seeded_with_lf(env):
++    import os
++
++    d = _ship(env / "shipped")
++    f = d / f"{DB_NAME}.ufdb.txt"
++    f.write_bytes(b"a=X:1.0\r\nb=Y:2.0\r\n")
++    assert md.install_for_pipe(_pipe())
++    assert (Path(os.environ[md.USER_DB_ENV]) / f.name).read_bytes() == b"a=X:1.0\nb=Y:2.0\n"
++
++
++def test_a_vanished_pipe_releases_its_claim(env):
++    import gc
++    import os
++
++    _ship(env / "shipped")
++
++    class Pipe:
++        pass
++
++    p = Pipe()
++    assert md.install_for_pipe(p)
++    del p
++    gc.collect()
++    assert md.USER_DB_ENV not in os.environ
++
++
++def test_speed_layer_installs_on_rocm_tiers_and_removes_on_off(monkeypatch):
++    from torch import nn
++
++    from core.inference import diffusion_rocm_tunableop as rt
++    from core.inference import diffusion_speed as ds
++
++    seen = []
++    monkeypatch.setattr(rt, "install_for_pipe", lambda pipe, device = None, logger = None: None)
++    monkeypatch.setattr(rt, "uninstall", lambda pipe = None: None)
++    monkeypatch.setattr(md, "install_for_pipe", lambda pipe, device = None, logger = None: seen.append("install"))
++    monkeypatch.setattr(md, "uninstall", lambda pipe = None: seen.append("uninstall"))
++    pipe = types.SimpleNamespace(transformer = nn.Linear(2, 2), vae = None)
++    rocm = types.SimpleNamespace(backend = "rocm", device = "cuda", dtype = torch.bfloat16)
++    ds.apply_speed_optims(pipe, rocm, is_gguf = False, family = None, speed_mode = "off")
++    assert seen == ["uninstall"]
++    cuda = types.SimpleNamespace(backend = "cuda", device = "cuda", dtype = torch.bfloat16)
++    ds.apply_speed_optims(pipe, cuda, is_gguf = False, family = None, speed_mode = "off")
++    assert seen == ["uninstall"]
++
++
++def test_unload_releases_the_miopen_db_claim(env):
++    import os
++
++    from core.inference import diffusion_speed as ds
++
++    _ship(env / "shipped")
++    pipe = _pipe()
++    assert md.install_for_pipe(pipe)
++    ds.release_rocm_tunableop(pipe)
++    assert md.USER_DB_ENV not in os.environ
++
++
++_MIOPEN_FILE = re.compile(r"^(gfx[0-9a-f]+)_\d+\.HIP\.\d+_\d+_\d+_[0-9a-f]+\.u(f)?db\.txt$")
++
++
++def test_shipped_dbs_are_well_formed():
++    dirs = sorted(p for p in md._DB_DIR.iterdir() if p.is_dir())
++    assert dirs, "no shipped MIOpen db"
++    for d in dirs:
++        m = md._manifest(d)
++        stack = m.get("stack") or {}
++        assert all(stack.get(k) for k in md.STACK_KEYS), d.name
++        assert stack["arch"] in md.TUNED_ARCHES and d.name.startswith(stack["arch"] + "_")
++        files = md._db_files(d, m)
++        assert files, d.name
++        kinds = set()
++        for f in files:
++            mt = _MIOPEN_FILE.match(f.name)
++            assert mt and mt.group(1) == stack["arch"], f.name
++            kinds.add(f.name.rsplit(".", 2)[-2])
++            for line in f.read_text(encoding = "utf-8").splitlines():
++                assert "=" in line, (f.name, line)
++        assert "ufdb" in kinds, d.name
++
++
++def test_shipped_dbs_are_package_data():
++    root = Path(md.__file__).resolve().parents[4]
++    text = (root / "pyproject.toml").read_text(encoding = "utf-8")
++    assert '"backend/core/inference/rocm_miopen_db/*/*"' in text
