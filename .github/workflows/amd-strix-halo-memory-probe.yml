@@ -1,0 +1,70 @@
+name: Strix Halo GGUF memory comparison
+
+on:
+  push:
+    branches: [fix/strix-halo-8060s-memory-probe]
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    name: Linux 8060S (${{ matrix.backend }})
+    runs-on: [self-hosted, Linux, strix-halo, devlab-dispatch]
+    concurrency:
+      group: amd-ci-gfx1151-gpu
+      cancel-in-progress: false
+    strategy:
+      fail-fast: false
+      matrix:
+        backend: [vulkan, hip]
+    timeout-minutes: 55
+    env:
+      UNSLOTH_REF: a9dd3e1be3c15231b25882b2dafbba54b187216d
+      UNSLOTH_LLAMA_CPP_BACKEND: ${{ matrix.backend }}
+      UNSLOTH_SKIP_AUTOSTART: '1'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Prepare isolated installation and pinned GGUF
+        shell: bash
+        run: |
+          set -euo pipefail
+          work="$(mktemp -d "$RUNNER_TEMP/strix-memory.XXXXXX")"
+          echo "PROBE_WORK=$work" >> "$GITHUB_ENV"
+          mkdir -p "$work"/{out,tmp,home,hf}
+          export HOME="$work/home" HF_HOME="$work/hf" TMPDIR="$work/tmp"
+          export UNSLOTH_HOME="$HOME/.unsloth" UNSLOTH_STUDIO_HOME="$HOME/.unsloth/studio"
+          git init -q "$work/source"
+          git -C "$work/source" fetch --depth=1 https://github.com/unslothai/unsloth "$UNSLOTH_REF"
+          git -C "$work/source" checkout -q --detach FETCH_HEAD
+          (cd "$work/source"; ./install.sh --local) > "$work/out/install.log" 2>&1 || {
+            tail -80 "$work/out/install.log"
+            exit 1
+          }
+          tail -15 "$work/out/install.log"
+          file=Qwen3.8-27B-UD-Q4_K_XL.gguf
+          curl -fsSL --retry 3 --retry-all-errors --max-time 1200 \
+            "https://huggingface.co/unsloth/Qwen3.8-27B-GGUF/resolve/be8e54148befbe990c6daeed4aecf9ac4540b840/$file" \
+            -o "$work/$file"
+          echo "3f227079003add2511437e5b1e94812e363385225bf6a9b47b0054a72bc8b01e  $work/$file" | sha256sum -c
+      - name: Compare automatic Unsloth load with standalone llama.cpp
+        shell: bash
+        run: |
+          set -euo pipefail
+          export HOME="$PROBE_WORK/home" HF_HOME="$PROBE_WORK/hf" TMPDIR="$PROBE_WORK/tmp"
+          export UNSLOTH_HOME="$HOME/.unsloth" UNSLOTH_STUDIO_HOME="$HOME/.unsloth/studio"
+          "$UNSLOTH_STUDIO_HOME/unsloth_studio/bin/python" \
+            .github/scripts/strix-memory-probe.py "$PROBE_WORK"
+      - name: Upload memory and offload evidence
+        if: always() && env.PROBE_WORK != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: strix-halo-memory-${{ matrix.backend }}
+          path: ${{ env.PROBE_WORK }}/out
+      - name: Remove isolated files
+        if: always() && env.PROBE_WORK != ''
+        shell: bash
+        run: |
+          case "$PROBE_WORK" in "$RUNNER_TEMP"/strix-memory.*) rm -rf -- "$PROBE_WORK";; esac
