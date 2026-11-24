@@ -1,0 +1,168 @@
+name: "AMD CI: validate PR 19172"
+
+# Generated from amd_ci/templates/workflow.yml. Edit the PROBE and CRITERIA env
+# values, and the tests/args, rather than the plumbing.
+#
+# Two jobs, because two jobs of this workflow may land on the SAME machine and
+# then share its one GPU:
+#   suites  masks the GPU, so it cannot perturb a measurement running beside it
+#   gpu     is the only job allowed to allocate, and is serialised against every
+#           other run of the same concurrency group
+#
+# They may equally land on different machines: the Linux pool is at least seven
+# (a 24-way matrix ran essentially concurrently across seven distinct hosts).
+# Nothing is shared between them, including the Docker image cache, so a job that
+# pulls an image does not make it available to the next one.
+#
+# This is the LINUX template. For the Windows boxes use
+# `scaffold.py --windows`, which emits templates/workflow_windows.yml.
+#
+# If your change needs no GPU measurement, delete the gpu job. If it needs no
+# test suites, delete suites. Do not delete the gate: it fails rather than
+# skipping, because a skip misreports missing hardware as nothing to see.
+
+on:
+  push:
+    branches: [amd-ci-m21-a14b-lnx]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  PR: "19172"
+  UPSTREAM: "https://github.com/unslothai/unsloth"
+  # Set to "1" for a PR already merged: compares the merge commit to its parent.
+  MERGED: "1"
+  # Set by scaffold.py --patch: base = PATCH_BASE, head = PATCH_BASE plus this diff (relative to the checkout).
+  PATCH_BASE: ""
+  PATCH_FILE: ""
+  PATCH_SHA256: ""
+
+jobs:
+
+  gpu:
+    name: "PR 19172 GPU measurement (exclusive)"
+    runs-on: [self-hosted, Linux, strix-halo, devlab-dispatch]
+    timeout-minutes: 600
+    # A shared constant, deliberately: it serialises every GPU measurement across
+    # all branches. That is stricter than co-tenancy strictly requires now that the
+    # pool is many machines, but nothing in the label set can pin or exclude a
+    # machine, so "two GPU jobs never run at once" is the only enforceable version
+    # of "no co-tenant moved my number".
+    # The cost is that the group holds one runner plus one waiter,
+    # so a third arrival evicts the waiter. `cancel-in-progress: false` protects
+    # the job already running, not the one queued behind it. Re-run the job.
+    concurrency:
+      group: amd-ci-gfx1151-gpu
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+        with: { persist-credentials: false }
+
+      - name: Preamble
+        run: |
+          source amd_ci/lib/preamble.sh "pr19172-gpu"
+
+      - name: Hardware gate
+        run: |
+          set -euo pipefail
+          python3 amd_ci/lib/gate.py --no-torch --require rocm gpu \
+            --expect-arch gfx1151 --min-gpus 1 \
+            --out "$AMD_CI_WORK/out/host.json" || \
+          echo "note: gate ran before the venv exists; re-gated after install below"
+
+      - name: Resolve states
+        run: |
+          set -euo pipefail
+          ARGS=""
+          [ "$MERGED" = "1" ] && ARGS="--merged"
+          if [ -n "$PATCH_FILE" ]; then ARGS="--patch-base $PATCH_BASE --patch $GITHUB_WORKSPACE/$PATCH_FILE --patch-sha256 $PATCH_SHA256"; fi
+          python3 amd_ci/lib/states.py --repo "$UPSTREAM" --pr "$PR" $ARGS \
+            --root "$AMD_CI_WORK" --out "$AMD_CI_WORK/out/states.json"
+
+      - name: Environment and real gate
+        timeout-minutes: 60
+        run: |
+          set -euo pipefail
+          cd "$AMD_CI_WORK/states/head"
+          export UNSLOTH_STUDIO_HOME="$AMD_CI_WORK/studio"
+          echo "UNSLOTH_STUDIO_HOME=$UNSLOTH_STUDIO_HOME" >> "$GITHUB_ENV"
+          # The runners' uv index (/etc/uv/uv.toml) is a PyPI mirror that lags new releases, so a
+          # tree pinning the newest unsloth fails to resolve. pip.conf already adds pypi.org as an
+          # extra index; give uv the same. A global UV_EXCLUDE_NEWER is NOT a substitute: it drops
+          # the ROCm torch index, whose wheels carry no upload time.
+          export UV_EXTRA_INDEX_URL="https://pypi.org/simple"
+          set +e
+          bash install.sh --local 2>&1 | tail -15
+          rc=${PIPESTATUS[0]}
+          set -e
+          [ "$rc" -eq 0 ] || exit "$rc"
+          V=""
+          for c in "$UNSLOTH_STUDIO_HOME"/unsloth_studio "$UNSLOTH_STUDIO_HOME"/.venv_t5_*; do
+            [ -x "$c/bin/python" ] && { V="$c"; break; }
+          done
+          [ -n "$V" ] || { echo "FATAL: no Studio venv"; exit 1; }
+          echo "AMD_CI_PY=$V/bin/python" >> "$GITHUB_ENV"
+          # Now with torch present, the gate is meaningful. It EXITS 1 on a miss.
+          # Absolute path: this step cd'd into the head worktree, which has no amd_ci/.
+          "$V/bin/python" -m pip install -q --no-deps lpips > "$AMD_CI_WORK/out/lpips_install.log" 2>&1 || true
+          "$V/bin/python" -c "import torch, diffusers, transformers; print(torch.__version__, torch.version.hip, diffusers.__version__, transformers.__version__)"
+          "$V/bin/python" "$GITHUB_WORKSPACE/amd_ci/lib/gate.py" --require rocm gpu \
+            --expect-arch gfx1151 --min-gpus 1 --out "$AMD_CI_WORK/out/host.json"
+
+
+      - name: "M21 network and disk (configured HF endpoint vs the Hub, no token)"
+        timeout-minutes: 20
+        run: |
+          set +e
+          HEAD_TREE=$(python3 -c "import json,sys; print(json.load(open(sys.argv[1]))['paths']['head'])" "$AMD_CI_WORK/out/states.json")
+          export HF_HOME="$AMD_CI_WORK/hf_home" HF_XET_HIGH_PERFORMANCE=1
+          unset HF_TOKEN HUGGING_FACE_HUB_TOKEN
+          mkdir -p "$AMD_CI_WORK/out/net"
+          df -h "$AMD_CI_WORK" | tail -1; free -g | head -2
+          "$AMD_CI_PY" -m pip install -q psutil > /dev/null 2>&1
+          :
+          "$AMD_CI_PY" "$GITHUB_WORKSPACE/amd_ci/probes/mq_probe.py" net --backend "$HEAD_TREE/studio/backend" \
+            --out "$AMD_CI_WORK/out/net/obs.json" --out-dir "$AMD_CI_WORK/out/net" \
+            --work "$AMD_CI_WORK/mq_work"  > "$AMD_CI_WORK/out/net/probe.log" 2>&1
+          echo "probe exit $?"
+          tail -40 "$AMD_CI_WORK/out/net/probe.log"
+          df -h "$AMD_CI_WORK" | tail -1
+          exit 0
+
+      - name: "M21 Wan2.2-T2V-A14B: prefetch (long timeouts, retries), then Studio default load + render"
+        timeout-minutes: 560
+        run: |
+          set +e
+          HEAD_TREE=$(python3 -c "import json,sys; print(json.load(open(sys.argv[1]))['paths']['head'])" "$AMD_CI_WORK/out/states.json")
+          export HF_HOME="$AMD_CI_WORK/hf_home" HF_XET_HIGH_PERFORMANCE=1
+          unset HF_TOKEN HUGGING_FACE_HUB_TOKEN
+          mkdir -p "$AMD_CI_WORK/out/m21"
+          df -h "$AMD_CI_WORK" | tail -1; free -g | head -2
+          "$AMD_CI_PY" -m pip install -q psutil > /dev/null 2>&1
+          EP=$(python3 -c "import json,sys; d=json.load(open(sys.argv[1])); h=d.get('hub',{}); c=d.get('configured',{}); print('https://huggingface.co' if (not h.get('dl_error')) and h.get('mb_per_s',0) > 1.5*max(c.get('mb_per_s',0),1) else '')" "$AMD_CI_WORK/out/net/obs.json" 2>/dev/null); if [ -n "$EP" ]; then export HF_ENDPOINT="$EP"; fi; echo "HF_ENDPOINT=${HF_ENDPOINT:-unset}"
+          "$AMD_CI_PY" "$GITHUB_WORKSPACE/amd_ci/probes/mq_probe.py" m21 --backend "$HEAD_TREE/studio/backend" \
+            --out "$AMD_CI_WORK/out/m21/obs.json" --out-dir "$AMD_CI_WORK/out/m21" \
+            --work "$AMD_CI_WORK/mq_work" --arms "$GITHUB_WORKSPACE/amd_ci/arms/m21.json" --prefetch '[{"repo": "unsloth/Wan2.2-T2V-A14B-FP8", "allow": ["transformer/*", "transformer_2/*", "vae/*", "tokenizer/*", "scheduler/*", "model_index.json", "Wan2.2-T2V-A14B-INT8*.pt"]}, {"repo": "unsloth/Wan2.2-TI2V-5B-FP8", "allow": ["Wan2.2-TI2V-5B-text_encoder-FP8.safetensors", "tokenizer/*", "text_encoder/config.json"]}]' --prefetch-min 240 --hf-timeout 120 --arm-timeout 12600 > "$AMD_CI_WORK/out/m21/probe.log" 2>&1
+          echo "probe exit $?"
+          tail -40 "$AMD_CI_WORK/out/m21/probe.log"
+          df -h "$AMD_CI_WORK" | tail -1
+          exit 0
+
+      - name: Stop anything this job started
+        if: always()
+        run: |
+          set +e
+          W="${AMD_CI_WORK:-}"
+          [ -n "$W" ] && [ ${#W} -ge 8 ] || { echo "no AMD_CI_WORK root"; exit 0; }
+          for p in $(pgrep -f -- "mq/(wan_arm|sentinel).py" || true); do [ "$p" != "$$" ] && kill -9 "$p" 2>/dev/null; done
+          exit 0
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: m21-a14b-lnx
+          path: ${{ env.AMD_CI_WORK }}/out
+          retention-days: 7
+          if-no-files-found: warn
