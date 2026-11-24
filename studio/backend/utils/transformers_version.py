@@ -573,6 +573,37 @@ def latest_tier_active_for(model_name: str, hf_token: str | None = None) -> bool
         return False
 
 
+# Latest-sidecar architectures whose bnb 4-bit load Unsloth core validates, so they keep QLoRA.
+LATEST_TIER_4BIT_MODEL_TYPES = frozenset(
+    {"inkling2", "inkling2_text", "inkling2_loop", "inkling2_loop_text"}
+)
+
+
+def latest_tier_keeps_4bit(model_type) -> bool:
+    return isinstance(model_type, str) and model_type in LATEST_TIER_4BIT_MODEL_TYPES
+
+
+def latest_tier_forces_16bit(model_name: str, hf_token: str | None = None) -> bool:
+    """latest_tier_active_for, minus architectures validated in 4-bit; never raises."""
+    if not latest_tier_active_for(model_name, hf_token):
+        return False
+    try:
+        if _is_lora_adapter_dir(Path(model_name)):
+            resolved = _resolve_base_model(model_name)
+        else:
+            resolved = _remote_lora_base(model_name, hf_token = hf_token) or model_name
+        cfg = _load_config_json(resolved, hf_token)
+        if not isinstance(cfg, dict):
+            return True
+        # A bnb-quantized checkpoint loads 4-bit from its own config whatever the flag says.
+        quant = cfg.get("quantization_config")
+        if isinstance(quant, dict) and quant.get("quant_method") == "bitsandbytes":
+            return False
+        return not any(latest_tier_keeps_4bit(t) for t in _model_types_from_config(cfg))
+    except Exception:
+        return True
+
+
 def _has_adapter_weights(path: Path) -> bool:
     """True if *path* holds LoRA adapter weight files (``adapter_model.*``)."""
     try:
