@@ -73,7 +73,7 @@ function Build-Tree($src, $bdir, $name, $static) {
 $TREES = Get-Content -Encoding utf8 "$J\TREES"
 $I3C = (($TREES | Where-Object { $_.StartsWith("i3 ") }) -split " ")[1]
 $TARGS = @()
-foreach ($spec in @("fx:fx:0", "d6:d6:0", "rpf:rpf:1", "fxs:fx:1")) {
+foreach ($spec in @("rpf:rpf:1", "fxs:fx:1")) {
   $n, $src, $st = $spec -split ":"
   $S = "$W\s_$src"
   if (-not (Test-Path "$S\.git")) {
@@ -100,7 +100,7 @@ foreach ($spec in @("fx:fx:0", "d6:d6:0", "rpf:rpf:1", "fxs:fx:1")) {
 }
 & $PY -c "import gzip,shutil,sys; shutil.copyfileobj(gzip.open(sys.argv[1]), open(sys.argv[2],'wb'))" "$W\s_fx\ci\tiny-qwen3moe-f16.gguf.gz" "$W\tiny-qwen3moe-f16.gguf"
 $env:PATH = "$ROCM\bin;$env:PATH"
-& $PY -u "$J\run.py" --out $OUT @TARGS --ctest fx,d6,rpf,fxs --ctest-replay fxs --tbo fx,d6 --replay fxs,rpf --smoke fx,d6 `
+& $PY -u "$J\run.py" --out $OUT @TARGS --llctx-test "replay|rollback|k19_|shared|capture|swa_prepare" --llctx fxs:0:sel,fxs:1:sel,rpf:auto:sel,rpf:spill:sel,fxs:auto:all `
   --models "$W\s_fx\build_fxs\tests\test-models" --tinymoe "$W\tiny-qwen3moe-f16.gguf" *> "$OUT\run.txt"
 Get-Content "$OUT\run.txt" -Tail 60
 if (-not (Test-Path "$OUT\rows.jsonl")) { exit 1 }

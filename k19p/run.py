@@ -20,6 +20,8 @@ ap.add_argument("--smoke", default="")
 ap.add_argument("--models", default="", help="dir of generated test models (default: <first replay tree build>/tests/test-models)")
 ap.add_argument("--tinymoe", default="")
 ap.add_argument("--ctest-j", default="8")
+ap.add_argument("--llctx", default="", help="tree:mode,... test-llama-context --models without GGML_SCHED_DEBUG_REALLOC (mode auto / spill / 0 / 1)")
+ap.add_argument("--llctx-test", default="", help="--test regex for the llctx runs ('' = every case)")
 a = ap.parse_args()
 OUT = a.out; LOG = os.path.join(OUT, "logs"); os.makedirs(LOG, exist_ok=True)
 T = {}
@@ -182,6 +184,25 @@ for n in lst(a.replay):
     if not models:
         models = os.path.join(T[n][0], "tests", "test-models")
     replay(n, models)
+def llctx(name, mode, models, rx):
+    _, d = T[name]
+    if not os.path.exists(os.path.join(models, "qwen35-dense.gguf")):   # this tree's own generator (fixed seed)
+        os.makedirs(models, exist_ok=True)
+        rc, s_, _ = run([os.path.join(d, "test-llama-archs" + EXE), "-s", "1234", "-o", models + os.sep], os.path.join(LOG, "genmodels_%s.log" % name), cwd=d, timeout=1800)
+        row(kind="genmodels", tree=name, rc=rc, wall_s=s_, n=len(os.listdir(models)))
+    env = {} if mode == "auto" else {"LLAMA_RS_REPLAY": mode}
+    tag = "%s_%s_%s" % (name, mode, "all" if not rx else "sel")
+    cmd = [os.path.join(d, "test-llama-context" + EXE), "--models", models + os.sep] + (["--test", rx] if rx else [])
+    rc, s_, txt = run(cmd, os.path.join(LOG, "llctx2_%s.log" % tag), env=env, cwd=d, timeout=5400)
+    row(kind="llctx", tree=name, mode=mode, test=rx, rc=rc, wall_s=s_, rollback=sorted(set(re.findall(r"delta-net rollback: (\S+(?: rows)?)", txt))),
+        n_replay_lines=len(re.findall(r"delta-net rollback: replay", txt)),
+        fails=sorted(set(re.findall(r"[^\n]*(?:FAIL|abort|Assertion|unexpected graph realloc)[^\n]*", txt)))[:20], tail=txt[-1500:])
+
+
 for n in lst(a.smoke):
     smoke(n, a.tinymoe)
+for spec in [x for x in a.llctx.split(",") if x]:
+    n, m, which = spec.split(":")   # tree:mode:sel|all
+    if n in T:
+        llctx(n, m, os.path.join(T[n][0], "tests", "test-models"), a.llctx_test if which == "sel" else "")
 row(kind="done")
