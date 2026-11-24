@@ -3124,12 +3124,15 @@ def rocm_windows_free_is_untrusted() -> bool:
 
 
 def trusted_mem_get_info(device: Any = None, *, module: Any = None) -> tuple[int, int]:
-    """``mem_get_info`` with the Windows ROCm free over-report capped (#8403). Guards that budget against free VRAM cannot be handed a figure saying the whole card is free while a model is resident: on WDDM the overflow does not raise, the driver satisfies it from host RAM, and the process grows past the card. Free is capped at what this process's torch allocator has NOT reserved, a true upper bound but still blind to other processes, so a ceiling rather than a measurement. Off Windows ROCm the driver's own numbers pass through untouched. ``module`` defaults to torch.cuda; exceptions propagate."""
+    """``mem_get_info`` with ROCm's free over-report capped. Linux: at the kernel DRM figure, which also counts Vulkan users and the desktop that hipMemGetInfo misses. Windows (#8403): WDDM overflows into host RAM instead of raising, so free is capped at what torch has not reserved, an upper bound blind to other processes. ``module`` defaults to torch.cuda; exceptions propagate."""
     import torch
 
     mod = module if module is not None else torch.cuda
     free_bytes, total_bytes = mod.mem_get_info() if device is None else mod.mem_get_info(device)
     free_bytes, total_bytes = int(free_bytes), int(total_bytes)
+    kernel_free_mib = rocm_linux_kernel_free_mib(device, module = mod)
+    if kernel_free_mib is not None:
+        free_bytes = min(free_bytes, kernel_free_mib * 1024 * 1024)
     if not rocm_windows_free_is_untrusted():
         return free_bytes, total_bytes
     try:
@@ -4253,7 +4256,7 @@ def _rocm_linux_sysfs_vram_by_pci_gb() -> dict[str, tuple[float, float]]:
 
 
 def rocm_linux_kernel_free_mib(device: Any = None, *, module: Any = None) -> Optional[int]:
-    """Free MiB of a ROCm device per DRM sysfs, which counts the Vulkan users and desktop hipMemGetInfo misses on Linux, or None. Matched by PCI address; a sysfs total off torch's by >10% (APU carve-out, partitioned card) is another scope. Never raises."""
+    """Free MiB of a ROCm device per DRM sysfs (counts Vulkan users and the desktop), or None. Matched by PCI address; reads the pool whose total is closest to hipMemGetInfo's, within 10%: VRAM, or on a known APU the GTT pool, shared by every amdgpu device (``amdgpu_gtt_reading``). Neither (partitioned card) is another scope. Never raises."""
     if platform.system() != "Linux":
         return None
     try:
@@ -4266,21 +4269,25 @@ def rocm_linux_kernel_free_mib(device: Any = None, *, module: Any = None) -> Opt
         index = mod.current_device() if device is None else device
         props = mod.get_device_properties(index)
         prefix = f"{int(props.pci_domain_id):04x}:{int(props.pci_bus_id):02x}:{int(props.pci_device_id):02x}."
-        torch_total = int(props.total_memory)
+        torch_total = int(mod.mem_get_info(index)[1])
         for bdf, _card_no, dev_dir in _rocm_linux_amdgpu_cards():
             if not bdf.lower().startswith(prefix):
                 continue
-            with open(os.path.join(dev_dir, "mem_info_vram_used"), encoding = "utf-8") as f:
-                used_bytes = int(f.read().strip())
-            with open(os.path.join(dev_dir, "mem_info_vram_total"), encoding = "utf-8") as f:
-                total_bytes = int(f.read().strip())
-            if (
-                total_bytes <= 0
-                or torch_total <= 0
-                or abs(total_bytes - torch_total) > 0.1 * torch_total
-            ):
-                return None
-            return max(0, total_bytes - used_bytes) // (1024 * 1024)
+            from core.inference.video_minimax_h3 import _sysfs_int, amdgpu_gtt_reading
+
+            read = lambda name: _sysfs_int(Path(dev_dir, f"mem_info_{name}"))
+            pools = ["vram"] + (["gtt"] if _rocm_props_unified_status(props) is True else [])
+            # VRAM, listed first, wins a size tie, as in the driver.
+            gaps = [
+                (abs(read(f"{p}_total") - torch_total), i)
+                for i, p in enumerate(pools)
+                if read(f"{p}_total")
+            ]
+            pool = pools[min(g for g in gaps if g[0] <= 0.1 * torch_total)[1]]
+            if pool == "vram":
+                return max(0, read("vram_total") - read("vram_used")) // (1024 * 1024)
+            gtt_free, gtt_known = amdgpu_gtt_reading(bdf)
+            return gtt_free // (1024 * 1024) if gtt_known and gtt_free is not None else None
         return None
     except Exception:
         return None
