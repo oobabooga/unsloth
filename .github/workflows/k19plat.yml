@@ -1,4 +1,4 @@
-name: "AMD CI k19 plat r3: test-llama-context recurrent / replay cases on ROCm0 without the debug realloc abort (r2: it stops on the first model): k19-int3 + k19-platfix (fx), gdnreplay trial merge + fix (rpf), 11-06 base (d6)"
+name: "AMD CI k19 plat r4: ctest on gfx1151 Linux + Windows of k19-int3 + k19-platfix b5eea901d6a (fx2)"
 
 # Correctness only (no timing): ctest, test-backend-ops ROCm0 vs CPU, delta-net replay probes, llama-server smoke on a tiny Qwen3 MoE.
 # Trees: i3 fetched by commit from the public CI copy (danielhanchen/llama.cpp-staging-ci f85d5f5115b = 1f09fc4a8fb minus its

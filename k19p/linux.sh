@@ -41,7 +41,7 @@ bundle() {   # $1 build bin dir: runtime libs + kernels beside the binaries, RPA
 
 I3C=$(awk '$1=="i3"{print $2}' "$J/TREES")
 TARGS=()
-for N in ${K19_TREES:-fx rpf d6}; do
+for N in ${K19_TREES:-fx2}; do
   S="$W/src_$N"; mkdir -p "$S"; t0=$(date +%s); EXP=$(awk -v n=$N '$1==n{print $3}' "$J/TREES")
   git -C "$S" init -q; git -C "$S" config core.autocrlf false; git -C "$S" remote add origin https://github.com/danielhanchen/llama.cpp-staging-ci
   git -C "$S" fetch -q --depth 1 origin "$I3C" && git -C "$S" checkout -q --detach "$I3C" || { echo "FATAL: fetch $N" | tee "$I/SRC_CHECK_$N"; continue; }
@@ -64,8 +64,6 @@ for N in ${K19_TREES:-fx rpf d6}; do
   c=$(cd "$S/build/bin" && ./llama-server --list-devices 2>&1 | grep -c "ROCm0"); echo "devices $N: ROCm0 x$c" | tee -a "$I/SRC_CHECK_$N"
   TARGS+=(--tree "$N=$S/build|$S/build/bin")
 done
-gunzip -c "$W/src_fx/ci/tiny-qwen3moe-f16.gguf.gz" > "$W/tiny-qwen3moe-f16.gguf"
-python3 -u "$J/run.py" --out "$O" "${TARGS[@]}" --llctx-test "replay|rollback|k19_|shared|capture|swa_prepare" \
-  --llctx fx:0:sel,fx:1:sel,rpf:auto:sel,rpf:spill:sel,fx:auto:all,d6:auto:all \
-  --models "$W/src_fx/build/tests/test-models" --tinymoe "$W/tiny-qwen3moe-f16.gguf" 2>&1 | tee "$O/run.txt"
+gunzip -c "$W/src_fx2/ci/tiny-qwen3moe-f16.gguf.gz" > "$W/tiny-qwen3moe-f16.gguf"
+python3 -u "$J/run.py" --out "$O" "${TARGS[@]}" --ctest fx2 --smoke fx2 --tinymoe "$W/tiny-qwen3moe-f16.gguf" 2>&1 | tee "$O/run.txt"
 test -s "$O/rows.jsonl"

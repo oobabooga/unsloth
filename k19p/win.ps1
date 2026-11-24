@@ -73,7 +73,7 @@ function Build-Tree($src, $bdir, $name, $static) {
 $TREES = Get-Content -Encoding utf8 "$J\TREES"
 $I3C = (($TREES | Where-Object { $_.StartsWith("i3 ") }) -split " ")[1]
 $TARGS = @()
-foreach ($spec in @("rpf:rpf:1", "fxs:fx:1")) {
+foreach ($spec in @("fx2:fx2:0", "fx2s:fx2:1")) {
   $n, $src, $st = $spec -split ":"
   $S = "$W\s_$src"
   if (-not (Test-Path "$S\.git")) {
@@ -98,9 +98,8 @@ foreach ($spec in @("rpf:rpf:1", "fxs:fx:1")) {
   $bd = "$S\build_$n"
   if (Build-Tree $S $bd $n ($st -eq "1")) { $TARGS += @("--tree", "$n=$bd|$bd\bin") }
 }
-& $PY -c "import gzip,shutil,sys; shutil.copyfileobj(gzip.open(sys.argv[1]), open(sys.argv[2],'wb'))" "$W\s_fx\ci\tiny-qwen3moe-f16.gguf.gz" "$W\tiny-qwen3moe-f16.gguf"
+& $PY -c "import gzip,shutil,sys; shutil.copyfileobj(gzip.open(sys.argv[1]), open(sys.argv[2],'wb'))" "$W\s_fx2\ci\tiny-qwen3moe-f16.gguf.gz" "$W\tiny-qwen3moe-f16.gguf"
 $env:PATH = "$ROCM\bin;$env:PATH"
-& $PY -u "$J\run.py" --out $OUT @TARGS --llctx-test "replay|rollback|k19_|shared|capture|swa_prepare" --llctx fxs:0:sel,fxs:1:sel,rpf:auto:sel,rpf:spill:sel,fxs:auto:all `
-  --models "$W\s_fx\build_fxs\tests\test-models" --tinymoe "$W\tiny-qwen3moe-f16.gguf" *> "$OUT\run.txt"
+& $PY -u "$J\run.py" --out $OUT @TARGS --ctest fx2,fx2s --smoke fx2 --tinymoe "$W\tiny-qwen3moe-f16.gguf" *> "$OUT\run.txt"
 Get-Content "$OUT\run.txt" -Tail 60
 if (-not (Test-Path "$OUT\rows.jsonl")) { exit 1 }
