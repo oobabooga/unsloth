@@ -1,0 +1,18 @@
+[
+ {
+  "tag": "M1",
+  "model": "OpenMOSS-Team/MOSS-Image-SFT",
+  "load": {},
+  "gen": {
+   "width": 512,
+   "height": 512,
+   "steps": 6,
+   "guidance": 2.5
+  },
+  "renders": 2,
+  "prompt_schedule": [
+   0,
+   1
+  ]
+ }
+]
