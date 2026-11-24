@@ -144,7 +144,7 @@ jobs:
           & $py -m pip install -q --upgrade pip
           & $py -m pip install -q pytest pytest-asyncio pytest-timeout
           # Studio backend deps (the suite imports fastapi / routes.*): the PR head's own requirement files.
-          & $py -m pip install -q -r https://raw.githubusercontent.com/unslothai/unsloth/0f829a9bc115bcd4c9ee32c3e6cc2955f459716e/studio/backend/requirements/studio.txt -r https://raw.githubusercontent.com/unslothai/unsloth/0f829a9bc115bcd4c9ee32c3e6cc2955f459716e/studio/backend/requirements/no-torch-runtime.txt transformers==5.24.0
+          & $py -m pip install -q -r https://raw.githubusercontent.com/unslothai/unsloth/0f829a9bc115bcd4c9ee32c3e6cc2955f459716e/studio/backend/requirements/studio.txt -r https://raw.githubusercontent.com/unslothai/unsloth/0f829a9bc115bcd4c9ee32c3e6cc2955f459716e/studio/backend/requirements/no-torch-runtime.txt
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           # --windows-rocm-torch: ROCm torch from AMD's multi-arch index, then the gate WITH torch.
