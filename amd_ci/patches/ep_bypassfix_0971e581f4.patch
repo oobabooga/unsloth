@@ -1,0 +1,126 @@
+From 0971e581f4fe738dd36bcaa76dcc09efa23563b8 Mon Sep 17 00:00:00 2001
+From: danielhanchen <danielhanchen@gmail.com>
+Date: Tue, 24 Nov 2026 07:59:36 -0800
+Subject: [PATCH] Expert parallel: refuse a bypass path that indexes the local
+ expert stacks with a global id (IndexError) the same as one that skips the
+ experts call; deterministic test
+
+---
+ tests/test_ep_moe_families_gloo.py | 25 ++++++++++++++++++++---
+ unsloth/models/ep_native.py        | 32 +++++++++++++++++++++++-------
+ 2 files changed, 47 insertions(+), 10 deletions(-)
+
+diff --git a/tests/test_ep_moe_families_gloo.py b/tests/test_ep_moe_families_gloo.py
+index 5ffce6934d..e10227a192 100644
+--- a/tests/test_ep_moe_families_gloo.py
++++ b/tests/test_ep_moe_families_gloo.py
+@@ -166,9 +166,10 @@ def _case_bypass(rank, world, tmp, repo):
+     return {"message": message}
+ 
+ 
+-def _zoo_like_gpt_oss_decode(enable):
++def _zoo_like_gpt_oss_decode(enable, last_expert = False):
+     """GptOssMLP.forward with unsloth_zoo's shape: a 1-token eval decode reads the expert stacks directly
+-    (here: the experts class forward called unbound, around the experts call)."""
++    (here: the experts class forward called unbound, around the experts call). last_expert routes every token
++    to expert E - 1, a global id past this rank's E / ep local stacks."""
+     from transformers.models.gpt_oss import modeling_gpt_oss as mod
+ 
+     if not enable:
+@@ -180,6 +181,8 @@ def _zoo_like_gpt_oss_decode(enable):
+         if qlen == 1 and not self.training:
+             flat = hidden_states.reshape(-1, hd)
+             _, scores, indices = self.router(flat)
++            if last_expert:
++                indices = torch.full_like(indices, self.router.num_experts - 1)
+             out = type(self.experts).forward(self.experts, flat, indices, scores)
+             return out.reshape(bsz, qlen, hd), scores
+         return original(self, hidden_states)
+@@ -194,8 +197,9 @@ def _case_generate(
+     repo,
+     zoo_decode = False,
+     plain_block = True,
++    last_expert = False,
+ ):
+-    _zoo_like_gpt_oss_decode(zoo_decode)
++    _zoo_like_gpt_oss_decode(zoo_decode, last_expert = last_expert)
+     """generate under expert parallel: each rank its own prompt and max_new_tokens (rank 1 stops 3 tokens early);
+     synced_gpus keeps the finished rank stepping, and every rank's tokens equal one process' greedy decode."""
+     from torch.distributed.device_mesh import init_device_mesh
+@@ -363,6 +367,21 @@ def test_ep_gpt_oss_decode_path_around_the_experts_call():
+         assert r is not None and "without calling" in (r.get("refused") or ""), r
+ 
+ 
++def test_ep_bypass_reading_a_global_expert_id_is_refused():
++    # A decode path around the experts call that indexes this rank's E / ep local stacks with a global id >= E / ep
++    # raised IndexError before the bypass guard's post hook (AMD gfx1151 hosts, torch 2.11: the router picked
++    # expert 3 of 4 with 2 local). Every token routed to expert E - 1 makes that deterministic.
++    results = _spawn(
++        "_case_generate",
++        repo = FAMILIES["gpt_oss"],
++        zoo_decode = True,
++        plain_block = False,
++        last_expert = True,
++    )
++    for r in results:
++        assert r is not None and "without calling" in (r.get("refused") or ""), r
++
++
+ @pytest.mark.parametrize("family", sorted(REFUSED))
+ def test_ep_refuses_models_it_cannot_shard(family):
+     results = _spawn("_case_refused", repo = REFUSED[family])
+diff --git a/unsloth/models/ep_native.py b/unsloth/models/ep_native.py
+index 84dc8f42b3..96eb43bf82 100644
+--- a/unsloth/models/ep_native.py
++++ b/unsloth/models/ep_native.py
+@@ -400,22 +400,40 @@ def _gpt_oss_block_forward(block):
+ _BLOCK_FORWARDS = {"GptOssMLP": _gpt_oss_block_forward}
+ 
+ 
++def _bypass_message(block, shard):
++    return (
++        f"Unsloth: {type(block).__name__}.forward computed its experts without calling "
++        f"{type(shard.leaf).__name__} (a fused or decode-only path), which under expert parallel holds only "
++        f"{shard.per_rank} of {shard.experts} experts. Disable that path (for example generate in "
++        "training mode or the zoo inference MoE path) or train without expert parallel."
++    )
++
++
+ def _guard_bypass(block, shard):
+     """A block forward that never reached its experts call (a fused / decode path computing all E experts from
+-    this rank's E / ep) would silently be wrong under expert parallel: refuse it."""
++    this rank's E / ep) would silently be wrong under expert parallel: refuse it. Such a path reading the local
++    stacks with a global expert id >= E / ep raises IndexError before the post hook can run: that is refused the
++    same way (the IndexError chained), so the outcome does not depend on which experts the router picked."""
+ 
+     def pre(module, args):
+         module.__dict__["_unsloth_ep_calls"] = shard.calls
+ 
+     def post(module, args, output):
+         if shard.calls == module.__dict__.get("_unsloth_ep_calls"):
+-            raise RuntimeError(
+-                f"Unsloth: {type(module).__name__}.forward computed its experts without calling "
+-                f"{type(shard.leaf).__name__} (a fused or decode-only path), which under expert parallel holds only "
+-                f"{shard.per_rank} of {shard.experts} experts. Disable that path (for example generate in "
+-                "training mode or the zoo inference MoE path) or train without expert parallel."
+-            )
++            raise RuntimeError(_bypass_message(module, shard))
++
++    inner = block.forward
++
++    def forward(*args, **kwargs):
++        before = shard.calls
++        try:
++            return inner(*args, **kwargs)
++        except IndexError as exc:
++            if shard.calls == before:
++                raise RuntimeError(_bypass_message(block, shard)) from exc
++            raise
+ 
++    block.forward = forward
+     block.register_forward_pre_hook(pre)
+     block.register_forward_hook(post)
+ 
+-- 
+2.43.0
+
