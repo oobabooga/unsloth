@@ -92,6 +92,11 @@ def main():
         rec["cuda"] = getattr(torch.version, "cuda", None)
         rec["gpu"] = torch.cuda.get_device_name(0)
         rec["platform"] = sys.platform
+        try:
+            import diffusers, transformers
+            rec["diffusers"], rec["transformers"] = diffusers.__version__, transformers.__version__
+        except Exception:  # noqa: BLE001
+            pass
         from core.inference.diffusion import DiffusionBackend
 
         eng = DiffusionBackend()
@@ -127,6 +132,8 @@ def main():
 
         # CPU noise: the pipeline's own prepare_latents, CPU generator with the same seed
         noise_hits: list = []
+        noise_info: list = []
+        rec["noise_info"] = noise_info
         rec["noise_hook"] = "none"
         if not a.no_cpu_noise and callable(getattr(pipe, "prepare_latents", None)):
             rec["noise_hook"] = "prepare_latents"
@@ -136,7 +143,15 @@ def main():
                 args = tuple(_cpu_gen(x, torch) for x in args)
                 kw = {k: _cpu_gen(v, torch) for k, v in kw.items()}
                 noise_hits.append(1)
-                return pl0(*args, **kw)
+                out = pl0(*args, **kw)
+                try:
+                    t0_ = out[0] if isinstance(out, (tuple, list)) else out
+                    c = t0_.detach().float().cpu().contiguous()
+                    noise_info.append({"shape": list(t0_.shape), "dtype": str(t0_.dtype),
+                                       "md5": hashlib.md5(c.numpy().tobytes()).hexdigest(), "std": float(c.std())})
+                except Exception as exc:  # noqa: BLE001
+                    noise_info.append({"error": repr(exc)[:200]})
+                return out
             pipe.prepare_latents = prepare_latents
 
         # step timestamps: class-level scheduler.step (survives a per-call scheduler copy of the same class)
