@@ -1,0 +1,19 @@
+[
+ {
+  "tag": "K1",
+  "model": "black-forest-labs/FLUX.2-klein-4B",
+  "load": {},
+  "gen": {
+   "width": 512,
+   "height": 512,
+   "steps": 4,
+   "guidance": 1.0
+  },
+  "renders": 2,
+  "prompt_schedule": [
+   0,
+   1
+  ],
+  "capture_vae": true
+ }
+]
