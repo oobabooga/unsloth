@@ -1,0 +1,94 @@
+[
+ {
+  "tag": "D1",
+  "model": "krea/Krea-2-Turbo",
+  "load": {},
+  "gen": {
+   "width": 1024,
+   "height": 1024,
+   "steps": 8,
+   "guidance": 0.0
+  },
+  "renders": 2,
+  "prompt_schedule": [
+   0,
+   0
+  ]
+ },
+ {
+  "tag": "T1",
+  "model": "krea/Krea-2-Turbo",
+  "load": {},
+  "gen": {
+   "width": 1024,
+   "height": 1024,
+   "steps": 8,
+   "guidance": 0.0
+  },
+  "renders": 2,
+  "prompt_schedule": [
+   0,
+   0
+  ],
+  "env": {
+   "UNSLOTH_DIFFUSION_ROCM_TUNABLEOP": "0"
+  }
+ },
+ {
+  "tag": "O1",
+  "model": "krea/Krea-2-Turbo",
+  "load": {
+   "speed_mode": "off"
+  },
+  "gen": {
+   "width": 1024,
+   "height": 1024,
+   "steps": 8,
+   "guidance": 0.0
+  },
+  "renders": 2,
+  "prompt_schedule": [
+   0,
+   0
+  ]
+ },
+ {
+  "tag": "E1",
+  "model": "krea/Krea-2-Turbo",
+  "load": {
+   "text_encoder_quant": "none"
+  },
+  "gen": {
+   "width": 1024,
+   "height": 1024,
+   "steps": 8,
+   "guidance": 0.0
+  },
+  "renders": 2,
+  "prompt_schedule": [
+   0,
+   0
+  ]
+ },
+ {
+  "tag": "C2",
+  "model": "krea/Krea-2-Turbo",
+  "load": {
+   "transformer_quant": "none",
+   "text_encoder_quant": "none",
+   "int8_attention": "off",
+   "speed_mode": "off"
+  },
+  "gen": {
+   "width": 1024,
+   "height": 1024,
+   "steps": 8,
+   "guidance": 0.0
+  },
+  "renders": 2,
+  "prompt_schedule": [
+   0,
+   0
+  ]
+ }
+]

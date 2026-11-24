@@ -1,0 +1,118 @@
+[
+ {
+  "tag": "P1",
+  "model": "krea/Krea-2-Turbo",
+  "load": {},
+  "gen": {
+   "width": 1024,
+   "height": 1024,
+   "steps": 8,
+   "guidance": 0.0
+  },
+  "renders": 1,
+  "prompt_schedule": [
+   0
+  ],
+  "noise_fp32": true
+ },
+ {
+  "tag": "C3",
+  "model": "krea/Krea-2-Turbo",
+  "load": {
+   "transformer_quant": "none",
+   "text_encoder_quant": "none",
+   "int8_attention": "off",
+   "speed_mode": "off"
+  },
+  "gen": {
+   "width": 1024,
+   "height": 1024,
+   "steps": 8,
+   "guidance": 0.0
+  },
+  "renders": 2,
+  "prompt_schedule": [
+   0,
+   1
+  ],
+  "noise_fp32": true
+ },
+ {
+  "tag": "D2",
+  "model": "krea/Krea-2-Turbo",
+  "load": {},
+  "gen": {
+   "width": 1024,
+   "height": 1024,
+   "steps": 8,
+   "guidance": 0.0
+  },
+  "renders": 2,
+  "prompt_schedule": [
+   0,
+   0
+  ],
+  "noise_fp32": true
+ },
+ {
+  "tag": "T2",
+  "model": "krea/Krea-2-Turbo",
+  "load": {},
+  "gen": {
+   "width": 1024,
+   "height": 1024,
+   "steps": 8,
+   "guidance": 0.0
+  },
+  "renders": 2,
+  "prompt_schedule": [
+   0,
+   0
+  ],
+  "noise_fp32": true,
+  "env": {
+   "UNSLOTH_DIFFUSION_ROCM_TUNABLEOP": "0"
+  }
+ },
+ {
+  "tag": "D3",
+  "model": "krea/Krea-2-Turbo",
+  "load": {},
+  "gen": {
+   "width": 1024,
+   "height": 1024,
+   "steps": 8,
+   "guidance": 0.0
+  },
+  "renders": 6,
+  "prompt_schedule": [
+   0,
+   0,
+   0,
+   0,
+   0,
+   1
+  ],
+  "noise_fp32": true
+ },
+ {
+  "tag": "T3",
+  "model": "krea/Krea-2-Turbo",
+  "load": {},
+  "gen": {
+   "width": 1024,
+   "height": 1024,
+   "steps": 8,
+   "guidance": 0.0
+  },
+  "renders": 2,
+  "prompt_schedule": [
+   0,
+   0
+  ],
+  "noise_fp32": true,
+  "env": {
+   "UNSLOTH_DIFFUSION_ROCM_TUNABLEOP": "0"
+  }
+ }
+]

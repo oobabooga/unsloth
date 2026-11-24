@@ -1,0 +1,94 @@
+[
+ {
+  "tag": "P1",
+  "model": "OpenMOSS-Team/MOSS-Image-SFT",
+  "load": {},
+  "gen": {
+   "width": 1024,
+   "height": 1024,
+   "steps": 25,
+   "guidance": 2.5
+  },
+  "renders": 1,
+  "prompt_schedule": [
+   0
+  ]
+ },
+ {
+  "tag": "B2",
+  "model": "OpenMOSS-Team/MOSS-Image-SFT",
+  "load": {
+   "transformer_quant": "none",
+   "text_encoder_quant": "none",
+   "int8_attention": "off",
+   "speed_mode": "off"
+  },
+  "gen": {
+   "width": 1024,
+   "height": 1024,
+   "steps": 25,
+   "guidance": 2.5
+  },
+  "renders": 2,
+  "prompt_schedule": [
+   0,
+   1
+  ]
+ },
+ {
+  "tag": "M2",
+  "model": "OpenMOSS-Team/MOSS-Image-SFT",
+  "load": {},
+  "gen": {
+   "width": 1024,
+   "height": 1024,
+   "steps": 25,
+   "guidance": 2.5
+  },
+  "renders": 6,
+  "prompt_schedule": [
+   0,
+   0,
+   0,
+   0,
+   0,
+   1
+  ]
+ },
+ {
+  "tag": "M3",
+  "model": "OpenMOSS-Team/MOSS-Image-SFT",
+  "load": {},
+  "gen": {
+   "width": 1024,
+   "height": 1024,
+   "steps": 25,
+   "guidance": 2.5
+  },
+  "renders": 2,
+  "prompt_schedule": [
+   0,
+   0
+  ]
+ },
+ {
+  "tag": "B3",
+  "model": "OpenMOSS-Team/MOSS-Image-SFT",
+  "load": {
+   "transformer_quant": "none",
+   "text_encoder_quant": "none",
+   "int8_attention": "off",
+   "speed_mode": "off"
+  },
+  "gen": {
+   "width": 1024,
+   "height": 1024,
+   "steps": 25,
+   "guidance": 2.5
+  },
+  "renders": 1,
+  "prompt_schedule": [
+   0
+  ]
+ }
+]
