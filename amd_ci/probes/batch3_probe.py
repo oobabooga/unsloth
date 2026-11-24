@@ -106,12 +106,11 @@ try:
     rec = []
     for L in lengths:
         static = (lat.clone().to(dev), torch.tensor(731.0, device = dev), emb(L).to(dev))
-        s = torch.cuda.Stream()
-        s.wait_stream(torch.cuda.current_stream())
-        with torch.cuda.stream(s), torch.no_grad():
+        # warm-up on the current stream, as the churn below: the caching allocator reuses a freed block only for
+        # allocations on the stream it was made on, so side-stream warm-ups would hide the reuse being tested
+        with torch.no_grad():
             for _ in range(2):
                 eager = m(*static, return_dict = False)[0]
-        torch.cuda.current_stream().wait_stream(s)
         torch.cuda.synchronize()
         ref = eager.float().clone()
         g = torch.cuda.CUDAGraph()
