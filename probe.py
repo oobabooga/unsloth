@@ -28,5 +28,11 @@ try:
     print(f"[{label}] rocm_linux_kernel_free_mib(0, total_bytes=driver total) = {hw.rocm_linux_kernel_free_mib(0, total_bytes=total)}")
 except TypeError:
     print(f"[{label}] (no total_bytes parameter on this revision)")
+try:
+    print(f"[{label}] positively unified (APU) = {hw._rocm_props_are_positively_unified(p)}")
+    from core.training.worker import _rocm_classify_unified_memory
+    print(f"[{label}] classification = {_rocm_classify_unified_memory(p)}")
+except Exception as e:
+    print(f"[{label}] classification error: {type(e).__name__}: {e}")
 tf, tt = hw.trusted_mem_get_info(0)
 print(f"[{label}] trusted_mem_get_info -> free={tf//MiB} MiB total={tt//MiB} MiB")
