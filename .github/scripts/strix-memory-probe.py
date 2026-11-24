@@ -33,7 +33,7 @@ def record(name, value):
     print(name, body, flush=True)
 
 
-def snapshot(name):
+def snapshot(name, *, require_headroom=False):
     memory = Path("/proc/meminfo").read_text().splitlines()
     devices = {}
     for device in sorted(Path("/sys/class/drm").glob("card[0-9]*/device")):
@@ -47,7 +47,12 @@ def snapshot(name):
         "memory": [line for line in memory if line.startswith(("MemTotal:", "MemAvailable:", "SwapFree:"))],
         "devices": devices,
     })
-    return devices
+    if require_headroom:
+        available = int(next(line.split()[1] for line in memory if line.startswith("MemAvailable:")))
+        used = sum(int(data.get(counter, 0)) for data in devices.values()
+                   for counter in ("mem_info_vram_used", "mem_info_gtt_used"))
+        if available < 36 * 1024**2 or used > 3 * 1024**3:
+            raise RuntimeError("Shared runner has insufficient idle headroom for this comparison.")
 
 
 def request(base, path, body=None, token=None, timeout=30):
@@ -120,7 +125,7 @@ def run_unsloth():
     port = free_port()
     backend = WORK / "source" / "studio" / "backend"
     backend_log = WORK / "unsloth-backend.log"
-    snapshot("unsloth-idle")
+    snapshot("unsloth-idle", require_headroom=True)
     command = [sys.executable, "run.py", "--api-only", "--host", "127.0.0.1", "--port", str(port)]
     try:
         with server(command, port, "/api/health", backend_log, cwd=backend) as base:
@@ -142,7 +147,7 @@ def run_unsloth():
 def run_standalone(binary):
     port = free_port()
     log = OUT / "llama-server.log"
-    snapshot("llama-server-idle")
+    snapshot("llama-server-idle", require_headroom=True)
     command = [
         str(binary), "-m", str(MODEL), "--host", "127.0.0.1", "--port", str(port),
         "--ctx-size", str(CONTEXT), "--parallel", "1", "--fit", "on",
@@ -160,10 +165,7 @@ def run_standalone(binary):
 
 
 def main():
-    devices = snapshot("host")
-    if not any(data.get("device") == "0x1586" or data.get("device") == "0x158e"
-               for data in devices.values()):
-        print("Check the device list for the Strix Halo GPU PCI ID.", flush=True)
+    snapshot("host")
     from core.inference.llama_cpp import LlamaCppBackend
 
     binary = LlamaCppBackend._find_llama_server_binary()
@@ -173,6 +175,10 @@ def main():
     for flag in ("--version", "--list-devices"):
         result = subprocess.run([binary, flag], capture_output=True, text=True, timeout=45)
         record(flag[2:], {"exit": result.returncode, "output": result.stdout + result.stderr})
+    expected = {"hip": "ROCm", "vulkan": "Vulkan"}[os.environ["UNSLOTH_LLAMA_CPP_BACKEND"]]
+    devices = result.stdout + result.stderr
+    if result.returncode != 0 or not re.search(rf"\b{expected}\d+\b", devices):
+        raise RuntimeError(f"The installed llama-server did not enumerate a {expected} device.")
     failures = []
     for name, probe in (("Unsloth", run_unsloth), ("llama.cpp", lambda: run_standalone(binary))):
         try:
