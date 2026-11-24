@@ -373,7 +373,9 @@ def main() -> int:
         env_add: dict = {}
         timeout = 40 * 60
         if arm == "Btune":
-            env_add = {"PYTORCH_TUNABLEOP_ENABLED": "1", "PYTORCH_TUNABLEOP_TUNING": "0",
+            # No PYTORCH_TUNABLEOP_TUNING here: the env var overrides tuning_enable(), so TUNING=0 kept run
+            # 45351968384's tuning window from tuning anything (0 rows). Tuning is switched off in-process instead.
+            env_add = {"PYTORCH_TUNABLEOP_ENABLED": "1",
                        "PYTORCH_TUNABLEOP_FILENAME": str(work / "torch_exit_write.csv")}
             timeout = int(args.tune_timeout_min * 60)
         elif arm.startswith("B"):

@@ -111,12 +111,12 @@ jobs:
             --expect-arch gfx1151 --min-gpus 1 --out "$AMD_CI_WORK/out/host.json"
 
       - name: TunableOp training arms
-        timeout-minutes: 240
+        timeout-minutes: 285
         run: |
           set +e
           "$AMD_CI_PY" -u "$GITHUB_WORKSPACE/amd_ci/probes/rocm_train_tunableop_probe.py" \
             --checkout "$AMD_CI_WORK/states/head" --out "$AMD_CI_WORK/out/tune/obs.json" \
-            --steps 20 --tune-timeout-min 110
+            --steps 20 --tune-timeout-min 160
           rc=$?
           echo "probe exit $rc"
           exit $rc
