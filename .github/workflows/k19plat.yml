@@ -1,4 +1,4 @@
-name: "AMD CI k19 plat: llama.cpp k19-int3 1f09fc4a8fb vs the 11-06 tree dc86a8f271b (+ gdnreplay trial merge 2b1738df6c3) on gfx1151 Linux + Windows"
+name: "AMD CI k19 plat r2: llama.cpp k19-int3 1f09fc4a8fb + k19-platfix a10f0782405 (int3 alone does not build for HIP, r1) vs the 11-06 tree dc86a8f271b, + gdnreplay trial merge 2b1738df6c3, on gfx1151 Linux + Windows"
 
 # Correctness only (no timing): ctest, test-backend-ops ROCm0 vs CPU, delta-net replay probes, llama-server smoke on a tiny Qwen3 MoE.
 # Trees: i3 fetched by commit from the public CI copy (danielhanchen/llama.cpp-staging-ci f85d5f5115b = 1f09fc4a8fb minus its

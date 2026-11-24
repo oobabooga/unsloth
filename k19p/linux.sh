@@ -41,11 +41,12 @@ bundle() {   # $1 build bin dir: runtime libs + kernels beside the binaries, RPA
 
 I3C=$(awk '$1=="i3"{print $2}' "$J/TREES")
 TARGS=()
-for N in ${K19_TREES:-i3 d6 rp}; do
+for N in ${K19_TREES:-fx d6 rpf}; do
   S="$W/src_$N"; mkdir -p "$S"; t0=$(date +%s); EXP=$(awk -v n=$N '$1==n{print $3}' "$J/TREES")
   git -C "$S" init -q; git -C "$S" config core.autocrlf false; git -C "$S" remote add origin https://github.com/danielhanchen/llama.cpp-staging-ci
   git -C "$S" fetch -q --depth 1 origin "$I3C" && git -C "$S" checkout -q --detach "$I3C" || { echo "FATAL: fetch $N" | tee "$I/SRC_CHECK_$N"; continue; }
-  [ "$N" != i3 ] && { gunzip -c "$J/$N.patch.gz" > "$W/$N.patch"; git -C "$S" apply --index --whitespace=nowarn "$W/$N.patch" || echo "FATAL: $N.patch"; }
+  PS=$(awk -v n=$N '$1==n{print $5}' "$J/TREES" | tr ',' ' '); [ -z "$PS" ] && [ "$N" != i3 ] && PS=$N
+  for p in $PS; do gunzip -c "$J/$p.patch.gz" > "$W/$p.patch"; git -C "$S" apply --index --whitespace=nowarn "$W/$p.patch" || echo "FATAL: $p.patch ($N)"; done
   TREE=$(git -C "$S" write-tree)
   echo "tree $N $TREE expect $EXP" | tee "$I/SRC_CHECK_$N"
   [ "$TREE" = "$EXP" ] || { echo "FATAL: the applied tree $N is not the expected one" | tee -a "$I/SRC_CHECK_$N"; continue; }
@@ -63,7 +64,7 @@ for N in ${K19_TREES:-i3 d6 rp}; do
   c=$(cd "$S/build/bin" && ./llama-server --list-devices 2>&1 | grep -c "ROCm0"); echo "devices $N: ROCm0 x$c" | tee -a "$I/SRC_CHECK_$N"
   TARGS+=(--tree "$N=$S/build|$S/build/bin")
 done
-gunzip -c "$W/src_i3/ci/tiny-qwen3moe-f16.gguf.gz" > "$W/tiny-qwen3moe-f16.gguf"
-python3 -u "$J/run.py" --out "$O" "${TARGS[@]}" --ctest i3,d6,rp --ctest-replay i3 --tbo i3,d6 --replay i3,rp --smoke i3,d6 \
-  --models "$W/src_i3/build/tests/test-models" --tinymoe "$W/tiny-qwen3moe-f16.gguf" 2>&1 | tee "$O/run.txt"
+gunzip -c "$W/src_fx/ci/tiny-qwen3moe-f16.gguf.gz" > "$W/tiny-qwen3moe-f16.gguf"
+python3 -u "$J/run.py" --out "$O" "${TARGS[@]}" --ctest fx,d6,rpf --ctest-replay fx --tbo fx,d6 --replay fx,rpf --smoke fx,d6 \
+  --models "$W/src_fx/build/tests/test-models" --tinymoe "$W/tiny-qwen3moe-f16.gguf" 2>&1 | tee "$O/run.txt"
 test -s "$O/rows.jsonl"

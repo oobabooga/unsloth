@@ -91,9 +91,7 @@ def rs_line(txt):
 def replay(name, models):
     _, d = T[name]
     exe = lambda x: os.path.join(d, x + EXE)
-    modes = ["auto"] if name == "rp" else ["0", "1"]
-    if name == "rp":
-        modes = ["auto", "spill", "1"]
+    modes = ["auto", "spill", "1"] if name.startswith("rp") else ["0", "1"]
     log = os.path.join(LOG, "gdn_replay_%s.log" % name)
     if os.path.exists(exe("test-gdn-replay")):
         rc, s, txt = run([exe("test-gdn-replay")], log, cwd=d, timeout=1800)
@@ -169,7 +167,7 @@ def smoke(name, gguf, port=8097):
             open(os.path.join(LOG, "smoke_%s.txt" % tag), "w", encoding="utf-8").write(txt)
         row(kind="smoke", tree=name, ngl=ngl, ok=ok and rc == 0, rc=rc, md5=hashlib.md5(txt.encode()).hexdigest()[:8] if txt is not None else None,
             n_chars=len(txt) if txt else 0, text=(txt or "")[:200], gguf_md5=md5(gguf),
-            device=re.findall(r"(?:ROCm0|CPU)[^\n]*model buffer size[^\n]*", lt)[:3], offload=re.findall(r"offloaded \d+/\d+ layers[^\n]*", lt)[:1])
+            device=sorted(set(re.findall(r"(?:ROCm0|CPU)[^\n]*model buffer size|layer \d+ is assigned to device \S+", lt)))[:3], offload=re.findall(r"offloaded \d+/\d+ layers[^\n]*", lt)[:1])
 
 
 for n in lst(a.ctest):

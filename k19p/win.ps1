@@ -73,7 +73,7 @@ function Build-Tree($src, $bdir, $name, $static) {
 $TREES = Get-Content -Encoding utf8 "$J\TREES"
 $I3C = (($TREES | Where-Object { $_.StartsWith("i3 ") }) -split " ")[1]
 $TARGS = @()
-foreach ($spec in @("i3:i3:0", "d6:d6:0", "rp:rp:1", "i3s:i3:1")) {
+foreach ($spec in @("fx:fx:0", "d6:d6:0", "rpf:rpf:1", "fxs:fx:1")) {
   $n, $src, $st = $spec -split ":"
   $S = "$W\s_$src"
   if (-not (Test-Path "$S\.git")) {
@@ -83,10 +83,12 @@ foreach ($spec in @("i3:i3:0", "d6:d6:0", "rp:rp:1", "i3s:i3:1")) {
     git -C $S remote add origin https://github.com/danielhanchen/llama.cpp-staging-ci
     git -C $S fetch -q --depth 1 origin $I3C
     git -C $S checkout -q --detach $I3C
-    if ($src -ne "i3") {
-      & $PY -c "import gzip,shutil,sys; shutil.copyfileobj(gzip.open(sys.argv[1]), open(sys.argv[2],'wb'))" "$J\$src.patch.gz" "$W\$src.patch"
-      git -C $S apply --index --whitespace=nowarn "$W\$src.patch"
-      if ($LASTEXITCODE -ne 0) { Log "FATAL: $src patch does not apply"; continue }
+    $pl = (($TREES | Where-Object { $_.StartsWith("$src ") }) -split " ")
+    $ps = if ($pl.Count -ge 5 -and $pl[4]) { $pl[4] -split "," } elseif ($src -ne "i3") { @($src) } else { @() }
+    foreach ($p in $ps) {
+      & $PY -c "import gzip,shutil,sys; shutil.copyfileobj(gzip.open(sys.argv[1]), open(sys.argv[2],'wb'))" "$J\$p.patch.gz" "$W\$p.patch"
+      git -C $S apply --index --whitespace=nowarn "$W\$p.patch"
+      if ($LASTEXITCODE -ne 0) { Log "FATAL: $p patch does not apply ($src)"; continue }
     }
     $exp = (($TREES | Where-Object { $_.StartsWith("$src ") }) -split " ")[2]
     $tree = (git -C $S write-tree).Trim()
@@ -96,9 +98,9 @@ foreach ($spec in @("i3:i3:0", "d6:d6:0", "rp:rp:1", "i3s:i3:1")) {
   $bd = "$S\build_$n"
   if (Build-Tree $S $bd $n ($st -eq "1")) { $TARGS += @("--tree", "$n=$bd|$bd\bin") }
 }
-& $PY -c "import gzip,shutil,sys; shutil.copyfileobj(gzip.open(sys.argv[1]), open(sys.argv[2],'wb'))" "$W\s_i3\ci\tiny-qwen3moe-f16.gguf.gz" "$W\tiny-qwen3moe-f16.gguf"
+& $PY -c "import gzip,shutil,sys; shutil.copyfileobj(gzip.open(sys.argv[1]), open(sys.argv[2],'wb'))" "$W\s_fx\ci\tiny-qwen3moe-f16.gguf.gz" "$W\tiny-qwen3moe-f16.gguf"
 $env:PATH = "$ROCM\bin;$env:PATH"
-& $PY -u "$J\run.py" --out $OUT @TARGS --ctest i3,d6,rp,i3s --ctest-replay i3s --tbo i3,d6 --replay i3s,rp --smoke i3,d6 `
-  --models "$W\s_i3\build_i3s\tests\test-models" --tinymoe "$W\tiny-qwen3moe-f16.gguf" *> "$OUT\run.txt"
+& $PY -u "$J\run.py" --out $OUT @TARGS --ctest fx,d6,rpf,fxs --ctest-replay fxs --tbo fx,d6 --replay fxs,rpf --smoke fx,d6 `
+  --models "$W\s_fx\build_fxs\tests\test-models" --tinymoe "$W\tiny-qwen3moe-f16.gguf" *> "$OUT\run.txt"
 Get-Content "$OUT\run.txt" -Tail 60
 if (-not (Test-Path "$OUT\rows.jsonl")) { exit 1 }
