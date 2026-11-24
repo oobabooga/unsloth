@@ -32,9 +32,9 @@ jobs:
           python $W/probe.py $W/main/studio/backend main
           python $W/probe.py $W/pr/studio/backend pr
           echo "##### Vulkan llama-server holding a model"
-          TAG=$(curl -s https://api.github.com/repos/ggml-org/llama.cpp/releases/latest | python -c "import sys,json; print(json.load(sys.stdin)['tag_name'])")
-          curl -sL -o $W/llama.zip "https://github.com/ggml-org/llama.cpp/releases/download/$TAG/llama-$TAG-bin-ubuntu-vulkan-x64.zip"
-          (cd $W && unzip -q llama.zip -d llama) ; LS=$(find $W/llama -name llama-server -type f | head -1); echo "llama-server: $LS"
+          TAG=b12681
+          curl -sL -o $W/llama.tgz "https://github.com/ggml-org/llama.cpp/releases/download/$TAG/llama-$TAG-bin-ubuntu-vulkan-x64.tar.gz"
+          mkdir -p $W/llama && tar -xzf $W/llama.tgz -C $W/llama; LS=$(find $W/llama -name llama-server -type f | head -1); echo "llama-server: $LS"
           curl -sL -o $W/models/m.gguf "https://huggingface.co/bartowski/Qwen2.5-7B-Instruct-GGUF/resolve/main/Qwen2.5-7B-Instruct-Q4_K_M.gguf"
           ls -la $W/models
           LD_LIBRARY_PATH=$(dirname $LS) $LS -m $W/models/m.gguf -ngl 99 -c 8192 --port 18080 > $W/ls.log 2>&1 &
