@@ -146,9 +146,8 @@ jobs:
       - name: Optional clock readers
         run: |
           $ErrorActionPreference = "Continue"
-          # Best effort: the python amdsmi binding (torch.cuda.clock_rate reads it on ROCm). A failure is recorded, not fatal.
-          & $env:AMD_CI_PY -m pip install -q amdsmi 2>&1 | Select-Object -Last 3
-          Write-Host "amdsmi pip exit $LASTEXITCODE"
+          # Not installing the PyPI amdsmi binding: run 45351962267 showed it is Linux-only (loads libamd_smi.so) and
+          # torch.cuda imports it on ROCm, so its presence breaks `import torch` on these boxes.
           Get-Command amd-smi -ErrorAction SilentlyContinue | Format-List Source
           powercfg /getactivescheme
           powercfg /q SCHEME_CURRENT SUB_VIDEO VIDEOIDLE
