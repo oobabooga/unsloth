@@ -1,0 +1,691 @@
+diff --git a/studio/backend/core/inference/diffusion_rocm_tunableop.py b/studio/backend/core/inference/diffusion_rocm_tunableop.py
+index 48e6f2e7be..a416031b8c 100644
+--- a/studio/backend/core/inference/diffusion_rocm_tunableop.py
++++ b/studio/backend/core/inference/diffusion_rocm_tunableop.py
+@@ -2,7 +2,7 @@
+ # Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
+ 
+ """ROCm TunableOp GEMM tables for diffusion denoisers on gfx1151 (hipBLASLt's default pick is 20-38% slow at DiT
+-shapes). Tuning costs 17-215 s per shape, so by default only READ the AMD CI tables in ``rocm_gemm_tables/`` whose
++shapes; training GEMMs too). Tuning costs 17-215 s per shape, so by default only READ the AMD CI tables in ``rocm_gemm_tables/`` whose
+ validators match exactly. ``UNSLOTH_DIFFUSION_ROCM_TUNABLEOP=tune`` also tunes on steady denoiser calls; ``=0`` off."""
+ 
+ from __future__ import annotations
+@@ -32,13 +32,19 @@ _STATE: dict = {
+     "file": None,
+     "last_key": None,
+     "tune": False,
+-    # Pipe tags using the table; the last release() restores prev_enabled.
++    # Pipe tags using the table; the last release() restores the pre-activation snapshot.
+     "owners": set(),
+-    "prev_enabled": False,
++    "snapshot": None,
++    "train": False,
+ }
+ 
+ 
+ _TABLE_DIR = Path(__file__).resolve().parent / "rocm_gemm_tables"
++# A shipped table whose stem ends with this also carries training GEMM rows (NT / NN); the others are inference-only.
++TRAIN_SUFFIX = "_train"
++# Tables were measured at torch's default hipBLASLt workspace; torch 2.11-2.14 drops a saved solution needing more
++# without falling back, which can leave the GEMM output unwritten.
++_WORKSPACE_ENVS = ("HIPBLASLT_WORKSPACE_SIZE", "CUBLASLT_WORKSPACE_SIZE")
+ 
+ 
+ def _env() -> str:
+@@ -69,7 +75,7 @@ def shipped_tables(arch: str, validators: dict) -> list:
+     for path in sorted(_TABLE_DIR.glob(f"{arch}_*.csv")):
+         try:
+             have = _validators(path.read_text(encoding = "utf-8"))
+-        except OSError:
++        except (OSError, ValueError):
+             continue
+         if have and have == want:
+             out.append(path)
+@@ -105,6 +111,12 @@ def eligible(device: Any = None) -> tuple:
+         return False, f"{TUNABLEOP_ENV}=0"
+     if _user_owns_tunableop():
+         return False, "PYTORCH_TUNABLEOP_* set by the user"
++    capped = [k for k in _WORKSPACE_ENVS if os.environ.get(k)]
++    if capped:
++        return (
++            False,
++            f"{capped[0]} set by the user: saved hipBLASLt solutions may not fit the workspace",
++        )
+     try:
+         import torch
+     except Exception:  # noqa: BLE001
+@@ -205,13 +217,57 @@ def _post(_module: Any, _args: Any, _kwargs: Any, _out: Any) -> None:
+             _write(torch.cuda.tunable)
+ 
+ 
+-def _activate(arch: str, logger: Any = None) -> bool:
++_SNAPSHOT_GETTERS = {
++    "enabled": "is_enabled",
++    "tuning": "tuning_is_enabled",
++    "iterations": "get_max_tuning_iterations",
++    "duration": "get_max_tuning_duration",
++    "filename": "get_filename",
++}
++
++
++def _snapshot(tunable: Any) -> dict:
++    snap = {}
++    for key, getter in _SNAPSHOT_GETTERS.items():
++        try:
++            snap[key] = getattr(tunable, getter)()
++        except Exception:  # noqa: BLE001
++            snap[key] = None
++    return snap
++
++
++def _apply_snapshot(tunable: Any, snap: Optional[dict]) -> None:
++    snap = snap or {}
++    setters = (
++        ("filename", lambda v: tunable.set_filename(v, insert_device_ordinal = False)),
++        ("iterations", tunable.set_max_tuning_iterations),
++        ("duration", tunable.set_max_tuning_duration),
++        ("tuning", lambda v: tunable.tuning_enable(bool(v))),
++        ("enabled", lambda v: tunable.enable(bool(v))),
++    )
++    for key, setter in setters:
++        value = snap.get(key)
++        if value is None and key == "enabled":
++            value = False
++        if value is None:
++            continue
++        try:
++            setter(value)
++        except Exception:  # noqa: BLE001
++            pass
++
++
++def _activate(
++    arch: str,
++    logger: Any = None,
++    training: bool = False,
++) -> bool:
+     import torch
+ 
+     tunable = torch.cuda.tunable
+     with _LOCK:
+         if _STATE["active"]:
+-            return True
++            return _STATE["train"] or not training
+         tune = tuning_requested()
+         path = results_file(arch)
+         try:
+@@ -219,43 +275,54 @@ def _activate(arch: str, logger: Any = None) -> bool:
+         except OSError:
+             if tune:
+                 return False
++        snap = _snapshot(tunable)
+         try:
+-            prev_enabled = bool(tunable.is_enabled())
+-        except Exception:  # noqa: BLE001
+-            prev_enabled = False
+-        tunable.tuning_enable(False)
+-        tunable.enable(True)
+-        _prime(torch)
+-        try:
+-            validators = dict(tunable.get_validators() or ())
+-        except Exception:  # noqa: BLE001
+-            validators = {}
+-        tables = shipped_tables(arch, validators)
+-        cached = path.exists() and _validators(_read(path)) == {
+-            str(k): str(v) for k, v in validators.items()
+-        }
+-        if not tune and not tables and not cached:
+-            tunable.enable(prev_enabled)
+-            return False
+-        tunable.set_filename(str(path), insert_device_ordinal = False)
+-        tunable.set_max_tuning_duration(MAX_TUNING_MS)
+-        tunable.set_max_tuning_iterations(MAX_TUNING_ITERS)
+-        for src in ([path] if cached else []) + tables:
++            tunable.tuning_enable(False)
++            tunable.enable(True)
++            _prime(torch)
++            # torch picks its default filename on the first tunable GEMM, so read it after the prime.
+             try:
+-                tunable.read_file(str(src))
+-            except Exception:  # noqa: BLE001 - a stale / foreign file: the default pick
++                snap["filename"] = tunable.get_filename()
++            except Exception:  # noqa: BLE001
+                 pass
+-        try:
+-            _STATE["written"] = len(tunable.get_results() or ())
+-        except Exception:  # noqa: BLE001
+-            _STATE["written"] = 0
++            try:
++                validators = dict(tunable.get_validators() or ())
++            except Exception:  # noqa: BLE001
++                validators = {}
++            tables = shipped_tables(arch, validators)
++            train_tables = [p for p in tables if p.stem.endswith(TRAIN_SUFFIX)]
++            if training:
++                tables = train_tables
++            cached = path.exists() and _validators(_read(path)) == {
++                str(k): str(v) for k, v in validators.items()
++            }
++            if training:
++                cached = cached and bool(tables)
++            if not tables and (training or (not tune and not cached)):
++                _apply_snapshot(tunable, snap)
++                return False
++            tunable.set_filename(str(path), insert_device_ordinal = False)
++            tunable.set_max_tuning_duration(MAX_TUNING_MS)
++            tunable.set_max_tuning_iterations(MAX_TUNING_ITERS)
++            for src in ([path] if cached else []) + tables:
++                if not tunable.read_file(str(src)):
++                    raise RuntimeError(f"TunableOp could not read {src.name}")
++            try:
++                written = len(tunable.get_results() or ())
++            except Exception:  # noqa: BLE001
++                written = 0
++        except BaseException:
++            _apply_snapshot(tunable, snap)
++            raise
+         _STATE.update(
+             active = True,
+             depth = 0,
++            written = written,
+             file = str(path),
+             last_key = None,
+             tune = tune,
+-            prev_enabled = prev_enabled,
++            snapshot = snap,
++            train = bool(train_tables),
+         )
+     if logger is not None:
+         logger.info(
+@@ -280,7 +347,7 @@ def _prime(torch: Any) -> None:
+ def _read(path: Path) -> str:
+     try:
+         return path.read_text(encoding = "utf-8")
+-    except OSError:
++    except (OSError, ValueError):
+         return ""
+ 
+ 
+@@ -339,13 +406,9 @@ def _restore(tunable: Any) -> None:
+     # Caller holds _LOCK.
+     if _STATE["active"]:
+         _write(tunable)
+-        try:
+-            tunable.tuning_enable(False)
+-            tunable.enable(bool(_STATE.get("prev_enabled")))
+-        except Exception:  # noqa: BLE001
+-            pass
++        _apply_snapshot(tunable, _STATE.get("snapshot"))
+     _STATE["owners"].clear()
+-    _STATE.update(active = False, depth = 0)
++    _STATE.update(active = False, depth = 0, snapshot = None, train = False)
+ 
+ 
+ def _remove_hooks(pipe: Any) -> None:
+@@ -417,5 +480,24 @@ def release(pipe: Any) -> None:
+     _remove_hooks(pipe)
+ 
+ 
++_TRAIN_OWNER = object()
++
++
++def install_for_training(device: Any = None, logger: Any = None) -> bool:
++    """Read-only (never tunes). gfx1151 FLUX.2-klein-4B LoRA: 8.34 -> 7.39 s/step with the 39 training shapes."""
++    ok, why = eligible(device)
++    if not ok:
++        return False
++    with _LOCK:
++        if not _activate(why, logger, training = True):
++            return False
++        _STATE["owners"].add(_TRAIN_OWNER)
++    return True
++
++
++def release_training() -> None:
++    _drop(_TRAIN_OWNER)
++
++
+ def is_active() -> bool:
+     return bool(_STATE["active"])
+diff --git a/studio/backend/core/inference/rocm_gemm_tables/gfx1151_torch2.11.0_hip713_qwenimage21_flux3klein_1024.csv b/studio/backend/core/inference/rocm_gemm_tables/gfx1151_torch2.11.0_hip713_qwenimage21_flux3klein_1024.csv
+deleted file mode 100644
+index 3ba0307305..0000000000
+--- a/studio/backend/core/inference/rocm_gemm_tables/gfx1151_torch2.11.0_hip713_qwenimage21_flux3klein_1024.csv
++++ /dev/null
+@@ -1,30 +0,0 @@
+-Validator,PT_VERSION,2.11.0
+-Validator,HIP_VERSION,713
+-Validator,HIPBLASLT_VERSION,100300-02d4f738fc
+-Validator,GCN_ARCH_NAME,gfx1151
+-Validator,ROCBLAS_VERSION,5.4.0.02d4f738fc
+-GemmTunableOp_BFloat16_TN,tn_6144_1_3072_ld_3072_3072_6144,Gemm_Hipblaslt_667,0.11484694927930833
+-GemmTunableOp_BFloat16_TN,tn_3072_4176_9216_ld_9216_9216_3072,Gemm_Hipblaslt_629,7.338281750679016
+-GemmTunableOp_BFloat16_TN,tn_18432_4176_3072_ld_3072_3072_18432,Gemm_Hipblaslt_629,14.003121376037598
+-GemmTunableOp_BFloat16_TN,tn_3072_4176_3072_ld_3072_3072_3072,Gemm_Hipblaslt_629,2.2569542114551253
+-GemmTunableOp_BFloat16_TN,tn_18432_4096_3072_ld_3072_3072_18432,Gemm_Hipblaslt_629,13.642011642456055
+-GemmTunableOp_BFloat16_TN,tn_3072_4096_3072_ld_3072_3072_3072,Gemm_Hipblaslt_629,2.213201541167039
+-GemmTunableOp_BFloat16_TN,tn_128_4096_3072_ld_3072_3072_128,Gemm_Hipblaslt_557,0.10843500010669231
+-GemmTunableOp_BFloat16_TN,tn_3072_80_9216_ld_9216_9216_3072,Gemm_Hipblaslt_565,0.31924929767847054
+-GemmTunableOp_BFloat16_TN,tn_18432_80_3072_ld_3072_3072_18432,Gemm_Hipblaslt_663,0.649364399909973
+-GemmTunableOp_BFloat16_TN,tn_3072_4096_9216_ld_9216_9216_3072,Gemm_Hipblaslt_629,7.2732932567596436
+-GemmTunableOp_BFloat16_TN,tn_64_4096_4096_ld_4096_4096_64,Gemm_Hipblaslt_605,0.08287774957716466
+-GemmTunableOp_BFloat16_TN,tn_24576_4096_4096_ld_4096_4096_24576,Gemm_Hipblaslt_547,24.405466079711914
+-GemmTunableOp_BFloat16_TN,tn_4096_4096_4096_ld_4096_4096_4096,Gemm_Hipblaslt_547,4.392675797144571
+-GemmTunableOp_BFloat16_TN,tn_3072_1_256_ld_256_256_3072,Gemm_Hipblaslt_649,0.01066969996318221
+-GemmTunableOp_BFloat16_TN,tn_3072_80_20480_ld_20480_20480_3072,Gemm_Hipblaslt_669,0.9796434998512268
+-GemmTunableOp_BFloat16_TN,tn_9216_1_3072_ld_3072_3072_9216,Gemm_Hipblaslt_667,0.2518795467913151
+-GemmTunableOp_BFloat16_TN,tn_16384_2_4096_ld_4096_4096_16384,Gemm_Hipblaslt_664,0.6665960043668747
+-GemmTunableOp_BFloat16_TN,tn_4096_2_4096_ld_4096_4096_4096,Gemm_Hipblaslt_667,0.05601640045642853
+-GemmTunableOp_BFloat16_TN,tn_4096_4096_12288_ld_12288_12288_4096,Gemm_Hipblaslt_547,14.220678806304932
+-GemmTunableOp_BFloat16_TN,tn_12288_4096_4096_ld_4096_4096_12288,Gemm_Hipblaslt_547,12.396608352661133
+-GemmTunableOp_BFloat16_TN,tn_4096_2_256_ld_256_256_4096,Gemm_Hipblaslt_652,0.012021700059995056
+-GemmTunableOp_BFloat16_TN,tn_3072_1_3072_ld_3072_3072_3072,Gemm_Hipblaslt_666,0.03424699939787389
+-GemmTunableOp_BFloat16_TN,tn_3072_80_3072_ld_3072_3072_3072,Gemm_Hipblaslt_615,0.07518800012767314
+-GemmTunableOp_BFloat16_TT,tt_3072_4096_128_ld_128_4096_3072,Gemm_Rocblas_-1162085804,0.1158729501068592
+-GemmTunableOp_BFloat16_TT,tt_4096_4096_64_ld_64_4096_4096,Gemm_Rocblas_-1162085812,0.10524164959788321
+diff --git a/studio/backend/core/inference/rocm_gemm_tables/gfx1151_torch2.11.0_hip713_qwenimage21_flux3klein_1024_flux2klein4b_train.csv b/studio/backend/core/inference/rocm_gemm_tables/gfx1151_torch2.11.0_hip713_qwenimage21_flux3klein_1024_flux2klein4b_train.csv
+new file mode 100644
+index 0000000000..e2434f69fe
+--- /dev/null
++++ b/studio/backend/core/inference/rocm_gemm_tables/gfx1151_torch2.11.0_hip713_qwenimage21_flux3klein_1024_flux2klein4b_train.csv
+@@ -0,0 +1,69 @@
++Validator,PT_VERSION,2.11.0
++Validator,HIP_VERSION,713
++Validator,HIPBLASLT_VERSION,100300-02d4f738fc
++Validator,GCN_ARCH_NAME,gfx1151
++Validator,ROCBLAS_VERSION,5.4.0.02d4f738fc
++GemmTunableOp_BFloat16_TN,tn_6144_1_3072_ld_3072_3072_6144,Gemm_Hipblaslt_667,0.11484694927930833
++GemmTunableOp_BFloat16_TN,tn_3072_4176_9216_ld_9216_9216_3072,Gemm_Hipblaslt_629,7.338281750679016
++GemmTunableOp_BFloat16_TN,tn_18432_4176_3072_ld_3072_3072_18432,Gemm_Hipblaslt_629,14.003121376037598
++GemmTunableOp_BFloat16_TN,tn_3072_4176_3072_ld_3072_3072_3072,Gemm_Hipblaslt_629,2.2569542114551253
++GemmTunableOp_BFloat16_TN,tn_18432_4096_3072_ld_3072_3072_18432,Gemm_Hipblaslt_629,13.642011642456055
++GemmTunableOp_BFloat16_TN,tn_3072_4096_3072_ld_3072_3072_3072,Gemm_Hipblaslt_629,2.213201541167039
++GemmTunableOp_BFloat16_TN,tn_128_4096_3072_ld_3072_3072_128,Gemm_Hipblaslt_557,0.10843500010669231
++GemmTunableOp_BFloat16_TN,tn_3072_80_9216_ld_9216_9216_3072,Gemm_Hipblaslt_565,0.31924929767847054
++GemmTunableOp_BFloat16_TN,tn_18432_80_3072_ld_3072_3072_18432,Gemm_Hipblaslt_663,0.649364399909973
++GemmTunableOp_BFloat16_TN,tn_3072_4096_9216_ld_9216_9216_3072,Gemm_Hipblaslt_629,7.2732932567596436
++GemmTunableOp_BFloat16_TN,tn_64_4096_4096_ld_4096_4096_64,Gemm_Hipblaslt_605,0.08287774957716466
++GemmTunableOp_BFloat16_TN,tn_24576_4096_4096_ld_4096_4096_24576,Gemm_Hipblaslt_547,24.405466079711914
++GemmTunableOp_BFloat16_TN,tn_4096_4096_4096_ld_4096_4096_4096,Gemm_Hipblaslt_547,4.392675797144571
++GemmTunableOp_BFloat16_TN,tn_3072_1_256_ld_256_256_3072,Gemm_Hipblaslt_649,0.01066969996318221
++GemmTunableOp_BFloat16_TN,tn_3072_80_20480_ld_20480_20480_3072,Gemm_Hipblaslt_669,0.9796434998512268
++GemmTunableOp_BFloat16_TN,tn_9216_1_3072_ld_3072_3072_9216,Gemm_Hipblaslt_667,0.2518795467913151
++GemmTunableOp_BFloat16_TN,tn_16384_2_4096_ld_4096_4096_16384,Gemm_Hipblaslt_664,0.6665960043668747
++GemmTunableOp_BFloat16_TN,tn_4096_2_4096_ld_4096_4096_4096,Gemm_Hipblaslt_667,0.05601640045642853
++GemmTunableOp_BFloat16_TN,tn_4096_4096_12288_ld_12288_12288_4096,Gemm_Hipblaslt_547,14.220678806304932
++GemmTunableOp_BFloat16_TN,tn_12288_4096_4096_ld_4096_4096_12288,Gemm_Hipblaslt_547,12.396608352661133
++GemmTunableOp_BFloat16_TN,tn_4096_2_256_ld_256_256_4096,Gemm_Hipblaslt_652,0.012021700059995056
++GemmTunableOp_BFloat16_TN,tn_3072_1_3072_ld_3072_3072_3072,Gemm_Hipblaslt_666,0.03424699939787389
++GemmTunableOp_BFloat16_TN,tn_3072_80_3072_ld_3072_3072_3072,Gemm_Hipblaslt_615,0.07518800012767314
++GemmTunableOp_BFloat16_TT,tt_3072_4096_128_ld_128_4096_3072,Gemm_Rocblas_-1162085804,0.1158729501068592
++GemmTunableOp_BFloat16_TT,tt_4096_4096_64_ld_64_4096_4096,Gemm_Rocblas_-1162085812,0.10524164959788321
++GemmTunableOp_BFloat16_NT,nt_16_3072_3840_ld_16_3072_16,Gemm_Hipblaslt_266,0.048903999477624895
++GemmTunableOp_BFloat16_NT,nt_3072_16_4352_ld_3072_16_3072,Gemm_Hipblaslt_270,0.048470049910247316
++GemmTunableOp_BFloat16_NT,nt_3072_16_3840_ld_3072_16_3072,Gemm_Hipblaslt_271,0.04114250000566245
++GemmTunableOp_BFloat16_NT,nt_16_3072_4352_ld_16_3072_16,Gemm_Hipblaslt_311,0.07082954980432987
++GemmTunableOp_BFloat16_NT,nt_16_27648_4352_ld_16_27648_16,Gemm_Rocblas_-1162084582,1.0735250949859618
++GemmTunableOp_BFloat16_NT,nt_12288_16_4352_ld_12288_16_12288,Gemm_Hipblaslt_272,0.480920447409153
++GemmTunableOp_BFloat16_NN,nn_3072_3840_3072_ld_3072_3072_3072,Gemm_Hipblaslt_386,1.9622139215469359
++GemmTunableOp_BFloat16_NN,nn_3072_3840_128_ld_3072_128_3072,Gemm_Rocblas_-1162085395,0.11106794960796834
++GemmTunableOp_BFloat16_NN,nn_12288_4352_3072_ld_12288_3072_12288,Gemm_Hipblaslt_386,9.086363474527994
++GemmTunableOp_BFloat16_NN,nn_3072_512_3072_ld_3072_3072_3072,Default,0.25953459888696667
++GemmTunableOp_BFloat16_NN,nn_16_4352_3072_ld_16_3072_16,Gemm_Hipblaslt_465,0.06458765007555485
++GemmTunableOp_BFloat16_NN,nn_3072_3840_16_ld_3072_16_3072,Gemm_Rocblas_-1162085405,0.049930249713361255
++GemmTunableOp_BFloat16_NN,nn_12288_4352_16_ld_12288_16_12288,Gemm_Rocblas_-1162085423,0.5385863989591597
++GemmTunableOp_BFloat16_NN,nn_3072_4352_16_ld_3072_16_3072,Gemm_Rocblas_-1162085394,0.05396205000579357
++GemmTunableOp_BFloat16_NN,nn_3072_4352_27648_ld_3072_27648_3072,Gemm_Hipblaslt_387,22.533302307128906
++GemmTunableOp_BFloat16_NN,nn_9216_512_3072_ld_9216_3072_9216,Gemm_Hipblaslt_384,0.7806536912918091
++GemmTunableOp_BFloat16_NN,nn_9216_3840_3072_ld_9216_3072_9216,Gemm_Hipblaslt_386,5.848443603515625
++GemmTunableOp_BFloat16_NN,nn_16_4352_27648_ld_16_27648_16,Gemm_Hipblaslt_332,1.0681630551815033
++GemmTunableOp_BFloat16_NN,nn_3072_512_18432_ld_3072_18432_3072,Gemm_Hipblaslt_386,1.8725746721029282
++GemmTunableOp_BFloat16_NN,nn_3072_3840_18432_ld_3072_18432_3072,Gemm_Hipblaslt_386,13.616206169128418
++GemmTunableOp_BFloat16_NN,nn_16_3840_3072_ld_16_3072_16,Gemm_Hipblaslt_382,0.05271020028740168
++GemmTunableOp_BFloat16_TT,tt_3072_3840_128_ld_128_3840_3072,Default,0.10734609998762606
++GemmTunableOp_BFloat16_TN,tn_128_3840_3072_ld_3072_3072_128,Gemm_Hipblaslt_621,0.09203865006566048
++GemmTunableOp_BFloat16_TN,tn_3072_4352_16_ld_16_16_3072,Gemm_Rocblas_-1162084603,0.0737991999834776
++GemmTunableOp_BFloat16_TN,tn_16_4352_12288_ld_12288_12288_16,Gemm_Hipblaslt_657,0.5360864520072935
++GemmTunableOp_BFloat16_TN,tn_3072_4352_12288_ld_12288_12288_3072,Gemm_Hipblaslt_629,11.838710308074951
++GemmTunableOp_BFloat16_TN,tn_27648_4352_16_ld_16_16_27648,Gemm_Rocblas_-1162084606,1.114407551288605
++GemmTunableOp_BFloat16_TN,tn_18432_1_3072_ld_3072_3072_18432,Gemm_Hipblaslt_667,0.4868722975254059
++GemmTunableOp_BFloat16_TN,tn_3072_3840_3072_ld_3072_3072_3072,Gemm_Hipblaslt_629,1.9564220666885377
++GemmTunableOp_BFloat16_TN,tn_16_4352_3072_ld_3072_3072_16,Gemm_Hipblaslt_643,0.04162049964070322
++GemmTunableOp_BFloat16_TN,tn_16_3840_3072_ld_3072_3072_16,Gemm_Hipblaslt_644,0.03791259974241256
++GemmTunableOp_BFloat16_TN,tn_3072_512_9216_ld_9216_9216_3072,Gemm_Hipblaslt_574,0.8674886018037796
++GemmTunableOp_BFloat16_TN,tn_3072_512_7680_ld_7680_7680_3072,Gemm_Hipblaslt_554,0.6664359480142593
++GemmTunableOp_BFloat16_TN,tn_18432_3840_3072_ld_3072_3072_18432,Gemm_Hipblaslt_629,12.493666172027588
++GemmTunableOp_BFloat16_TN,tn_27648_4352_3072_ld_3072_3072_27648,Gemm_Hipblaslt_629,21.242507934570312
++GemmTunableOp_BFloat16_TN,tn_3072_3840_16_ld_16_16_3072,Gemm_Rocblas_-1162084603,0.06445174962282181
++GemmTunableOp_BFloat16_TN,tn_3072_3840_9216_ld_9216_9216_3072,Gemm_Hipblaslt_629,6.255592703819275
++GemmTunableOp_BFloat16_TN,tn_3072_512_3072_ld_3072_3072_3072,Gemm_Hipblaslt_554,0.2702801018953323
++GemmTunableOp_BFloat16_TN,tn_18432_512_3072_ld_3072_3072_18432,Gemm_Hipblaslt_547,1.682581116171444
+diff --git a/studio/backend/core/training/diffusion_dit_trainer.py b/studio/backend/core/training/diffusion_dit_trainer.py
+index ed3daa36b7..e73cba4020 100644
+--- a/studio/backend/core/training/diffusion_dit_trainer.py
++++ b/studio/backend/core/training/diffusion_dit_trainer.py
+@@ -3790,6 +3790,26 @@ def _compile_engagement_warning(before, after) -> Optional[str]:
+     return None
+ 
+ 
++def _install_rocm_tunableop(device) -> bool:
++    if device != "cuda" or not torch_is_rocm():
++        return False
++    import logging
++    try:
++        from core.inference import diffusion_rocm_tunableop as rocm_tunableop
++        return bool(rocm_tunableop.install_for_training(None, logging.getLogger(__name__)))
++    except Exception as exc:  # noqa: BLE001 - keep torch's default GEMM pick
++        logging.getLogger(__name__).warning("rocm tunableop: %s", exc)
++        return False
++
++
++def _release_rocm_tunableop() -> None:
++    try:
++        from core.inference import diffusion_rocm_tunableop as rocm_tunableop
++        rocm_tunableop.release_training()
++    except Exception:  # noqa: BLE001
++        pass
++
++
+ def run_dit_lora_training(
+     config: DiffusionLoraConfig,
+     *,
+@@ -3927,6 +3947,7 @@ def run_dit_lora_training(
+             )
+     # Restore TF32 / cudnn.benchmark on exit, so in-process callers see no lasting change.
+     perf_snap = _apply_perf_flags(cfg, device)
++    tunableop = _install_rocm_tunableop(device)
+     failed = True
+     try:
+         out = _train_dit(
+@@ -3947,6 +3968,8 @@ def run_dit_lora_training(
+         return out
+     finally:
+         _restore_perf_flags(perf_snap)
++        if tunableop:
++            _release_rocm_tunableop()
+         if launched is not None:
+             launched.close(failed = failed)
+ 
+diff --git a/studio/backend/tests/test_diffusion_rocm_tunableop.py b/studio/backend/tests/test_diffusion_rocm_tunableop.py
+index 4ffc5cfcf6..265b4a0196 100644
+--- a/studio/backend/tests/test_diffusion_rocm_tunableop.py
++++ b/studio/backend/tests/test_diffusion_rocm_tunableop.py
+@@ -18,10 +18,31 @@ from core.inference import diffusion_rocm_tunableop as rt  # noqa: E402
+ class FakeTunable:
+     def __init__(self):
+         self.enabled = False
+-        self.tuning = False
++        self.tuning = True
+         self.calls = []
+         self.results = {}
+-        self.filename = None
++        self.filename = "user.csv"
++        self.iterations = 77
++        self.duration = 91
++        self.read_ok = True
++
++    def state(self):
++        return (self.enabled, self.tuning, self.filename, self.iterations, self.duration)
++
++    def is_enabled(self):
++        return self.enabled
++
++    def tuning_is_enabled(self):
++        return self.tuning
++
++    def get_filename(self):
++        return self.filename
++
++    def get_max_tuning_iterations(self):
++        return self.iterations
++
++    def get_max_tuning_duration(self):
++        return self.duration
+ 
+     def enable(self, v = True):
+         self.enabled = bool(v)
+@@ -39,14 +60,16 @@ class FakeTunable:
+         self.filename = name
+ 
+     def set_max_tuning_duration(self, ms):
++        self.duration = ms
+         self.calls.append(("duration", ms))
+ 
+     def set_max_tuning_iterations(self, n):
++        self.iterations = n
+         self.calls.append(("iters", n))
+ 
+     def read_file(self, name = None):
+         self.calls.append(("read", name))
+-        return True
++        return self.read_ok
+ 
+     def get_results(self):
+         return tuple(
+@@ -82,6 +105,11 @@ def fake(monkeypatch, tmp_path):
+         "read_file",
+         "get_results",
+         "get_validators",
++        "is_enabled",
++        "tuning_is_enabled",
++        "get_filename",
++        "get_max_tuning_iterations",
++        "get_max_tuning_duration",
+     ):
+         monkeypatch.setattr(torch.cuda.tunable, name, getattr(f, name))
+     monkeypatch.setattr(rt, "is_rocm_torch", lambda _t: True)
+@@ -93,8 +121,12 @@ def fake(monkeypatch, tmp_path):
+     monkeypatch.setattr(rt, "_prime", lambda _torch: None)
+     for k in [k for k in __import__("os").environ if k.startswith("PYTORCH_TUNABLEOP_")]:
+         monkeypatch.delenv(k)
++    for k in ("HIPBLASLT_WORKSPACE_SIZE", "CUBLASLT_WORKSPACE_SIZE"):
++        monkeypatch.delenv(k, raising = False)
++    rt._STATE["owners"].clear()
+     rt._STATE.update(active = False, depth = 0, written = 0, file = None, tune = False)
+     yield f
++    rt._STATE["owners"].clear()
+     rt._STATE.update(active = False, depth = 0, written = 0, file = None, tune = False)
+ 
+ 
+@@ -169,9 +201,10 @@ def test_declines(fake, monkeypatch, why):
+ 
+ def test_uninstall_restores_the_default_pick(fake):
+     pipe = _pipe(fake)
++    before = fake.state()
+     rt.install_for_pipe(pipe)
+     rt.uninstall(pipe)
+-    assert not fake.enabled and not fake.tuning
++    assert fake.state() == before
+     assert not pipe.transformer._forward_pre_hooks and not pipe.transformer._forward_hooks
+     assert not rt.is_active()
+ 
+@@ -356,3 +389,188 @@ def test_windows_and_linux_gfx1151_builds_each_get_their_own_table():
+                 assert other_path not in rt.shipped_tables("gfx1151", validators)
+     windows = by_hip["714"][1]
+     assert windows["PT_VERSION"] == "2.11.0" and windows["HIPBLASLT_VERSION"].startswith("100401-")
++
++
++def _write_table(
++    tmp_path,
++    fake,
++    name = "gfx1151_train.csv",
++):
++    rt._STATE["owners"].clear()  # earlier tests' pipes may still hold claims
++    d = tmp_path / "tables"
++    d.mkdir(exist_ok = True)
++    rows = [f"Validator,{k},{v}" for k, v in fake.get_validators()]
++    rows.append(
++        "GemmTunableOp_BFloat16_NN,nn_3072_3840_3072_ld_3072_3072_3072,Gemm_Hipblaslt_386,1.96"
++    )
++    (d / name).write_text("\n".join(rows) + "\n", encoding = "utf-8")
++    return d / name
++
++
++def test_training_reads_the_shipped_table_never_tunes_and_release_restores(
++    fake, tmp_path, monkeypatch
++):
++    monkeypatch.delenv(rt.TUNABLEOP_ENV)
++    table = _write_table(tmp_path, fake)
++    assert rt.install_for_training()
++    assert fake.enabled and not fake.tuning
++    assert ("read", str(table)) in fake.calls
++    assert rt.is_active()
++    rt.release_training()
++    assert not fake.enabled and not rt.is_active()
++
++
++def test_training_without_a_matching_table_leaves_torch_alone(fake, monkeypatch):
++    monkeypatch.delenv(rt.TUNABLEOP_ENV)
++    assert not rt.install_for_training()
++    assert not fake.enabled and not rt.is_active()
++
++
++def test_training_release_keeps_a_pipe_claim(fake, tmp_path, monkeypatch):
++    monkeypatch.delenv(rt.TUNABLEOP_ENV)
++    _write_table(tmp_path, fake)
++    pipe = _pipe(fake)
++    assert rt.install_for_pipe(pipe)
++    assert rt.install_for_training()
++    rt.release_training()
++    assert rt.is_active() and fake.enabled  # the render pipe still owns the table
++    rt.release(pipe)
++    assert not rt.is_active() and not fake.enabled
++
++
++@pytest.mark.parametrize("why", ["kill", "user", "arch"])
++def test_training_declines(fake, tmp_path, monkeypatch, why):
++    monkeypatch.delenv(rt.TUNABLEOP_ENV)
++    _write_table(tmp_path, fake)
++    if why == "kill":
++        monkeypatch.setenv(rt.TUNABLEOP_ENV, "0")
++    elif why == "user":
++        monkeypatch.setenv("PYTORCH_TUNABLEOP_ENABLED", "1")
++    else:
++        monkeypatch.setattr(rt, "_arch", lambda device = None: "gfx1100")
++    assert not rt.install_for_training()
++    assert not fake.enabled
++
++
++def test_trainer_installs_only_on_rocm_cuda_and_releases(monkeypatch):
++    from core.training import diffusion_dit_trainer as ddt
++
++    seen = []
++    monkeypatch.setattr(
++        rt, "install_for_training", lambda device = None, logger = None: seen.append("i") or True
++    )
++    monkeypatch.setattr(rt, "release_training", lambda: seen.append("r"))
++    monkeypatch.setattr(ddt, "torch_is_rocm", lambda: False)
++    assert not ddt._install_rocm_tunableop("cuda")
++    monkeypatch.setattr(ddt, "torch_is_rocm", lambda: True)
++    assert not ddt._install_rocm_tunableop("cpu")
++    assert seen == []
++    assert ddt._install_rocm_tunableop("cuda")
++    ddt._release_rocm_tunableop()
++    assert seen == ["i", "r"]
++
++
++def test_shipped_training_table_is_well_formed():
++    from pathlib import Path
++
++    # Training GEMMs (NT / NN) share the inference table with no duplicate key.
++    (path,) = sorted((Path(rt.__file__).parent / "rocm_gemm_tables").glob("gfx1151_*_train.csv"))
++    rows = [
++        ln.split(",")
++        for ln in path.read_text(encoding = "utf-8").splitlines()
++        if ln and not ln.startswith("Validator,")
++    ]
++    keys = [(r[0], r[1]) for r in rows]
++    assert len(keys) == len(set(keys))
++    assert ("GemmTunableOp_BFloat16_NT", "nt_16_3072_3840_ld_16_3072_16") in keys
++    assert ("GemmTunableOp_BFloat16_NN", "nn_3072_3840_3072_ld_3072_3072_3072") in keys
++
++
++@pytest.mark.parametrize("var", ["HIPBLASLT_WORKSPACE_SIZE", "CUBLASLT_WORKSPACE_SIZE"])
++def test_a_user_workspace_cap_declines(fake, tmp_path, monkeypatch, var):
++    monkeypatch.delenv(rt.TUNABLEOP_ENV)
++    _write_table(tmp_path, fake)
++    monkeypatch.setenv(var, "0")
++    ok, why = rt.eligible()
++    assert not ok and var in why
++    assert not rt.install_for_training()
++    assert not rt.install_for_pipe(_pipe(fake))
++    assert not fake.enabled and not any(c[0] == "read" for c in fake.calls)
++
++
++def test_an_incompatible_table_leaves_every_setting_alone(fake, monkeypatch, tmp_path):
++    monkeypatch.delenv(rt.TUNABLEOP_ENV)
++    _table(tmp_path, (("PT_VERSION", "2.12.0"), ("GCN_ARCH_NAME", "gfx1151")))
++    before = fake.state()
++    assert not rt.install_for_pipe(_pipe(fake))
++    assert not rt.install_for_training()
++    assert fake.state() == before
++
++
++@pytest.mark.parametrize("who", ["pipe", "training"])
++def test_last_release_restores_every_setting(fake, tmp_path, monkeypatch, who):
++    monkeypatch.delenv(rt.TUNABLEOP_ENV)
++    _write_table(tmp_path, fake)
++    before = fake.state()
++    pipe = _pipe(fake)
++    assert rt.install_for_pipe(pipe) if who == "pipe" else rt.install_for_training()
++    assert fake.enabled and fake.iterations == rt.MAX_TUNING_ITERS and not fake.tuning
++    rt.release(pipe) if who == "pipe" else rt.release_training()
++    assert fake.state() == before and not rt.is_active()
++
++
++def test_trainer_with_a_malformed_local_cache_keeps_state_consistent(fake, tmp_path, monkeypatch):
++    from core.training import diffusion_dit_trainer as ddt
++
++    monkeypatch.delenv(rt.TUNABLEOP_ENV)
++    monkeypatch.setattr(ddt, "torch_is_rocm", lambda: True)
++    _write_table(tmp_path, fake)
++    cache = rt.results_file("gfx1151")
++    cache.parent.mkdir(parents = True, exist_ok = True)
++    cache.write_bytes(b"\xff\xfe\x00bad")
++    before = fake.state()
++    ok = ddt._install_rocm_tunableop("cuda")
++    assert ok == fake.enabled == rt.is_active()
++    ddt._release_rocm_tunableop()
++    assert fake.state() == before and not rt.is_active()
++
++
++def test_a_failed_read_is_a_failure_and_restores(fake, tmp_path, monkeypatch):
++    from core.training import diffusion_dit_trainer as ddt
++
++    monkeypatch.delenv(rt.TUNABLEOP_ENV)
++    monkeypatch.setattr(ddt, "torch_is_rocm", lambda: True)
++    _write_table(tmp_path, fake)
++    fake.read_ok = False
++    before = fake.state()
++    assert not ddt._install_rocm_tunableop("cuda")
++    assert fake.state() == before and not rt.is_active()
++    with pytest.raises(RuntimeError):
++        rt.install_for_pipe(_pipe(fake))
++    assert fake.state() == before and not rt.is_active()
++
++
++def test_training_skips_inference_only_tables(fake, tmp_path, monkeypatch):
++    monkeypatch.delenv(rt.TUNABLEOP_ENV)
++    table = _write_table(tmp_path, fake, name = "gfx1151_windows.csv")
++    before = fake.state()
++    assert not rt.install_for_training()
++    assert fake.state() == before and not any(c[0] == "read" for c in fake.calls)
++    pipe = _pipe(fake)
++    assert rt.install_for_pipe(pipe) and ("read", str(table)) in fake.calls
++    assert (
++        not rt.install_for_training()
++    )  # an inference-only table already active: no training claim
++    rt.release(pipe)
++    assert fake.state() == before and not rt.is_active()
++
++
++def test_only_the_linux_shipped_table_serves_training():
++    from pathlib import Path
++
++    root = Path(rt.__file__).resolve().parent.joinpath("rocm_gemm_tables")
++    train = {}
++    for path in sorted(root.glob("gfx1151_*.csv")):
++        hip = rt._validators(path.read_text(encoding = "utf-8"))["HIP_VERSION"]
++        train[hip] = path.stem.endswith(rt.TRAIN_SUFFIX)
++    assert train == {"713": True, "714": False}
