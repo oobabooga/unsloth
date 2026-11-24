@@ -1,0 +1,39 @@
+name: AMD DevLab PR595 probe
+
+on:
+  push:
+    branches: [amd-devlab-pr595]
+
+permissions: {}
+
+jobs:
+  amd:
+    runs-on: [self-hosted, Linux, strix-halo, devlab-dispatch]
+    timeout-minutes: 45
+    steps:
+      - name: Hardware
+        run: |
+          uname -a; free -h | head -2
+          lspci -nn | grep -iE 'vga|display' || true
+          ls /opt | head; ls /opt/rocm* -d 2>/dev/null || echo "no /opt/rocm"
+          which rocminfo rocm-smi vulkaninfo 2>/dev/null || true
+          rocminfo 2>/dev/null | grep -E 'Marketing Name|gfx' | head || true
+          for d in /sys/class/drm/card*/device; do echo "$d driver=$(basename $(readlink -f $d/driver)) bdf=$(basename $(readlink -f $d))"; for f in mem_info_vram_total mem_info_vram_used mem_info_gtt_total mem_info_gtt_used mem_info_vis_vram_total; do [ -f $d/$f ] && echo "  $f=$(cat $d/$f)"; done; done
+          ls /usr/share/vulkan/icd.d/ 2>/dev/null || true
+          ldconfig -p | grep -iE 'libvulkan' || echo "no libvulkan"
+      - name: Torch ROCm for gfx1151
+        run: |
+          WORK_ROOT="$RUNNER_TEMP/w"; mkdir -p $WORK_ROOT/tmp
+          python3 -m venv $WORK_ROOT/venv; . $WORK_ROOT/venv/bin/activate
+          export TMPDIR=$WORK_ROOT/tmp PIP_CACHE_DIR=$WORK_ROOT/pipcache
+          pip install -q --upgrade pip
+          pip install -q --index-url https://rocm.nightlies.amd.com/v2/gfx1151/ torch 2>&1 | tail -3
+          python - <<'PY'
+          import torch
+          print("torch", torch.__version__, "hip", torch.version.hip, "avail", torch.cuda.is_available())
+          if torch.cuda.is_available():
+              p = torch.cuda.get_device_properties(0)
+              print("name", p.name, "total_memory", p.total_memory)
+              print("pci", getattr(p, "pci_domain_id", None), getattr(p, "pci_bus_id", None), getattr(p, "pci_device_id", None))
+              print("mem_get_info", torch.cuda.mem_get_info(0))
+          PY
