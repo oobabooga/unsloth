@@ -28,6 +28,14 @@ jobs:
           git clone -q --depth 1 -b rocm-free-vram https://github.com/oobabooga/unsloth.git $W/pr
           (cd $W/pr && git log --oneline -1)
           curl -sL https://raw.githubusercontent.com/oobabooga/unsloth/amd-devlab-pr595/probe.py -o $W/probe.py
+          echo "##### install what core.training.worker imports"
+          for i in $(seq 1 30); do
+            m=$(cd $W/pr/studio/backend && python -c "import core.training.worker" 2>&1 | grep -oE "No module named '[^'.]+" | sed "s/No module named '//" | head -1)
+            [ -z "$m" ] && break
+            case "$m" in yaml) pkg=pyyaml;; PIL) pkg=pillow;; sklearn) pkg=scikit-learn;; dateutil) pkg=python-dateutil;; jose) pkg=python-jose;; multipart) pkg=python-multipart;; *) pkg=$m;; esac
+            echo "installing $pkg"; pip install -q "$pkg" 2>&1 | tail -1
+          done
+          (cd $W/pr/studio/backend && python -c "import core.training.worker; print('core.training.worker imports')" 2>&1 | tail -2)
           echo "##### idle"
           python $W/probe.py $W/main/studio/backend main
           python $W/probe.py $W/pr/studio/backend pr
