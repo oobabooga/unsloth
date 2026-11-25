@@ -5,12 +5,18 @@ import { getInferenceStatus, unloadModel } from "@/features/chat/api/chat-api";
 import { confirmStopRunningChatsIfNeeded } from "@/features/chat/utils/confirm-stop-running-chats";
 import { requestScopedLocalPromptQueueStop } from "@/features/chat/utils/prompt-queue-boundary";
 
+// Two quants of one repo share active_model, so the quant is part of which copy is active.
+const activeCopy = (status: {
+  active_model?: string | null;
+  gguf_variant?: string | null;
+}) => `${status.active_model ?? ""}:${status.gguf_variant ?? ""}`;
+
 /** /unload refuses while chats generate on the model unless forced, so ask first.
  *  False when the user keeps them running: nothing was unloaded. */
 export async function unloadAfterChatStopConfirmation(
   modelPath: string,
 ): Promise<boolean> {
-  const activeBefore = (await getInferenceStatus()).active_model;
+  const activeBefore = activeCopy(await getInferenceStatus());
   const decision = await confirmStopRunningChatsIfNeeded(
     "Unloading this model",
     "unloadOne",
@@ -20,7 +26,7 @@ export async function unloadAfterChatStopConfirmation(
   // A forced unload cancels the chats of whatever model is active, so ask again if it changed while the dialog was open.
   if (
     decision.forceCancelActive &&
-    (await getInferenceStatus()).active_model !== activeBefore
+    activeCopy(await getInferenceStatus()) !== activeBefore
   ) {
     return unloadAfterChatStopConfirmation(modelPath);
   }

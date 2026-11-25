@@ -175,3 +175,14 @@ test("a model switched in while the dialog is open is asked about before anythin
   assert.equal(stub.state.confirmCalls.length, 2);
   assert.deepEqual(stub.state.unloads, [{ model_path: QWEN, force_cancel_active: true }]);
 });
+
+test("another quant of the same repo swapped in during the dialog is asked about too", async () => {
+  stub.resetStub({ active: QWEN, loaded: [QWEN], generating: true });
+  stub.state.activeVariant = "Q4_K_M";
+  stub.state.confirmAnswer = { proceed: true, forceCancelActive: true };
+  stub.state.duringConfirm = () => {
+    stub.state.activeVariant = "Q8_0";
+  };
+  assert.equal(await unloadAfterChatStopConfirmation(QWEN), true);
+  assert.equal(stub.state.confirmCalls.length, 2);
+});

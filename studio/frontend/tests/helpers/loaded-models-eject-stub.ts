@@ -8,6 +8,7 @@ type UnloadPayload = { model_path: string; force_cancel_active?: boolean };
 
 export const state = {
   active: null as string | null,
+  activeVariant: null as string | null,
   loaded: [] as string[],
   servingCheckpoints: [] as string[],
   embeddingLoaded: false,
@@ -28,6 +29,7 @@ export function resetStub({
   generating = false,
 } = {}): void {
   state.active = active;
+  state.activeVariant = null;
   state.loaded = [...loaded];
   state.servingCheckpoints = [...servingCheckpoints];
   state.embeddingLoaded = embeddingLoaded;
@@ -43,6 +45,7 @@ export function resetStub({
 export async function getInferenceStatus() {
   return {
     active_model: state.active,
+    gguf_variant: state.activeVariant,
     loaded: [...state.loaded],
     serving_checkpoints: [...state.servingCheckpoints],
   };
