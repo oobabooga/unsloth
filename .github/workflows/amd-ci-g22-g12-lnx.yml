@@ -1,0 +1,105 @@
+name: "AMD CI: validate PR 19420"
+
+# Generated from amd_ci/templates/workflow.yml. Edit the PROBE and CRITERIA env
+# values, and the tests/args, rather than the plumbing.
+#
+# Two jobs, because two jobs of this workflow may land on the SAME machine and
+# then share its one GPU:
+#   suites  masks the GPU, so it cannot perturb a measurement running beside it
+#   gpu     is the only job allowed to allocate, and is serialised against every
+#           other run of the same concurrency group
+#
+# They may equally land on different machines: the Linux pool is at least seven
+# (a 24-way matrix ran essentially concurrently across seven distinct hosts).
+# Nothing is shared between them, including the Docker image cache, so a job that
+# pulls an image does not make it available to the next one.
+#
+# This is the LINUX template. For the Windows boxes use
+# `scaffold.py --windows`, which emits templates/workflow_windows.yml.
+#
+# If your change needs no GPU measurement, delete the gpu job. If it needs no
+# test suites, delete suites. Do not delete the gate: it fails rather than
+# skipping, because a skip misreports missing hardware as nothing to see.
+
+on:
+  push:
+    branches: [amd-ci-g22-g12-lnx]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  PR: "19420"
+  UPSTREAM: "https://github.com/unslothai/unsloth"
+  # Set to "1" for a PR already merged: compares the merge commit to its parent.
+  AMD1_BASE_OVERRIDE: "f5f755c2c9e040f494305f7a75c0f58eb0071ae4"
+  AMD1_HEAD_OVERRIDE: "c92b78c8373b11466ec13ace16720001e26be4e8"
+  MERGED: "0"
+  # Set by scaffold.py --patch: base = PATCH_BASE, head = PATCH_BASE plus this diff (relative to the checkout).
+  PATCH_BASE: ""
+  PATCH_FILE: ""
+  PATCH_SHA256: "__PATCH_SHA256__"
+
+jobs:
+
+  gpu:
+    name: "PR 19420 GPU check (shared GPU)"
+    runs-on: [self-hosted, Linux, strix-halo, devlab-dispatch]
+    timeout-minutes: 330
+    # --shared-gpu: no concurrency group, so a co-tenant may share the card.
+    # Correctness only; capability.py reports `exclusive_gpu` as a gap.
+    env:
+      AMD_CI_SHARED_GPU: "1"
+    steps:
+      - uses: actions/checkout@v4
+        with: { persist-credentials: false }
+
+      - name: Preamble
+        run: |
+          source amd_ci/lib/preamble.sh "pr19420-gpu"
+
+      - name: Hardware gate
+        run: |
+          set -euo pipefail
+          python3 amd_ci/lib/gate.py --no-torch --require rocm gpu \
+            --expect-arch gfx1151 --min-gpus 1 \
+            --out "$AMD_CI_WORK/out/host.json" || \
+          echo "note: gate ran before the venv exists; re-gated after install below"
+
+      - name: Resolve states
+        run: |
+          set -euo pipefail
+          ARGS=""
+          [ "$MERGED" = "1" ] && ARGS="--merged"
+          if [ -n "$PATCH_FILE" ]; then ARGS="--patch-base $PATCH_BASE --patch $GITHUB_WORKSPACE/$PATCH_FILE --patch-sha256 $PATCH_SHA256"; fi
+          python3 amd_ci/lib/states.py --repo "$UPSTREAM" --pr "$PR" $ARGS \
+            --root "$AMD_CI_WORK" --out "$AMD_CI_WORK/out/states.json"
+
+      - name: Environment and host gate (no Studio)
+        run: |
+          set -euo pipefail
+          echo "AMD_CI_PY=$(command -v python3)" >> "$GITHUB_ENV"
+          # No torch here, so rocm/gpu read UNDETERMINED: the criteria gates prove the GPU ran.
+          python3 "$GITHUB_WORKSPACE/amd_ci/lib/gate.py" --no-torch --out "$AMD_CI_WORK/out/host.json"
+
+      - name: Differential
+        run: |
+          set +e
+          "$AMD_CI_PY" amd_ci/lib/differential.py \
+            --states "$AMD_CI_WORK/out/states.json" \
+            --probe amd_ci/probes/train5_probe.py \
+            --criteria amd_ci/criteria/amdgate_rocm.py \
+            --out-dir "$AMD_CI_WORK/out/gpu" \
+            --python "$AMD_CI_PY" -- --unit g12 --state-repo unsloth --transformers 5.24.0 --trl 1.18.0 --cells env,flm16,flm4,grpo_txt,grpo_padeos,dpo_txt,vision,tphost,gen_llama,gen_llama_f32,gen_mistral,gen_gemma3 --companion-repo https://github.com/unslothai/unsloth-zoo --companion-base ebf37d36b9402b44c55f6d1108464380d3867d69 --companion-head 08e7d2e4c57bded2aeb28609563d46546ad8edd8 --venv "$AMD_CI_WORK/tvenv" --tests tests/test_mamba_fused_lora_adapters.py tests/test_cache_kwarg_rename.py tests/test_fa2_fast_generate_bypass.py tests/test_inkling2_prequantized.py tests/test_lora_gguf_export_errors.py tests/saving/test_save_method_lora_routing.py tests/test_merged_hub_destination.py tests/python/test_quantization_config_remap.py tests/python/test_loader_resolution_reporting.py studio/backend/tests/test_parallel_plan.py studio/backend/tests/test_parallel_launch.py studio/backend/tests/test_parallel_routes.py studio/backend/tests/test_incremental_streamer.py --repeat flm16,flm4,grpo_txt,dpo_txt,gen_llama,gen_mistral --companion-tests tests/test_cache_kwarg_family_patches.py tests/test_compiler_cache_kwarg_adapter.py tests/test_csm_cache_kwarg.py tests/test_gemma3_attention_patch_cache_kwarg.py tests/test_patch_function_cache_rename.py tests/test_qwen3_vl_moe_hidden_states_output.py tests/test_sparse_cache_kwarg.py tests/test_checkpoint_keyword_only_layer.py tests/test_temporary_patches_exhaustive.py tests/test_upstream_signatures.py tests/test_sparse_attention_flex.py tests/test_gemma3_forced_float32_plain_model.py tests/test_vlm_forced_float32_full_finetune_dtype.py tests/test_cpu_dpo_kto_chunked_logps.py tests/test_cpu_logits_to_keep_index.py --companion-tests-from-head tests/test_cache_kwarg_family_patches.py tests/test_compiler_cache_kwarg_adapter.py tests/test_csm_cache_kwarg.py tests/test_gemma3_attention_patch_cache_kwarg.py tests/test_patch_function_cache_rename.py tests/test_qwen3_vl_moe_hidden_states_output.py tests/test_sparse_cache_kwarg.py !tests/test_checkpoint_keyword_only_layer.py !tests/test_temporary_patches_exhaustive.py !tests/test_upstream_signatures.py !tests/test_sparse_attention_flex.py tests/test_gemma3_forced_float32_plain_model.py !tests/test_vlm_forced_float32_full_finetune_dtype.py tests/test_cpu_dpo_kto_chunked_logps.py tests/test_cpu_logits_to_keep_index.py --tests-from-head !tests/test_mamba_fused_lora_adapters.py tests/test_cache_kwarg_rename.py !tests/test_fa2_fast_generate_bypass.py !tests/test_inkling2_prequantized.py !tests/test_lora_gguf_export_errors.py !tests/saving/test_save_method_lora_routing.py !tests/test_merged_hub_destination.py tests/python/test_quantization_config_remap.py !tests/python/test_loader_resolution_reporting.py studio/backend/tests/test_parallel_plan.py studio/backend/tests/test_parallel_launch.py studio/backend/tests/test_parallel_routes.py !studio/backend/tests/test_incremental_streamer.py studio/backend/tests/parallel_launch_target.py
+          cat "$AMD_CI_WORK/out/gpu/VERDICT.md" >> "$GITHUB_STEP_SUMMARY"
+          # A finding keeps the job green; a NON-result (VOID / INCONCLUSIVE) does not.
+          python3 "$GITHUB_WORKSPACE/amd_ci/lib/announce.py" "$AMD_CI_WORK/out/gpu"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: pr19420-gpu
+          path: ${{ env.AMD_CI_WORK }}/out
+          retention-days: 7
+          if-no-files-found: warn
