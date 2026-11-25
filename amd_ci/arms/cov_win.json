@@ -1,0 +1,9 @@
+[
+ {"tag": "I1", "kind": "image", "model": "unsloth/MiniMax-H3-Image-GGUF",
+  "load": {"gguf_filename": "minimax_h3_image_pruned-UD-Q4_K_XL.gguf"}, "gen": {"width": 1024, "height": 1024},
+  "renders": 2, "timeout": 10800, "purge_after": true},
+ {"tag": "V1", "kind": "video", "model": "MiniMaxAI/MiniMax-H3", "load": {},
+  "gen": {"width": 832, "height": 480, "num_frames": 17}, "renders": 2, "png": 1, "timeout": 14400, "purge_after": true},
+ {"tag": "A1", "kind": "video", "model": "Wan-AI/Wan2.2-T2V-A14B-Diffusers", "load": {},
+  "gen": {"width": 832, "height": 480, "num_frames": 17}, "renders": 2, "png": 1, "timeout": 14400, "purge_after": true}
+]

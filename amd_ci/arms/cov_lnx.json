@@ -1,0 +1,4 @@
+[
+ {"tag": "V1", "kind": "video", "model": "MiniMaxAI/MiniMax-H3", "load": {},
+  "gen": {"width": 832, "height": 480, "num_frames": 17}, "renders": 2, "png": 1, "timeout": 14400, "purge_after": true}
+]
