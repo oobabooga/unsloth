@@ -5617,6 +5617,16 @@ with open(out_js, "w", encoding = "utf-8") as fh:
 """
 
 
+def _numel(x):
+    """numel of a logits object; Unsloth's EmptyLogits raises on any use (counts as 0 = empty, fused branch)."""
+    if x is None:
+        return None
+    try:
+        return int(x.numel())
+    except NotImplementedError:
+        return 0
+
+
 def _plain_check(path, tag):
     """unsloth #19464 / zoo #2768: a model loaded with plain transformers after `import unsloth` (never through an
     Unsloth loader) keeps its logits when given labels, and its logits / loss / greedy tokens equal a fresh process
@@ -5643,7 +5653,7 @@ def _plain_check(path, tag):
                            min_new_tokens = 12, do_sample = False, pad_token_id = tok.eos_token_id)
     l1 = getattr(o1, "logits", None)
     r["labels_logits_type"] = type(l1).__name__
-    r["labels_logits_numel"] = int(l1.numel()) if l1 is not None and hasattr(l1, "numel") else None
+    r["labels_logits_numel"] = _numel(l1)
     r["labels_logits_present"] = bool(r["labels_logits_numel"])
     r["loss"] = float(o1.loss) if getattr(o1, "loss", None) is not None else None
     r["gen"] = g[0, ids.shape[1]:].tolist()
@@ -5707,7 +5717,7 @@ def cell_plain_after():
         opt.zero_grad(set_to_none = True)
         losses.append(float(o.loss.detach()))
         lg = getattr(o, "logits", None)
-        numels.append(int(lg.numel()) if lg is not None and hasattr(lg, "numel") else None)
+        numels.append(_numel(lg))
     res["unsloth_logits_type"] = type(getattr(o, "logits", None)).__name__
     res["unsloth_logits_numels"] = numels
     res["unsloth_fused"] = all(not n for n in numels)
