@@ -16,10 +16,15 @@ const PARAGRAPH =
   "varies by audience, decade and medium. This paragraph exists to give the viewport real " +
   "prose to lay out and to wrap over several lines at this width.";
 
+/** A reply whose thinking block folds, as reasoning.tsx folds it: optional tool run under it, and an
+ *  unrelated element that can be removed separately. */
+type FoldScene = { foldPx: number; siblingPx: number; extraPx: number };
+
 function Harness(): ReactElement {
   const { ref, context } = useIntentAwareAutoScroll();
   const [blocks, setBlocks] = useState<string[]>([]);
   const [tail, setTail] = useState("");
+  const [scene, setScene] = useState<FoldScene | null>(null);
   const viewportRef = useRef<HTMLElement | null>(null);
   const spacerRef = useRef<HTMLDivElement>(null);
 
@@ -71,6 +76,40 @@ function Harness(): ReactElement {
       scrollToBottom(): void {
         context.scrollToBottom("instant");
       },
+      foldScene(blockCount: number, next: FoldScene): void {
+        setBlocks(Array.from({ length: blockCount }, (_, index) => `${index}`));
+        setTail("");
+        setScene(next);
+      },
+      /** The block hands itself to the hold while still open, then folds in the same task, as a
+       *  reduced-motion close does; its tool run hides with it. */
+      fold(collapsedPx: number): void {
+        const element = viewport();
+        const block = element?.querySelector<HTMLElement>('[data-smoke="fold"]');
+        if (!block) return;
+        context.holdThroughCollapse();
+        const body = block.firstElementChild as HTMLElement | null;
+        if (body) body.style.height = `${collapsedPx}px`;
+        element?.querySelector('[data-smoke="sibling"]')?.setAttribute("hidden", "");
+      },
+      removeExtra(): void {
+        viewport()?.querySelector('[data-smoke="extra"]')?.setAttribute("hidden", "");
+      },
+      /** Viewport-relative tops: a fold that keeps the reader still leaves these where they were. */
+      foldTops(): { block: number; tail: number; tailBottom: number; padding: number } {
+        const element = viewport();
+        const box = element?.getBoundingClientRect();
+        const block = element?.querySelector('[data-smoke="fold"]')?.getBoundingClientRect();
+        const reply = element?.querySelector('[data-smoke="reply-tail"]')?.getBoundingClientRect();
+        return {
+          block: block && box ? block.top - box.top : -1,
+          tail: reply && box ? reply.top - box.top : -1,
+          tailBottom: reply && box ? reply.bottom - box.top : -1,
+          padding: element
+            ? Number.parseFloat(element.style.getPropertyValue("--aui-scroll-stabilizer")) || 0
+            : 0,
+        };
+      },
       metrics(): { scrollHeight: number; scrollTop: number; clientHeight: number } {
         const element = viewport();
         if (!element) return { scrollHeight: -1, scrollTop: -1, clientHeight: -1 };
@@ -98,6 +137,9 @@ function Harness(): ReactElement {
           overflowY: "auto",
           padding: "16px",
           paddingBottom: "var(--aui-scroll-stabilizer, 0px)",
+          // As the thread viewport: a block container leaves its bottom padding out of scrollHeight.
+          display: "flex",
+          flexDirection: "column",
         }}
       >
         {blocks.map((id) => (
@@ -105,10 +147,28 @@ function Harness(): ReactElement {
             Message {id}. {PARAGRAPH}
           </p>
         ))}
-        <p data-smoke="tail" style={{ margin: "0 0 16px" }}>
-          {tail}
-        </p>
-        <div ref={spacerRef} data-smoke="spacer" style={{ height: "0px" }} />
+        {scene ? (
+          <div data-role="assistant" data-smoke="reply">
+            {scene.extraPx > 0 ? (
+              <div data-smoke="extra" style={{ height: `${scene.extraPx}px` }} />
+            ) : null}
+            <div data-slot="reasoning-root" data-smoke="fold">
+              <div style={{ height: `${scene.foldPx}px` }} />
+            </div>
+            {scene.siblingPx > 0 ? (
+              <div data-slot="tool-run-under-thinking" data-smoke="sibling" style={{ height: `${scene.siblingPx}px` }} />
+            ) : null}
+            <p data-smoke="reply-tail" style={{ margin: "0 0 16px" }}>
+              {tail || "The answer starts here."}
+            </p>
+          </div>
+        ) : (
+          <p data-smoke="tail" style={{ margin: "0 0 16px" }}>
+            {tail}
+          </p>
+        )}
+        {/* No flex shrink: the column would squeeze it to nothing and silent growth would not grow. */}
+        <div ref={spacerRef} data-smoke="spacer" style={{ height: "0px", flexShrink: 0 }} />
       </div>
     </IntentAwareScrollProvider>
   );

@@ -75,6 +75,120 @@ PUMP_INIT = """
 """
 
 
+# A thinking block folding as the answer starts (collapse-hold.ts). Reduced motion folds in one step;
+# the viewport is short so a first turn can come to fit inside it.
+FOLD_VIEWPORT = {"width": 1440, "height": 600}
+
+FOLD_CASES = (
+    "pinnedFits",
+    "pinnedFitsSettled",
+    "detachedFits",
+    "sibling",
+    "reuse",
+    "rebind",
+    "detachedGrowth",
+)
+
+# One case per page load, so padding one case leaves cannot reach the next.
+FOLD_CASE = """
+async (name) => {
+  const a = window.__autoscroll;
+  const frames = (n) => new Promise((resolve) => {
+    const step = (left) => (left <= 0 ? resolve() : requestAnimationFrame(() => step(left - 1)));
+    step(n);
+  });
+  const wait = (ms) => new Promise((r) => setTimeout(r, ms));
+  // A first turn that overflows by `overflow` px, sized with the reply's other content so the block
+  // keeps its height. Sized from an overflowing layout: scrollHeight never reads below the viewport.
+  const scene = async (blockCount, overflow, base) => {
+    a.foldScene(blockCount, { ...base, extraPx: 3000 });
+    await frames(3);
+    const m = a.metrics();
+    const extraPx = 3000 - (m.scrollHeight - m.clientHeight - overflow);
+    a.foldScene(blockCount, { ...base, extraPx });
+    await frames(3);
+    a.scrollToBottom();
+    await wait(100);
+  };
+  const foldAndRead = async (collapsedPx) => {
+    const before = { ...a.foldTops(), top: a.metrics().scrollTop };
+    a.fold(collapsedPx);
+    await frames(4);
+    const after = { ...a.foldTops(), top: a.metrics().scrollTop, clientHeight: a.metrics().clientHeight };
+    return { before, after };
+  };
+  const firstTurn = { foldPx: 188, siblingPx: 0, extraPx: 0 };
+  if (name === "pinnedFits") {
+    // A first turn at the bottom: 80 px of overflow, a 160 px fold, and the thread then fits.
+    await scene(0, 80, firstTurn);
+    return foldAndRead(28);
+  }
+  if (name === "pinnedFitsSettled") {
+    await scene(0, 80, firstTurn);
+    await wait(900);
+    return foldAndRead(28);
+  }
+  if (name === "detachedFits") {
+    await scene(0, 80, firstTurn);
+    a.scrollUpBy(24);
+    await wait(200);
+    return foldAndRead(28);
+  }
+  // A long thread for these two, sized by its messages, not by the block.
+  const longThread = async (base) => {
+    a.foldScene(30, base);
+    await frames(3);
+    a.scrollToBottom();
+    await wait(100);
+  };
+  if (name === "sibling") {
+    // A tool run folding with the block.
+    await longThread({ foldPx: 100, siblingPx: 160, extraPx: 0 });
+    return foldAndRead(28);
+  }
+  if (name === "rebind") {
+    // A one-word answer re-renders the page, whose inline ref rebinds the hook to the same element.
+    await longThread({ foldPx: 348, siblingPx: 0, extraPx: 0 });
+    const out = await foldAndRead(28);
+    a.token("OK");
+    await frames(4);
+    out.afterRebind = { ...a.foldTops(), top: a.metrics().scrollTop, clientHeight: a.metrics().clientHeight };
+    return out;
+  }
+  if (name === "detachedGrowth") {
+    // 100 px up when the block folds, then the answer grows past the fold while the reader is away;
+    // scrolling back down must never move backward.
+    await longThread({ foldPx: 348, siblingPx: 0, extraPx: 0 });
+    a.scrollUpBy(100);
+    await wait(200);
+    const out = await foldAndRead(28);
+    for (let i = 0; i < 30; i += 1) a.token("A sentence of the answer that wraps across the column. ");
+    await frames(4);
+    out.paddingAfterAnswer = a.foldTops().padding;
+    const tops = [a.metrics().scrollTop];
+    for (let i = 0; i < 40 && a.distanceFromBottom() > 0; i += 1) {
+      a.scrollDownBy(60);
+      await frames(2);
+      tops.push(a.metrics().scrollTop);
+    }
+    out.downTops = tops;
+    return out;
+  }
+  // The answer uses up the fold's padding, then something else is removed within the same second.
+  await longThread({ foldPx: 348, siblingPx: 0, extraPx: 180 });
+  const out = await foldAndRead(28);
+  out.paddingAfterFold = a.foldTops().padding;
+  for (let i = 0; i < 40; i += 1) a.token("A sentence of the answer that wraps across the column. ");
+  await frames(4);
+  out.paddingAfterAnswer = a.foldTops().padding;
+  a.removeExtra();
+  await frames(4);
+  out.paddingAfterRemoval = a.foldTops().padding;
+  return out;
+}
+"""
+
+
 def info(message: str) -> None:
     print(f"[chat-autoscroll] {message}", flush = True)
 
@@ -166,7 +280,9 @@ def run() -> dict:
                 // 100ms in: inside the follow window, which is where a decoding image lands.
                 await new Promise((r) => setTimeout(r, 100));
                 const start = performance.now();
+                const heightBefore = window.__autoscroll.metrics().scrollHeight;
                 window.__autoscroll.growSilently(240);
+                const grewBy = window.__autoscroll.metrics().scrollHeight - heightBefore;
                 let repinnedAfterMs = null;
                 // Watch past the window's end plus a margin, so a settle check at the deadline
                 // is still counted rather than reported as a permanent failure to follow.
@@ -178,6 +294,7 @@ def run() -> dict:
                     await new Promise((r) => setTimeout(r, 8));
                 }
                 return {
+                    grewBy,
                     repinnedAfterMs,
                     distanceAtEnd: window.__autoscroll.distanceFromBottom(),
                     isAtBottom: window.__autoscroll.isAtBottom(),
@@ -219,8 +336,85 @@ def run() -> dict:
         results["intent"] = intent
 
         context.close()
+
+        fold_context = browser.new_context(viewport = FOLD_VIEWPORT, reduced_motion = "reduce")
+        fold_context.add_init_script(
+            "localStorage.setItem('unsloth_auth_token', 'chat-autoscroll-smoke');"
+        )
+        fold_context.route(
+            re.compile(rf"^{re.escape(BASE)}/api/"),
+            lambda route: route.fulfill(status = 200, content_type = "application/json", body = "{}"),
+        )
+        fold_page = fold_context.new_page()
+        echo_browser_errors(fold_page, info)
+        results["fold"] = {}
+        for name in FOLD_CASES:
+            fold_page.goto(f"{BASE}/smoke-autoscroll.html", wait_until = "domcontentloaded")
+            fold_page.wait_for_function("() => Boolean(window.__autoscroll)", timeout = 30_000)
+            results["fold"][name] = fold_page.evaluate(FOLD_CASE, name)
+        fold_context.close()
         browser.close()
     return results
+
+
+def fold_failures(fold: dict) -> list[str]:
+    failures: list[str] = []
+
+    def still(name: str, case: dict) -> None:
+        before, after = case["before"], case["after"]
+        moved = after["block"] - before["block"]
+        if abs(moved) > 1:
+            failures.append(f"fold {name}: the folding block moved {moved:+.0f} px on screen")
+        if not (0 <= after["tailBottom"] <= after["clientHeight"]):
+            failures.append(
+                f"fold {name}: the reply is out of view (bottom at {after['tailBottom']:.0f} px)"
+            )
+
+    for name in ("pinnedFits", "pinnedFitsSettled", "detachedFits", "sibling"):
+        still(name, fold[name])
+    for name in ("pinnedFits", "pinnedFitsSettled", "detachedFits"):
+        case = fold[name]
+        if case["before"]["top"] < 1:
+            failures.append(
+                f"fold {name}: the thread did not overflow before the fold; nothing was measured"
+            )
+    rebind = fold["rebind"]
+    still("rebind", rebind)
+    moved = rebind["afterRebind"]["block"] - rebind["after"]["block"]
+    if abs(moved) > 1:
+        failures.append(f"fold rebind: rebinding the viewport moved the thread {moved:+.0f} px")
+    if rebind["after"]["padding"] < 300:
+        failures.append("fold rebind: the fold was not padded; the rebind check proved nothing")
+    growth = fold["detachedGrowth"]
+    still("detachedGrowth", growth)
+    if growth["after"]["padding"] < 1:
+        failures.append("fold detachedGrowth: the fold was not padded; the check proved nothing")
+    if growth["paddingAfterAnswer"] > 1:
+        failures.append(
+            f"fold detachedGrowth: {growth['paddingAfterAnswer']:.0f} px of padding outlived the answer"
+        )
+    tops = growth["downTops"]
+    backward = [b - a for a, b in zip(tops, tops[1:]) if b < a - 1]
+    if backward:
+        failures.append(
+            f"fold detachedGrowth: scrolling down moved backward by {-min(backward):.0f} px"
+        )
+    reuse = fold["reuse"]
+    still("reuse", reuse)
+    if reuse["paddingAfterFold"] < 300:
+        failures.append(
+            f"fold reuse: the fold was padded {reuse['paddingAfterFold']:.0f} px, not its 320"
+        )
+    if reuse["paddingAfterAnswer"] > 1:
+        failures.append(
+            "fold reuse: the answer did not use up the fold's padding; the check proved nothing"
+        )
+    if reuse["paddingAfterRemoval"] > 64:
+        failures.append(
+            f"fold reuse: a removal after the answer used the padding was padded "
+            f"{reuse['paddingAfterRemoval']:.0f} px"
+        )
+    return failures
 
 
 def main() -> int:
@@ -271,6 +465,11 @@ def main() -> int:
         failures.append("streaming re-pinned a detached reader")
     if not intent["reattached"]:
         failures.append("scrolling back to the bottom did not re-attach")
+    if results["silent_growth"]["grewBy"] < 200:
+        failures.append(
+            f"silent growth grew the page {results['silent_growth']['grewBy']} px, not 240; "
+            "the follow check proved nothing"
+        )
     repinned_after_ms = results["silent_growth"]["repinnedAfterMs"]
     if repinned_after_ms is None:
         failures.append("silent growth was never followed inside the window")
@@ -279,6 +478,7 @@ def main() -> int:
             f"silent growth took {repinned_after_ms:.0f}ms to follow, over the "
             f"{SILENT_GROWTH_REPIN_BUDGET_MS}ms budget"
         )
+    failures.extend(fold_failures(results["fold"]))
     for problem in failures:
         info(f"FAIL {problem}")
     return 1 if failures else 0

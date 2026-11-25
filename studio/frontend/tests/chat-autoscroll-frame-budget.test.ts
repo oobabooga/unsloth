@@ -19,7 +19,8 @@ function tickBody(): string {
 
 test("a following frame re-arms only while layout is still moving", () => {
   const tick = tickBody();
-  assert.match(tick, /if \(layoutChanged \|\| !pinned\) \{/);
+  // The one-second fold hold also keeps it running: an animated fold shrinks with no mutation.
+  assert.match(tick, /if \(layoutChanged \|\| !pinned \|\| holdActive\(\)\) \{/);
   assert.match(tick, /layoutChanged = false;/);
   assert.doesNotMatch(
     tick,

@@ -53,7 +53,10 @@ import {
   reasoningRoundKey,
 } from "@/components/assistant-ui/thinking-fold";
 import { toolRunIsExempt } from "@/components/assistant-ui/tool-fold-exemptions";
-import { useDetachThreadFromBottom } from "@/components/assistant-ui/use-intent-aware-autoscroll";
+import {
+  useDetachThreadFromBottom,
+  useHoldThreadThroughCollapse,
+} from "@/components/assistant-ui/use-intent-aware-autoscroll";
 import { useCollapseScrollLock } from "@/hooks/use-collapse-scroll-lock";
 import { formatWorkedFor } from "@/lib/format-worked-for";
 import { inputPointerHeld } from "@/lib/input-pointer-state";
@@ -825,6 +828,17 @@ const ReasoningGroupBlock = ({
     visibility,
     override,
   });
+
+  // Folding drops the trace (and what folds with it) at once, as the answer starts: the thread holds
+  // its height so a reader at the bottom is not clamped. A layout effect, so the block is still open.
+  const holdThroughCollapse = useHoldThreadThroughCollapse();
+  const wasOpenRef = useRef(isOpen);
+  useLayoutEffect(() => {
+    if (wasOpenRef.current && !isOpen) {
+      holdThroughCollapse();
+    }
+    wasOpenRef.current = isOpen;
+  }, [isOpen, holdThroughCollapse]);
 
   // Fold mode keeps its rounds inline: the lead's box could not hold the rounds folded after it.
   // A closing block keeps the cap it had while open: a hand close must not re-cap a full trace.

@@ -3,6 +3,12 @@
 
 "use client";
 
+import {
+  type ChildBox,
+  collapsePaddingCap,
+  naturalContentHeight,
+  reconcilePadding,
+} from "@/components/assistant-ui/collapse-hold";
 import { ROW_DISTANT_ATTRIBUTE } from "@/components/assistant-ui/distant-rows";
 import { useChatPreferencesStore } from "@/features/chat/stores/chat-preferences-store";
 import { useAui, useAuiEvent } from "@assistant-ui/react";
@@ -38,6 +44,9 @@ const FOLLOW_SETTLE_MS = 600;
 const SETTLE_CHECK_MS = 100;
 // Absorbs sub-frame transients (shiki re-renders); larger shrinks are real removals and re-pin.
 const STABILIZER_MAX_PX = 64;
+// A thinking block folding as the answer starts drops a few hundred px at once. For this long after
+// it starts to fold, the thread keeps its height in bottom padding (reconcilePadding).
+const COLLAPSE_HOLD_MS = 1000;
 
 export type ScrollToBottom = (behavior?: ScrollBehavior) => void;
 
@@ -53,6 +62,8 @@ type AutoScrollContextValue = {
    */
   adjustForContentInsertedAbove: (deltaPx: number) => boolean;
   notifyContentResized: () => void;
+  /** A block is about to fold (called while it is still open): hold the thread's height. */
+  holdThroughCollapse: () => void;
 };
 
 const noopContext: AutoScrollContextValue = {
@@ -68,6 +79,7 @@ const noopContext: AutoScrollContextValue = {
   },
   adjustForContentInsertedAbove: () => false,
   notifyContentResized: () => undefined,
+  holdThroughCollapse: () => undefined,
 };
 
 const AutoScrollContext = createContext<AutoScrollContextValue>(noopContext);
@@ -98,6 +110,11 @@ export function useAdjustForContentInsertedAbove(): (deltaPx: number) => boolean
 /** Opening a collapsible near the bottom must grow it downward, not pin and shove the header. */
 export function useDetachThreadFromBottom(): () => void {
   return useContext(AutoScrollContext).detachFromBottom;
+}
+
+/** See AutoScrollContextValue.holdThroughCollapse. */
+export function useHoldThreadThroughCollapse(): () => void {
+  return useContext(AutoScrollContext).holdThroughCollapse;
 }
 
 export function useIsThreadAtBottom(): boolean {
@@ -131,6 +148,11 @@ export function useIntentAwareAutoScroll(): {
     /* no viewport mounted */
   });
   const tickRequestRef = useRef<() => void>(() => undefined);
+  // Outside the closure, so a rebind to the same element keeps them: the fold hold, and the content
+  // height the padding last saw (growth since then uses the padding up).
+  const holdRef = useRef<{ floor: number; until: number } | null>(null);
+  const lastContentRef = useRef<number | null>(null);
+  const holdImplRef = useRef<() => void>(() => undefined);
 
   const getIsAtBottom = useCallback(() => isAtBottomRef.current, []);
 
@@ -167,6 +189,10 @@ export function useIntentAwareAutoScroll(): {
 
   const notifyContentResized = useCallback(() => {
     tickRequestRef.current();
+  }, []);
+
+  const holdThroughCollapse = useCallback(() => {
+    holdImplRef.current();
   }, []);
 
   const attach = useCallback(
@@ -231,16 +257,83 @@ export function useIntentAwareAutoScroll(): {
         return false;
       };
 
-      // Stabilizer state lives in this closure so it resets when the viewport remounts.
-      let stabilizerPx = 0;
+      // Stabilizer state lives in this closure so it resets when the viewport remounts. A rebind to
+      // the same element takes over the padding on it; starting from zero would leave that padding
+      // unowned, read as content and never released.
+      let stabilizerPx = Number.parseFloat(el.style.getPropertyValue("--aui-scroll-stabilizer")) || 0;
       let maxContentHeight = 0;
 
-      const releaseStabilizer = (): void => {
-        if (stabilizerPx === 0) {
+      const setStabilizer = (px: number): void => {
+        if (px === stabilizerPx) {
           return;
         }
-        stabilizerPx = 0;
-        el.style.removeProperty("--aui-scroll-stabilizer");
+        stabilizerPx = px;
+        if (px === 0) {
+          el.style.removeProperty("--aui-scroll-stabilizer");
+        } else {
+          el.style.setProperty("--aui-scroll-stabilizer", `${px}px`);
+        }
+      };
+
+      const releaseStabilizer = (): void => {
+        setStabilizer(0);
+      };
+
+      // Dropping the padding with the reader closer to the bottom than its height would clamp them.
+      const releaseStabilizerIfSafe = (): void => {
+        if (stabilizerPx > 0 && distanceFromBottom() >= stabilizerPx) {
+          releaseStabilizer();
+        }
+      };
+
+      // See naturalContentHeight: scrollHeight floors at the viewport height.
+      const contentHeight = (): number => {
+        if (el.scrollHeight > el.clientHeight + 1) {
+          return el.scrollHeight - stabilizerPx;
+        }
+        const origin = el.getBoundingClientRect().top - el.scrollTop;
+        const children: ChildBox[] = [];
+        for (const child of el.children) {
+          const style = getComputedStyle(child);
+          const box = child.getBoundingClientRect();
+          children.push({
+            top: box.top - origin,
+            // The last child's bottom margin is part of the scroll height.
+            height: box.height + (Number.parseFloat(style.marginBottom) || 0),
+            position:
+              style.position === "sticky"
+                ? "sticky"
+                : style.position === "absolute" || style.position === "fixed"
+                  ? "out"
+                  : "flow",
+          });
+        }
+        return naturalContentHeight(children);
+      };
+      if (!isRebind || lastContentRef.current === null) {
+        lastContentRef.current = contentHeight();
+      }
+
+      const holdActive = (): boolean => {
+        const hold = holdRef.current;
+        if (hold !== null && performance.now() >= hold.until) {
+          holdRef.current = null;
+        }
+        return holdRef.current !== null;
+      };
+
+      // See collapsePaddingCap: the last message's last lines stay below the header.
+      const collapseCap = (): number => {
+        const rows = el.querySelectorAll("[data-role]");
+        const last = rows[rows.length - 1];
+        const box = el.getBoundingClientRect();
+        const lastBottom = last ? last.getBoundingClientRect().bottom - box.top + el.scrollTop : 0;
+        return collapsePaddingCap({
+          clientHeight: el.clientHeight,
+          tailPx: Math.max(0, contentHeight() - lastBottom),
+          topInsetPx: Number.parseFloat(getComputedStyle(el).paddingTop) || 0,
+          stabilizerMaxPx: STABILIZER_MAX_PX,
+        });
       };
 
       const extendFollow = (): void => {
@@ -298,9 +391,10 @@ export function useIntentAwareAutoScroll(): {
         followUntilRef.current = 0;
         // Hygiene: `following` checks userDetached first, so a queued check cannot re-pin anyway.
         clearSettleCheck();
-        // Drop residual stabilizer padding once the user scrolls up so the bottom stays flush.
-        releaseStabilizer();
-        maxContentHeight = el.scrollHeight;
+        // Drop residual stabilizer padding once the user is far enough up that it cannot clamp them;
+        // onScroll drops it later otherwise.
+        releaseStabilizerIfSafe();
+        maxContentHeight = contentHeight();
       };
 
       const parkIfHeld = (): boolean => {
@@ -373,7 +467,8 @@ export function useIntentAwareAutoScroll(): {
             el.scrollTo({ top: scrollHeight, behavior: "instant" });
           }
           setIsAtBottom(true);
-          if (layoutChanged || !pinned) {
+          // A fold can shrink with no mutation to wake the loop (an animated close), so it runs on.
+          if (layoutChanged || !pinned || holdActive()) {
             layoutChanged = false;
             requestTick();
             return;
@@ -383,6 +478,14 @@ export function useIntentAwareAutoScroll(): {
         }
 
         setFollowing(false);
+        // Padding keeps reconciling for a reader who is not following: growth uses it up, and a
+        // fold near the bottom is held as for a following reader.
+        if (stabilizerPx > 0 || holdActive()) {
+          stabilize();
+          if (holdActive()) {
+            requestTick();
+          }
+        }
         setIsAtBottom(atBottomStrict());
       };
 
@@ -487,6 +590,14 @@ export function useIntentAwareAutoScroll(): {
       };
 
       const onScroll = () => {
+        if (userDetachedRef.current) {
+          // A fold's clamp can be reported here before the frame's tick: pad and restore first, so the
+          // clamped position never becomes the baseline.
+          if (holdActive()) {
+            stabilize();
+          }
+          releaseStabilizerIfSafe();
+        }
         const scrollTop = el.scrollTop;
         const clientWidth = el.clientWidth;
         const clientHeight = el.clientHeight;
@@ -545,38 +656,36 @@ export function useIntentAwareAutoScroll(): {
         requestTick();
       };
 
-      // Keeps scrollHeight monotonic during the follow window: a finalizing code block briefly shrinks
-      // and the browser caps scrollTop. The shortfall goes into `--aui-scroll-stabilizer` padding.
+      // Keeps the thread's height through a shrink that is not the reader's doing (reconcilePadding): a
+      // finalizing code block in the follow window, a thinking block folding in a hold. The shortfall
+      // goes into `--aui-scroll-stabilizer` padding.
       const stabilize = (): number => {
-        const sh = el.scrollHeight;
-        const currentContent = sh - stabilizerPx;
         const followActive =
           !userDetachedRef.current &&
           performance.now() < followUntilRef.current;
-        if (!followActive) {
-          // Outside the follow window: stop adjusting but keep maxContentHeight current.
-          maxContentHeight = currentContent;
-          return sh;
+        const hold = holdActive() ? holdRef.current : null;
+        const before = stabilizerPx;
+        // Read before the padding changes: a reader at the very end was clamped there, not scrolling.
+        const clamped = el.scrollTop >= el.scrollHeight - el.clientHeight - 1;
+        const content = contentHeight();
+        const next = reconcilePadding({
+          content,
+          lastContent: lastContentRef.current ?? content,
+          padding: stabilizerPx,
+          followMax: followActive ? maxContentHeight : null,
+          holdFloor: hold ? hold.floor : null,
+          stabilizerMaxPx: STABILIZER_MAX_PX,
+          capPx: hold ? collapseCap() : STABILIZER_MAX_PX,
+        });
+        lastContentRef.current = content;
+        maxContentHeight = next.followMax ?? content;
+        setStabilizer(next.padding);
+        // A reader who is not pinned was clamped when the shrink was laid out; the padding makes their
+        // place reachable again, so put them back before paint.
+        if (stabilizerPx > before && !followActive && clamped && el.scrollTop < lastScrollTop - 0.5) {
+          el.scrollTo({ top: lastScrollTop, behavior: "instant" });
         }
-        if (currentContent > maxContentHeight) {
-          maxContentHeight = currentContent;
-        }
-        const shrink = maxContentHeight - currentContent;
-        // Large shrinks are intentional removals; release and re-anchor rather than pad a gap.
-        if (shrink > STABILIZER_MAX_PX) {
-          maxContentHeight = currentContent;
-          if (stabilizerPx !== 0) {
-            stabilizerPx = 0;
-            el.style.removeProperty("--aui-scroll-stabilizer");
-          }
-          return currentContent;
-        }
-        const needed = Math.max(0, shrink);
-        if (needed !== stabilizerPx) {
-          stabilizerPx = needed;
-          el.style.setProperty("--aui-scroll-stabilizer", `${stabilizerPx}px`);
-        }
-        return currentContent + stabilizerPx;
+        return content + stabilizerPx;
       };
 
       // Observer callbacks run after layout and before paint, so this lands in the same frame.
@@ -619,9 +728,20 @@ export function useIntentAwareAutoScroll(): {
         requestTick();
       };
 
+      // Measured while the block is still open: its content shrinks after this commit.
+      holdImplRef.current = () => {
+        holdRef.current = {
+          floor: contentHeight() + stabilizerPx,
+          until: performance.now() + COLLAPSE_HOLD_MS,
+        };
+        requestTick();
+      };
+
       const resizeObserver = new ResizeObserver(onLayoutChange);
       const mutationObserver = new MutationObserver(onMutation);
       const onViewportResize = onLayoutChange;
+
+      maxContentHeight = lastContentRef.current;
 
       // Only a fresh attach pins: React re-runs the composed ref on unrelated renders for the same element.
       if (!isRebind) {
@@ -715,6 +835,7 @@ export function useIntentAwareAutoScroll(): {
           /* no viewport mounted */
         };
         tickRequestRef.current = () => undefined;
+        holdImplRef.current = () => undefined;
       };
     },
     [aui, setIsAtBottom],
@@ -768,6 +889,7 @@ export function useIntentAwareAutoScroll(): {
       detachFromBottom,
       adjustForContentInsertedAbove,
       notifyContentResized,
+      holdThroughCollapse,
     }),
     [
       scrollToBottom,
@@ -776,6 +898,7 @@ export function useIntentAwareAutoScroll(): {
       detachFromBottom,
       adjustForContentInsertedAbove,
       notifyContentResized,
+      holdThroughCollapse,
     ],
   );
 
