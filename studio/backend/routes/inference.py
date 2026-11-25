@@ -6994,17 +6994,12 @@ def _strip_tool_xml_for_display(
     ):
         return text
     from core.tool_healing import (
+        _code_spans,
+        _in_code,
         _markerless_promotable,
         _strip_bracket_tag_calls,
         strip_outside_think,
     )
-
-    def _keep_inactive_rehearsal(m) -> str:
-        # Deleting a call the parser will not promote leaves the turn empty.
-        name = m.groupdict().get("reh")
-        if name is not None and not _markerless_promotable(name, enabled_tool_names):
-            return m.group(0)
-        return ""
 
     def _strip_segment(seg: str, is_last: bool) -> str:
         # Strips close at each call's real terminator, so a quoted </function> cannot truncate them.
@@ -7018,7 +7013,20 @@ def _strip_tool_xml_for_display(
         seg = _strip_glm_calls(seg, final = is_last)
         seg = _strip_function_xml_calls(seg, final = is_last)
         if is_last:
-            return _TOOL_XML_RE.sub(_keep_inactive_rehearsal, seg)
+            spans = _code_spans(seg)
+
+            def _keep_example(m) -> str:
+                # A rehearsal the parser does not promote (inactive name, or quoted in code) is text: deleting it would
+                # empty the turn or a code block. Matching it still keeps markup quoted in its arguments from other arms.
+                name = m.groupdict().get("reh")
+                if name is not None and (
+                    not _markerless_promotable(name, enabled_tool_names)
+                    or _in_code(spans, m.start())
+                ):
+                    return m.group(0)
+                return ""
+
+            return _TOOL_XML_RE.sub(_keep_example, seg)
         return _TOOL_XML_CLOSED_RE.sub("", seg)
 
     # Mask blocked-call bodies and lone backticked tags (prose) so these passes do not edit them.
