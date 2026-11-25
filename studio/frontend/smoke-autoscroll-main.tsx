@@ -25,6 +25,8 @@ function Harness(): ReactElement {
   const [blocks, setBlocks] = useState<string[]>([]);
   const [tail, setTail] = useState("");
   const [scene, setScene] = useState<FoldScene | null>(null);
+  // Bumped to mount a new viewport element, as switching threads does.
+  const [viewportKey, setViewportKey] = useState(0);
   const viewportRef = useRef<HTMLElement | null>(null);
   const spacerRef = useRef<HTMLDivElement>(null);
 
@@ -92,6 +94,15 @@ function Harness(): ReactElement {
         if (body) body.style.height = `${collapsedPx}px`;
         element?.querySelector('[data-smoke="sibling"]')?.setAttribute("hidden", "");
       },
+      remount(): void {
+        setViewportKey((key) => key + 1);
+      },
+      padding(): number {
+        const element = viewport();
+        return element
+          ? Number.parseFloat(element.style.getPropertyValue("--aui-scroll-stabilizer")) || 0
+          : -1;
+      },
       removeExtra(): void {
         viewport()?.querySelector('[data-smoke="extra"]')?.setAttribute("hidden", "");
       },
@@ -126,6 +137,7 @@ function Harness(): ReactElement {
   return (
     <IntentAwareScrollProvider value={context}>
       <div
+        key={viewportKey}
         data-smoke="viewport"
         ref={(element) => {
           viewportRef.current = element;

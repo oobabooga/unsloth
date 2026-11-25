@@ -98,6 +98,11 @@ test("a tall fold is held only while the reply's last lines stay below the heade
   assert.equal(collapsePaddingCap({ clientHeight: 300, tailPx: 245, topInsetPx: 48, stabilizerMaxPx: MAX }), MAX);
 });
 
+test("padding kept after the hold follows the cap when the window gets shorter", () => {
+  // 330 px kept; the window shrinks and the cap drops to 120.
+  assert.deepEqual(run({ content: 3000, padding: 330 }, [{ content: 3000, capPx: 120 }]), [120]);
+});
+
 test("a thread the fold leaves shorter than the viewport is measured from its children", () => {
   // scrollHeight reads 1000 for this thread; its children end at 800 (the last block, then a sticky
   // footer that keeps its flow space; the absolute one takes none).
@@ -124,6 +129,16 @@ test("a closing thinking block holds the thread from a layout effect, while it i
     "the floor is the padded height before the fold, so what folds with the block is held too",
   );
   assert.match(HOOK, /const holdRef = useRef</, "the hold lives outside the attach closure, so a rebind keeps it");
+  assert.match(
+    HOOK,
+    /if \(!isRebind \|\| lastContentRef\.current === null\) \{\s*holdRef\.current = null;/,
+    "a different element (another thread) starts without the hold",
+  );
+  assert.match(
+    HOOK,
+    /releaseStabilizer\(\);\s*holdRef\.current = null;/,
+    "once the padding is safely dropped, the hold does not put it back",
+  );
   assert.match(
     HOOK,
     /let stabilizerPx = Number\.parseFloat\(el\.style\.getPropertyValue\("--aui-scroll-stabilizer"\)\) \|\| 0;/,

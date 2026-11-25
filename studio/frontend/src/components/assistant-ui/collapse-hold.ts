@@ -53,9 +53,10 @@ export function naturalContentHeight(children: readonly ChildBox[]): number {
  * - In a follow window (`followMax`, the tallest content in it), a shrink of up to `stabilizerMaxPx`
  *   is padded (a code block re-rendering); a larger one is a removal and re-anchors, as before.
  * - In a fold hold (`holdFloor`, the padded height when a thinking block began to fold), the
- *   padding keeps that height, up to `capPx`.
+ *   padding keeps that height.
  *
- * Nothing else adds padding, so outside both it can only shrink.
+ * Nothing else adds padding, so outside both it can only shrink. It never exceeds `capPx`, the cap
+ * for the viewport as it is now: a window made shorter after a fold lowers it too.
  */
 export function reconcilePadding(input: {
   content: number;
@@ -79,7 +80,7 @@ export function reconcilePadding(input: {
     }
   }
   if (input.holdFloor !== null) {
-    padding = Math.max(padding, Math.min(input.holdFloor - content, input.capPx));
+    padding = Math.max(padding, input.holdFloor - content);
   }
-  return { padding, followMax };
+  return { padding: Math.min(padding, input.capPx), followMax };
 }

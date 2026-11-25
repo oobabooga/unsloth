@@ -280,9 +280,11 @@ export function useIntentAwareAutoScroll(): {
       };
 
       // Dropping the padding with the reader closer to the bottom than its height would clamp them.
+      // A reader that far up is past any fold too, so the hold ends with it rather than re-pad.
       const releaseStabilizerIfSafe = (): void => {
         if (stabilizerPx > 0 && distanceFromBottom() >= stabilizerPx) {
           releaseStabilizer();
+          holdRef.current = null;
         }
       };
 
@@ -310,7 +312,9 @@ export function useIntentAwareAutoScroll(): {
         }
         return naturalContentHeight(children);
       };
+      // A different element is another thread: neither the hold nor the height carries over.
       if (!isRebind || lastContentRef.current === null) {
+        holdRef.current = null;
         lastContentRef.current = contentHeight();
       }
 
@@ -675,7 +679,9 @@ export function useIntentAwareAutoScroll(): {
           followMax: followActive ? maxContentHeight : null,
           holdFloor: hold ? hold.floor : null,
           stabilizerMaxPx: STABILIZER_MAX_PX,
-          capPx: hold ? collapseCap() : STABILIZER_MAX_PX,
+          // Only padding past the ordinary stabilizer can push the reply out of view; skip the row query
+          // otherwise.
+          capPx: hold || stabilizerPx > STABILIZER_MAX_PX ? collapseCap() : STABILIZER_MAX_PX,
         });
         lastContentRef.current = content;
         maxContentHeight = next.followMax ?? content;

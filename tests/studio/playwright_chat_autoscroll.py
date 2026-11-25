@@ -87,6 +87,8 @@ FOLD_CASES = (
     "reuse",
     "rebind",
     "detachedGrowth",
+    "switchInHold",
+    "scrollAwayInHold",
 )
 
 # One case per page load, so padding one case leaves cannot reach the next.
@@ -173,6 +175,34 @@ async (name) => {
     }
     out.downTops = tops;
     return out;
+  }
+  if (name === "switchInHold") {
+    // Another thread mounts its own viewport inside the hold: it must not inherit the fold's padding.
+    await longThread({ foldPx: 348, siblingPx: 0, extraPx: 0 });
+    const out = await foldAndRead(28);
+    // A shorter thread in a new viewport element, as a thread switch mounts.
+    a.foldScene(2, { foldPx: 28, siblingPx: 0, extraPx: 0 });
+    a.remount();
+    await frames(6);
+    out.paddingAfterSwitch = a.padding();
+    return out;
+  }
+  if (name === "scrollAwayInHold") {
+    // Scrolling far up inside the hold drops the padding, and the hold must not put it back.
+    await longThread({ foldPx: 348, siblingPx: 0, extraPx: 0 });
+    const out = await foldAndRead(28);
+    a.scrollUpBy(500);
+    await frames(6);
+    out.paddingAfterScroll = a.padding();
+    await wait(1100);
+    a.scrollToBottom();
+    await frames(6);
+    out.paddingAtBottom = a.padding();
+    return out;
+  }
+  if (name === "shrinkWindow") {
+    await longThread({ foldPx: 348, siblingPx: 0, extraPx: 0 });
+    return foldAndRead(28);
   }
   // The answer uses up the fold's padding, then something else is removed within the same second.
   await longThread({ foldPx: 348, siblingPx: 0, extraPx: 180 });
@@ -352,6 +382,18 @@ def run() -> dict:
             fold_page.goto(f"{BASE}/smoke-autoscroll.html", wait_until = "domcontentloaded")
             fold_page.wait_for_function("() => Boolean(window.__autoscroll)", timeout = 30_000)
             results["fold"][name] = fold_page.evaluate(FOLD_CASE, name)
+        # Padding kept after a fold, then the window gets shorter: the reply must stay in view.
+        fold_page.goto(f"{BASE}/smoke-autoscroll.html", wait_until = "domcontentloaded")
+        fold_page.wait_for_function("() => Boolean(window.__autoscroll)", timeout = 30_000)
+        shrink = fold_page.evaluate(FOLD_CASE, "shrinkWindow")
+        fold_page.wait_for_timeout(1200)
+        fold_page.set_viewport_size({"width": FOLD_VIEWPORT["width"], "height": 330})
+        fold_page.wait_for_timeout(300)
+        shrink["resized"] = fold_page.evaluate(
+            """() => ({ ...window.__autoscroll.foldTops(),
+                clientHeight: window.__autoscroll.metrics().clientHeight })"""
+        )
+        results["fold"]["shrinkWindow"] = shrink
         fold_context.close()
         browser.close()
     return results
@@ -365,7 +407,7 @@ def fold_failures(fold: dict) -> list[str]:
         moved = after["block"] - before["block"]
         if abs(moved) > 1:
             failures.append(f"fold {name}: the folding block moved {moved:+.0f} px on screen")
-        if not (0 <= after["tailBottom"] <= after["clientHeight"]):
+        if not (after["tail"] >= 0 and after["tailBottom"] <= after["clientHeight"]):
             failures.append(
                 f"fold {name}: the reply is out of view (bottom at {after['tailBottom']:.0f} px)"
             )
@@ -398,6 +440,27 @@ def fold_failures(fold: dict) -> list[str]:
     if backward:
         failures.append(
             f"fold detachedGrowth: scrolling down moved backward by {-min(backward):.0f} px"
+        )
+    if fold["switchInHold"]["after"]["padding"] < 300:
+        failures.append(
+            "fold switchInHold: the fold was not padded; the switch check proved nothing"
+        )
+    if fold["switchInHold"]["paddingAfterSwitch"] > 1:
+        failures.append(
+            f"fold switchInHold: the new viewport took {fold['switchInHold']['paddingAfterSwitch']:.0f} px "
+            "of the old thread's padding"
+        )
+    away = fold["scrollAwayInHold"]
+    if away["paddingAfterScroll"] > 1 or away["paddingAtBottom"] > 1:
+        failures.append(
+            f"fold scrollAwayInHold: padding came back after scrolling away "
+            f"({away['paddingAfterScroll']:.0f} px, then {away['paddingAtBottom']:.0f} px at the bottom)"
+        )
+    resized = fold["shrinkWindow"]["resized"]
+    if not (resized["tail"] >= 0 and resized["tailBottom"] <= resized["clientHeight"]):
+        failures.append(
+            f"fold shrinkWindow: after the window got shorter the reply ended at "
+            f"{resized['tailBottom']:.0f} px in a {resized['clientHeight']:.0f} px viewport"
         )
     reuse = fold["reuse"]
     still("reuse", reuse)
