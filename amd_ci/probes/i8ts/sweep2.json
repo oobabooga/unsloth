@@ -1,0 +1,421 @@
+{
+ "sm80": {
+  "128": [
+   {
+    "bn": 64,
+    "kgroup": 32
+   },
+   {
+    "bn": 64,
+    "kgroup": 32,
+    "stages": 2
+   },
+   {
+    "bn": 64,
+    "kgroup": 32,
+    "stages": 4
+   },
+   {
+    "bn": 128,
+    "kgroup": 32,
+    "stages": 2
+   },
+   {
+    "bn": 64,
+    "kgroup": 32,
+    "warps": 8
+   },
+   {
+    "bn": 64,
+    "kgroup": 32,
+    "bm": 64
+   },
+   {
+    "acc_in_dot": true
+   },
+   {
+    "bn": 64,
+    "kgroup": 32,
+    "acc_in_dot": true
+   },
+   {
+    "pv": "int8"
+   },
+   {
+    "pv": "int8",
+    "bn": 128,
+    "warps": 8,
+    "stages": 2
+   }
+  ],
+  "64": [
+   {
+    "bn": 128,
+    "kgroup": 64
+   },
+   {
+    "bn": 128,
+    "kgroup": 64,
+    "stages": 2
+   },
+   {
+    "bn": 128,
+    "kgroup": 64,
+    "stages": 3
+   },
+   {
+    "bn": 128,
+    "kgroup": 64,
+    "warps": 8
+   },
+   {
+    "acc_in_dot": true
+   },
+   {
+    "bn": 128,
+    "kgroup": 64,
+    "acc_in_dot": true
+   },
+   {
+    "stages": 4
+   },
+   {
+    "pv": "int8"
+   },
+   {
+    "pv": "int8",
+    "bn": 128,
+    "warps": 8
+   }
+  ]
+ },
+ "sm120": {
+  "128": [
+   {
+    "bn": 64,
+    "kgroup": 32
+   },
+   {
+    "bn": 64,
+    "kgroup": 32,
+    "stages": 2
+   },
+   {
+    "bn": 64,
+    "kgroup": 32,
+    "stages": 4
+   },
+   {
+    "bn": 128,
+    "kgroup": 32,
+    "stages": 2
+   },
+   {
+    "bn": 64,
+    "kgroup": 32,
+    "warps": 8
+   },
+   {
+    "bn": 64,
+    "kgroup": 32,
+    "bm": 64
+   },
+   {
+    "acc_in_dot": true
+   },
+   {
+    "bn": 64,
+    "kgroup": 32,
+    "acc_in_dot": true
+   },
+   {
+    "pv": "int8"
+   },
+   {
+    "pv": "int8",
+    "bn": 128,
+    "warps": 8,
+    "stages": 2
+   }
+  ],
+  "64": [
+   {
+    "bn": 128,
+    "kgroup": 64
+   },
+   {
+    "bn": 128,
+    "kgroup": 64,
+    "stages": 2
+   },
+   {
+    "bn": 128,
+    "kgroup": 64,
+    "stages": 3
+   },
+   {
+    "bn": 128,
+    "kgroup": 64,
+    "warps": 8
+   },
+   {
+    "acc_in_dot": true
+   },
+   {
+    "bn": 128,
+    "kgroup": 64,
+    "acc_in_dot": true
+   },
+   {
+    "stages": 4
+   },
+   {
+    "pv": "int8"
+   },
+   {
+    "pv": "int8",
+    "bn": 128,
+    "warps": 8
+   }
+  ]
+ },
+ "sm89": {
+  "128": [
+   {
+    "bn": 128,
+    "kgroup": 64
+   },
+   {
+    "bn": 128,
+    "kgroup": 64,
+    "stages": 2
+   },
+   {
+    "bn": 128,
+    "kgroup": 64,
+    "stages": 3
+   },
+   {
+    "bn": 128,
+    "kgroup": 64,
+    "warps": 8
+   },
+   {
+    "acc_in_dot": true
+   },
+   {
+    "bn": 128,
+    "kgroup": 64,
+    "acc_in_dot": true
+   },
+   {
+    "stages": 4
+   },
+   {
+    "pv": "int8"
+   },
+   {
+    "pv": "int8",
+    "bn": 128,
+    "warps": 8
+   }
+  ],
+  "64": [
+   {
+    "bn": 128,
+    "kgroup": 64
+   },
+   {
+    "bn": 128,
+    "kgroup": 64,
+    "stages": 2
+   },
+   {
+    "bn": 128,
+    "kgroup": 64,
+    "stages": 3
+   },
+   {
+    "bn": 128,
+    "kgroup": 64,
+    "warps": 8
+   },
+   {
+    "acc_in_dot": true
+   },
+   {
+    "bn": 128,
+    "kgroup": 64,
+    "acc_in_dot": true
+   },
+   {
+    "stages": 4
+   },
+   {
+    "pv": "int8"
+   },
+   {
+    "pv": "int8",
+    "bn": 128,
+    "warps": 8
+   }
+  ]
+ },
+ "gfx1151": {
+  "128": [
+   {
+    "bn": 64,
+    "kgroup": 32
+   },
+   {
+    "bn": 64,
+    "kgroup": 32,
+    "bm": 128,
+    "warps": 8
+   },
+   {
+    "bn": 128,
+    "kgroup": 32
+   },
+   {
+    "bn": 64,
+    "kgroup": 32,
+    "warps": 2,
+    "bm": 32
+   },
+   {
+    "acc_in_dot": true
+   },
+   {
+    "bn": 64,
+    "kgroup": 32,
+    "acc_in_dot": true
+   },
+   {
+    "pv": "int8_t"
+   },
+   {
+    "pv": "int8_t",
+    "bn": 64
+   }
+  ],
+  "64": [
+   {
+    "bn": 64,
+    "kgroup": 32
+   },
+   {
+    "bn": 128,
+    "kgroup": 32
+   },
+   {
+    "bn": 64,
+    "kgroup": 32,
+    "warps": 8,
+    "bm": 128
+   },
+   {
+    "bn": 64,
+    "kgroup": 32,
+    "bm": 64,
+    "warps": 2
+   },
+   {
+    "acc_in_dot": true
+   },
+   {
+    "pv": "int8_t"
+   }
+  ]
+ },
+ "default": {
+  "128": [
+   {
+    "bn": 64,
+    "kgroup": 32
+   },
+   {
+    "bn": 64,
+    "kgroup": 32,
+    "stages": 2
+   },
+   {
+    "bn": 64,
+    "kgroup": 32,
+    "stages": 4
+   },
+   {
+    "bn": 128,
+    "kgroup": 32,
+    "stages": 2
+   },
+   {
+    "bn": 64,
+    "kgroup": 32,
+    "warps": 8
+   },
+   {
+    "bn": 64,
+    "kgroup": 32,
+    "bm": 64
+   },
+   {
+    "acc_in_dot": true
+   },
+   {
+    "bn": 64,
+    "kgroup": 32,
+    "acc_in_dot": true
+   },
+   {
+    "pv": "int8"
+   },
+   {
+    "pv": "int8",
+    "bn": 128,
+    "warps": 8,
+    "stages": 2
+   }
+  ],
+  "64": [
+   {
+    "bn": 128,
+    "kgroup": 64
+   },
+   {
+    "bn": 128,
+    "kgroup": 64,
+    "stages": 2
+   },
+   {
+    "bn": 128,
+    "kgroup": 64,
+    "stages": 3
+   },
+   {
+    "bn": 128,
+    "kgroup": 64,
+    "warps": 8
+   },
+   {
+    "acc_in_dot": true
+   },
+   {
+    "bn": 128,
+    "kgroup": 64,
+    "acc_in_dot": true
+   },
+   {
+    "stages": 4
+   },
+   {
+    "pv": "int8"
+   },
+   {
+    "pv": "int8",
+    "bn": 128,
+    "warps": 8
+   }
+  ]
+ }
+}
