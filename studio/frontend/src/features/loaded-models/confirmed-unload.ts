@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
 
-import { unloadModel } from "@/features/chat/api/chat-api";
+import { getInferenceStatus, unloadModel } from "@/features/chat/api/chat-api";
 import { confirmStopRunningChatsIfNeeded } from "@/features/chat/utils/confirm-stop-running-chats";
 import { requestScopedLocalPromptQueueStop } from "@/features/chat/utils/prompt-queue-boundary";
 
@@ -10,12 +10,20 @@ import { requestScopedLocalPromptQueueStop } from "@/features/chat/utils/prompt-
 export async function unloadAfterChatStopConfirmation(
   modelPath: string,
 ): Promise<boolean> {
+  const activeBefore = (await getInferenceStatus()).active_model;
   const decision = await confirmStopRunningChatsIfNeeded(
     "Unloading this model",
     "unloadOne",
     modelPath,
   );
   if (!decision.proceed) return false;
+  // A forced unload cancels the chats of whatever model is active, so ask again if it changed while the dialog was open.
+  if (
+    decision.forceCancelActive &&
+    (await getInferenceStatus()).active_model !== activeBefore
+  ) {
+    return unloadAfterChatStopConfirmation(modelPath);
+  }
   requestScopedLocalPromptQueueStop(decision.promptQueueThreadIds);
   await unloadModel({
     model_path: modelPath,

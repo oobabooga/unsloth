@@ -163,3 +163,15 @@ test("the API page, Translate, the panel and the picker unload through the owner
     /await unloadAfterChatStopConfirmation\(modelId\)/,
   );
 });
+
+test("a model switched in while the dialog is open is asked about before anything is forced", async () => {
+  stub.resetStub({ active: QWEN, loaded: [QWEN], generating: true });
+  stub.state.confirmAnswer = { proceed: true, forceCancelActive: true };
+  stub.state.duringConfirm = () => {
+    stub.state.active = HYMT;
+    stub.state.loaded = [QWEN, HYMT];
+  };
+  assert.equal(await unloadAfterChatStopConfirmation(QWEN), true);
+  assert.equal(stub.state.confirmCalls.length, 2);
+  assert.deepEqual(stub.state.unloads, [{ model_path: QWEN, force_cancel_active: true }]);
+});

@@ -17,6 +17,7 @@ export const state = {
   unloads: [] as UnloadPayload[],
   queueStops: [] as string[][],
   afterUnload: null as (() => void) | null,
+  duringConfirm: null as (() => void) | null,
 };
 
 export function resetStub({
@@ -36,6 +37,7 @@ export function resetStub({
   state.unloads = [];
   state.queueStops = [];
   state.afterUnload = null;
+  state.duringConfirm = null;
 }
 
 export async function getInferenceStatus() {
@@ -78,6 +80,9 @@ export async function confirmStopRunningChatsIfNeeded(
   model?: string,
 ) {
   state.confirmCalls.push({ action, effect, model });
+  const during = state.duringConfirm;
+  state.duringConfirm = null;
+  during?.();
   const answer = state.generating
     ? state.confirmAnswer
     : { proceed: true, forceCancelActive: false };
