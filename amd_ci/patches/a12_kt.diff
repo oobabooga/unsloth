@@ -1,0 +1,56 @@
+diff --git a/studio/backend/core/inference/diffusion_int8_attention_triton.py b/studio/backend/core/inference/diffusion_int8_attention_triton.py
+index 760ed60668..ed5ab8e571 100644
+--- a/studio/backend/core/inference/diffusion_int8_attention_triton.py
++++ b/studio/backend/core/inference/diffusion_int8_attention_triton.py
+@@ -630,11 +630,17 @@ if triton is not None:
+         PV_MODE: tl.constexpr,
+         ACC_IN_DOT: tl.constexpr,
+         MASK: tl.constexpr,
++        K_T: tl.constexpr = False,
+     ):
+         keys = t * BN + offs_n
+         if QK_INT8:
+-            k = tl.load(k_ptr + (kbase + keys[:, None]) * D + cols[None, :])
+-            dots = tl.dot(q, tl.trans(k), out_dtype = tl.int32).to(tl.float32)
++            if K_T:
++                # K read as a [D, BN] tile, no tl.trans: the AMD pipeliner swizzles its LDS copy (triton #12828)
++                kt = tl.load(k_ptr + (kbase + keys[None, :]) * D + cols[:, None])
++                dots = tl.dot(q, kt, out_dtype = tl.int32).to(tl.float32)
++            else:
++                k = tl.load(k_ptr + (kbase + keys[:, None]) * D + cols[None, :])
++                dots = tl.dot(q, tl.trans(k), out_dtype = tl.int32).to(tl.float32)
+             if K_TILE:
+                 kst = tl.load(ks_ptr + bh.to(tl.int64) * n_ktiles + t)
+                 s = dots * (qs * kst)[:, None]
+@@ -726,6 +732,7 @@ if triton is not None:
+         EVEN_K: tl.constexpr,
+         ACC_IN_DOT: tl.constexpr,
+         PREFETCH_FIX: tl.constexpr,  # cache key only: compiled with the sm_8x 8-bit prefetch fix
++        K_T: tl.constexpr = False,
+     ):
+         # PV_MODE 0: 16-bit P.V, V read from the strided input; 1: 16-bit P.V, V from a heads-major padded copy;
+         # 2: INT8 P.V, P as 0..127 relative to each (row, key tile) maximum, V centred / gained, one scale per tile;
+@@ -791,6 +798,7 @@ if triton is not None:
+                 PV_MODE,
+                 ACC_IN_DOT,
+                 False,
++                K_T,
+             )
+         if not EVEN_K:
+             acc, l_i, m_i = _attn_tile(
+@@ -828,6 +836,7 @@ if triton is not None:
+                 PV_MODE,
+                 ACC_IN_DOT,
+                 True,
++                K_T,
+             )
+         out = acc / l_i[:, None]
+         if PV_MODE == 2 or PV_MODE == 4:
+@@ -982,6 +991,7 @@ def _make_plan(
+             "EVEN_K": Sk % bn == 0,
+             "ACC_IN_DOT": bool(config.get("acc_in_dot", False)),
+             "PREFETCH_FIX": prefetch_fix(),
++            "K_T": bool(config.get("k_t", False)),
+             **_launch_options(config),
+         },
+         "config": config,
