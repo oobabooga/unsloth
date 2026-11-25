@@ -45,6 +45,7 @@ test("a row replaced since the poll stops no queue and unloads nothing", async (
   stub.resetStub({ active: ORNITH, loaded: [ORNITH], generating: true });
   stub.state.confirmAnswer = { proceed: true, forceCancelActive: true };
   const outcome = await ejectLoadedModel(chatRow(QWEN));
+  assert.deepEqual(stub.state.confirmCalls, [], "nothing to stop chats for");
   assert.deepEqual(stub.state.unloads, []);
   assert.deepEqual(stub.state.queueStops, []);
   assert.deepEqual(outcome, { status: "replaced", resident: ORNITH });
@@ -74,9 +75,22 @@ test("declining to stop the chat leaves the model loaded", async () => {
   stub.resetStub({ active: QWEN, loaded: [QWEN], generating: true });
   stub.state.confirmAnswer = { proceed: false, forceCancelActive: false };
   const outcome = await ejectLoadedModel(chatRow(QWEN));
+  assert.equal(stub.state.confirmCalls.length, 1, "asked once, not retried");
   assert.deepEqual(stub.state.unloads, []);
   assert.deepEqual(outcome, { status: "declined" });
   assert.equal(stub.state.active, QWEN);
+});
+
+test("declining for a model kept in memory leaves it loaded", async () => {
+  stub.resetStub({ active: QWEN, loaded: [QWEN, ORNITH], generating: true });
+  stub.state.confirmAnswer = { proceed: false, forceCancelActive: false };
+  const outcome = await ejectLoadedModel(chatRow(ORNITH, true));
+  assert.deepEqual(stub.state.confirmCalls, [
+    { action: "Unloading this model", effect: "unloadOne", model: ORNITH },
+  ]);
+  assert.deepEqual(stub.state.unloads, []);
+  assert.deepEqual(outcome, { status: "declined" });
+  assert.deepEqual(stub.state.loaded, [QWEN, ORNITH]);
 });
 
 test("an idle model is ejected without forcing anything", async () => {

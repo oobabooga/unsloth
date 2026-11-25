@@ -1789,7 +1789,7 @@ test("ejects stop only the ejected model's chats; eject all asks once and unload
   );
   assert.match(
     USE_CHAT_MODEL_RUNTIME,
-    /confirmStopRunningChatsIfNeeded\("Unloading this model", "unload", keptId\)[\s\S]{0,80}?if \(!decision\.proceed\) return false;\s*stopQueuedRuns\(decision, true\);/,
+    /if \(!\(await unloadAfterChatStopConfirmation\(modelId\)\)\) \{/,
   );
   assert.match(
     USE_CHAT_MODEL_RUNTIME,

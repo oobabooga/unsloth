@@ -560,7 +560,11 @@ test("a stopped load is cancelled on the server and a serving repo counts only a
     runner.indexOf("async function chatModel"),
   );
   // A bare repo id would let a resident Q4_K_M answer for a picked Q8_0.
-  assert.match(ensure, /`\$\{model\.repo\}:\$\{model\.variant\}`/);
+  assert.match(
+    ensure,
+    /const requestModel = localModelId\(model\.repo, model\.variant\);/,
+  );
+  assert.match(runner, /return variant \? `\$\{repo\}:\$\{variant\}` : repo;/);
   assert.match(ensure, /getInferenceStatus\(signal, requestModel\)/);
   assert.match(
     ensure,

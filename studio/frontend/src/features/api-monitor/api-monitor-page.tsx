@@ -19,13 +19,14 @@ import { useSidebar } from "@/components/ui/sidebar";
 import { Skeleton } from "@/components/ui/skeleton";
 import { fetchDeviceType, usePlatformStore } from "@/config/env";
 import { useIsMobileShell } from "@/hooks/use-mobile";
-import { getInferenceStatus, unloadModel } from "@/features/chat/api/chat-api";
+import { getInferenceStatus } from "@/features/chat/api/chat-api";
 import { servedInferenceCheckpointId } from "@/features/chat/lib/apply-inference-status-to-store";
 import { useChatRuntimeStore } from "@/features/chat/stores/chat-runtime-store";
 import { type ApiMonitorEntry, useChatModelRuntime } from "@/features/chat";
 import type { ApiMonitorResponse } from "@/features/chat/types/api";
 import { isExternalModelId } from "@/features/chat/external-providers";
 import { ggufVariantsMatch, modelIdsMatch } from "@/features/hub/lib/model-identity";
+import { unloadAfterChatStopConfirmation } from "@/features/loaded-models/confirmed-unload";
 import {
   type ModelConfigHandoffRequest,
   createModelConfigHandoffRequestId,
@@ -1110,8 +1111,10 @@ export function ApiMonitorPage(): ReactElement {
             ),
           };
         },
-        unload: (checkpoint) => unloadModel({ model_path: checkpoint }),
+        unload: unloadAfterChatStopConfirmation,
       });
+      // Declined before anything was unloaded.
+      if (unloadedAliases.length === 0 && stillResident) return;
       // Only clear when the store holds the model just unloaded: an external provider may be selected.
       const store = useChatRuntimeStore.getState();
       const selected = store.params.checkpoint;

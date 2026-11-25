@@ -8,6 +8,7 @@ type UnloadPayload = { model_path: string; force_cancel_active?: boolean };
 
 export const state = {
   active: null as string | null,
+  activeVariant: null as string | null,
   loaded: [] as string[],
   servingCheckpoints: [] as string[],
   embeddingLoaded: false,
@@ -16,6 +17,8 @@ export const state = {
   confirmCalls: [] as { action: string; effect: string; model?: string }[],
   unloads: [] as UnloadPayload[],
   queueStops: [] as string[][],
+  afterUnload: null as (() => void) | null,
+  duringConfirm: null as (() => void) | null,
 };
 
 export function resetStub({
@@ -26,6 +29,7 @@ export function resetStub({
   generating = false,
 } = {}): void {
   state.active = active;
+  state.activeVariant = null;
   state.loaded = [...loaded];
   state.servingCheckpoints = [...servingCheckpoints];
   state.embeddingLoaded = embeddingLoaded;
@@ -34,11 +38,14 @@ export function resetStub({
   state.confirmCalls = [];
   state.unloads = [];
   state.queueStops = [];
+  state.afterUnload = null;
+  state.duringConfirm = null;
 }
 
 export async function getInferenceStatus() {
   return {
     active_model: state.active,
+    gguf_variant: state.activeVariant,
     loaded: [...state.loaded],
     serving_checkpoints: [...state.servingCheckpoints],
   };
@@ -67,6 +74,7 @@ export async function unloadModel(payload: UnloadPayload): Promise<void> {
     (checkpoint) => checkpoint !== payload.model_path,
   );
   if (state.active === payload.model_path) state.active = null;
+  state.afterUnload?.();
 }
 
 export async function confirmStopRunningChatsIfNeeded(
@@ -75,6 +83,9 @@ export async function confirmStopRunningChatsIfNeeded(
   model?: string,
 ) {
   state.confirmCalls.push({ action, effect, model });
+  const during = state.duringConfirm;
+  state.duringConfirm = null;
+  during?.();
   const answer = state.generating
     ? state.confirmAnswer
     : { proceed: true, forceCancelActive: false };
