@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
 
-"""Pins the known divergence where the display strip deletes rehearsals inside fenced code blocks."""
+"""The display strip keeps a rehearsal quoted in code, as the canonical strip and the parser do."""
 
 import sys
 from pathlib import Path
@@ -14,7 +14,7 @@ if str(BACKEND_ROOT) not in sys.path:
 
 from core.inference.tool_call_parser import strip_tool_markup  # noqa: E402
 
-ENABLED = {"get_weather", "search"}
+ENABLED = {"get_weather", "search", "web_search"}
 
 
 @pytest.fixture(scope = "module")
@@ -23,28 +23,49 @@ def route_strip():
     return routes_inference._strip_tool_xml_for_display
 
 
-def test_route_strip_deletes_a_fenced_rehearsal_canonical_keeps_it(route_strip):
-    """The concrete user-visible symptom of the drift."""
-    text = '```\nget_weather[ARGS]{"city": "Paris"}\n```'
-
-    assert route_strip(text, auto_heal_tool_calls = True, enabled_tool_names = ENABLED) == "```\n\n```"
+@pytest.mark.parametrize(
+    "text",
+    [
+        '```\nget_weather[ARGS]{"city": "Paris"}\n```',
+        '~~~\nget_weather[ARGS]{"city": "Paris"}\n~~~',
+        "`get_weather[ARGS]{}`",
+        'Call it as `search[ARGS]{"q": "x"}` when needed.',
+    ],
+)
+def test_route_strip_keeps_a_rehearsal_quoted_in_code(route_strip, text):
+    assert route_strip(text, auto_heal_tool_calls = True, enabled_tool_names = ENABLED) == text
     assert strip_tool_markup(text, final = True, enabled_tool_names = ENABLED) == text
 
 
-def test_route_strip_deletes_an_inline_code_rehearsal(route_strip):
-    text = "`get_weather[ARGS]{}`"
-
-    assert route_strip(text, auto_heal_tool_calls = True, enabled_tool_names = ENABLED) == "``"
-    assert strip_tool_markup(text, final = True, enabled_tool_names = ENABLED) == text
+@pytest.mark.parametrize(
+    "text, expected",
+    [
+        ('Checking. get_weather[ARGS]{"city": "Paris"}', "Checking. "),
+        ('Checking. get_weather[ARGS]{"city": "Par', "Checking. "),
+        ("Checking. unknown_tool[ARGS]{}", "Checking. unknown_tool[ARGS]{}"),
+        # Markup quoted in a kept example stays; a real call after the code block still goes.
+        (
+            'Try `other[ARGS]{"query":"<tool_call>"}` to search for the literal tag.',
+            'Try `other[ARGS]{"query":"<tool_call>"}` to search for the literal tag.',
+        ),
+        (
+            '```\nsearch[ARGS]{}\n```\n<tool_call>{"name":"search","arguments":{}}</tool_call>Done.',
+            "```\nsearch[ARGS]{}\n```\nDone.",
+        ),
+        (
+            '<tool_call>{"name":"web_search","arguments":{"q":"web_search[ARGS]{ syntax"}}</tool_call>Here.',
+            "Here.",
+        ),
+    ],
+)
+def test_route_strip_still_removes_calls_outside_code(route_strip, text, expected):
+    assert route_strip(text, auto_heal_tool_calls = True, enabled_tool_names = ENABLED) == expected
 
 
 def test_route_strip_still_removes_a_real_call(route_strip):
-    """Whatever else differs, the route strip must keep doing its actual job."""
-    text = 'Here you go. <tool_call>{"name": "get_weather", "arguments": {"city": "Paris"}}</tool_call>'
-    stripped = route_strip(text, auto_heal_tool_calls = True, enabled_tool_names = ENABLED)
+    text = 'Answer <tool_call>{"name": "get_weather", "arguments": {}}</tool_call>'
 
-    assert "<tool_call>" not in stripped
-    assert "Here you go." in stripped
+    assert route_strip(text, auto_heal_tool_calls = True, enabled_tool_names = ENABLED) == "Answer "
 
 
 def test_route_strip_is_disabled_when_healing_is_off(route_strip):
