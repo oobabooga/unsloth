@@ -16,6 +16,7 @@ export const state = {
   confirmCalls: [] as { action: string; effect: string; model?: string }[],
   unloads: [] as UnloadPayload[],
   queueStops: [] as string[][],
+  afterUnload: null as (() => void) | null,
 };
 
 export function resetStub({
@@ -34,6 +35,7 @@ export function resetStub({
   state.confirmCalls = [];
   state.unloads = [];
   state.queueStops = [];
+  state.afterUnload = null;
 }
 
 export async function getInferenceStatus() {
@@ -67,6 +69,7 @@ export async function unloadModel(payload: UnloadPayload): Promise<void> {
     (checkpoint) => checkpoint !== payload.model_path,
   );
   if (state.active === payload.model_path) state.active = null;
+  state.afterUnload?.();
 }
 
 export async function confirmStopRunningChatsIfNeeded(

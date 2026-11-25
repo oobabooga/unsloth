@@ -5,10 +5,8 @@
 // imported directly because their indexes re-export pages kept out of the eager bundle.
 
 import { authFetch, isAccountOwner } from "@/features/auth";
-import { confirmStopRunningChatsIfNeeded } from "@/features/chat/utils/confirm-stop-running-chats";
-import { getInferenceStatus, unloadModel } from "@/features/chat/api/chat-api";
+import { getInferenceStatus } from "@/features/chat/api/chat-api";
 import { isExternalModelId } from "@/features/chat/external-providers";
-import { requestScopedLocalPromptQueueStop } from "@/features/chat/utils/prompt-queue-boundary";
 import { servedInferenceCheckpointId } from "@/features/chat/lib/apply-inference-status-to-store";
 import { useChatRuntimeStore } from "@/features/chat/stores/chat-runtime-store";
 import { disposableTimeoutSignal } from "@/features/hub/lib/abort-signals";
@@ -21,6 +19,7 @@ import { getVideoStatus, unloadVideoModel } from "@/features/video/api";
 import { unloadEmbeddingModel } from "@/features/settings/api/embedding-model";
 import { useEmbeddingModelStore } from "@/features/settings/stores/embedding-model-store";
 import { notifyModelEjected } from "@/lib/model-lifecycle-events";
+import { UNLOAD_DECLINED, unloadOrAbortIfDeclined } from "./confirmed-unload";
 import { ejectChatModel } from "./eject-chat-model";
 import {
   embeddingRowName,
@@ -171,12 +170,6 @@ export async function readLoadedModels(
 
 async function ejectChatRow(entry: LoadedModelEntry): Promise<EjectOutcome> {
   if (entry.servingCheckpoint) return ejectServingRow(entry);
-  const decision = await confirmStopRunningChatsIfNeeded(
-    "Unloading this model",
-    "unloadOne",
-    entry.label ?? entry.name,
-  );
-  if (!decision.proceed) return { status: "declined" };
   const { unloadedAliases, stillResident, replacedBy } = await ejectChatModel(
     entry.name,
     {
@@ -191,14 +184,8 @@ async function ejectChatRow(entry: LoadedModelEntry): Promise<EjectOutcome> {
           ),
         };
       },
-      // Only once an unload is really sent: a row replaced since the poll unloads nothing.
-      unload: (modelPath) => {
-        requestScopedLocalPromptQueueStop(decision.promptQueueThreadIds);
-        return unloadModel({
-          model_path: modelPath,
-          force_cancel_active: decision.forceCancelActive,
-        });
-      },
+      // Asks only once an unload is really sent: a row replaced since the poll asks nothing.
+      unload: unloadOrAbortIfDeclined,
       matches: modelIdsMatch,
       cachedRow: entry.inactive === true,
       readCached: async () => (await bounded(getInferenceStatus)).loaded ?? [],
@@ -214,24 +201,12 @@ async function ejectChatRow(entry: LoadedModelEntry): Promise<EjectOutcome> {
 
 async function ejectServingRow(entry: LoadedModelEntry): Promise<EjectOutcome> {
   const checkpoint = entry.servingCheckpoint ?? entry.name;
-  const decision = await confirmStopRunningChatsIfNeeded(
-    "Unloading this model",
-    "unloadOne",
-    checkpoint,
-  );
-  if (!decision.proceed) return { status: "declined" };
   const servedCheckpoints = async () =>
     (await bounded(getInferenceStatus)).serving_checkpoints ?? [];
   const { unloadedAliases, stillResident } = await ejectChatModel(checkpoint, {
     // Never the active model: that row has no servingCheckpoint.
     readResident: async () => null,
-    unload: (modelPath) => {
-      requestScopedLocalPromptQueueStop(decision.promptQueueThreadIds);
-      return unloadModel({
-        model_path: modelPath,
-        force_cancel_active: decision.forceCancelActive,
-      });
-    },
+    unload: unloadOrAbortIfDeclined,
     matches: (left, right) => left === right,
     cachedRow: true,
     readCached: servedCheckpoints,
@@ -290,7 +265,10 @@ export async function ejectLoadedModel(
 ): Promise<EjectOutcome> {
   switch (entry.source) {
     case "chat":
-      return ejectChatRow(entry);
+      return ejectChatRow(entry).catch((error: unknown) => {
+        if (error === UNLOAD_DECLINED) return { status: "declined" } as const;
+        throw error;
+      });
     case "image": {
       const before = await bounded(getDiffusionStatus);
       return ejectRuntimeRow(

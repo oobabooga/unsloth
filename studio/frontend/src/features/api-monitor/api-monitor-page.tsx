@@ -19,13 +19,17 @@ import { useSidebar } from "@/components/ui/sidebar";
 import { Skeleton } from "@/components/ui/skeleton";
 import { fetchDeviceType, usePlatformStore } from "@/config/env";
 import { useIsMobileShell } from "@/hooks/use-mobile";
-import { getInferenceStatus, unloadModel } from "@/features/chat/api/chat-api";
+import { getInferenceStatus } from "@/features/chat/api/chat-api";
 import { servedInferenceCheckpointId } from "@/features/chat/lib/apply-inference-status-to-store";
 import { useChatRuntimeStore } from "@/features/chat/stores/chat-runtime-store";
 import { type ApiMonitorEntry, useChatModelRuntime } from "@/features/chat";
 import type { ApiMonitorResponse } from "@/features/chat/types/api";
 import { isExternalModelId } from "@/features/chat/external-providers";
 import { ggufVariantsMatch, modelIdsMatch } from "@/features/hub/lib/model-identity";
+import {
+  UNLOAD_DECLINED,
+  unloadOrAbortIfDeclined,
+} from "@/features/loaded-models/confirmed-unload";
 import {
   type ModelConfigHandoffRequest,
   createModelConfigHandoffRequestId,
@@ -1110,7 +1114,7 @@ export function ApiMonitorPage(): ReactElement {
             ),
           };
         },
-        unload: (checkpoint) => unloadModel({ model_path: checkpoint }),
+        unload: unloadOrAbortIfDeclined,
       });
       // Only clear when the store holds the model just unloaded: an external provider may be selected.
       const store = useChatRuntimeStore.getState();
@@ -1129,6 +1133,7 @@ export function ApiMonitorPage(): ReactElement {
       );
       refresh();
     } catch (err: unknown) {
+      if (err === UNLOAD_DECLINED) return;
       setUnloadError(
         err instanceof Error ? err.message : "Failed to unload the model",
       );

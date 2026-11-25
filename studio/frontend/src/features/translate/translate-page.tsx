@@ -61,7 +61,6 @@ import {
 import {
   getInferenceStatus,
   listGgufVariants,
-  unloadModel,
 } from "@/features/chat/api/chat-api";
 import {
   buildExternalModelId,
@@ -71,6 +70,7 @@ import {
 } from "@/features/chat/external-providers";
 import { useDeviceInventorySources } from "@/features/hub";
 import { modelIdsMatch } from "@/features/hub/lib/model-identity";
+import { unloadAfterChatStopConfirmation } from "@/features/loaded-models/confirmed-unload";
 import type {
   LoraModelOption,
   ModelSelectorChangeMeta,
@@ -910,7 +910,7 @@ const ModelMenu = memo(function ModelMenu({
   const eject = async () => {
     if (!localModel) return;
     try {
-      await unloadModel({ model_path: localModel });
+      if (!(await unloadAfterChatStopConfirmation(localModel))) return;
       setLoaded([]);
       // Typing must not load it straight back.
       setModelReady(selectedKey, false);

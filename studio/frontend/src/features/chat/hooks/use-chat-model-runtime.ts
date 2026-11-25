@@ -85,6 +85,7 @@ import {
 } from "@/features/hub/lib/model-identity";
 // eslint-disable-next-line no-restricted-imports -- Avoid the hub barrel's React and download-manager exports.
 import { subscribeResidentStatusRefresh } from "@/features/hub/lib/resident-status-refresh";
+import { unloadAfterChatStopConfirmation } from "@/features/loaded-models/confirmed-unload";
 // eslint-disable-next-line no-restricted-imports -- Leaf module; the model-picker index pulls in chat.
 import {
   pinnedReasoningEnabled,
@@ -663,17 +664,6 @@ function stopQueuedRuns(decision: StopRunningChatsDecision, scoped: boolean): vo
   }
   cancelPreStreamRunReservations(decision.preStreamRunTokens);
   requestLocalPromptQueueStop(decision.promptQueueThreadIds);
-}
-
-function unloadKeptModel(keptId: string): Promise<boolean> {
-  return confirmStopRunningChatsIfNeeded("Unloading this model", "unload", keptId).then(
-    async (decision) => {
-      if (!decision.proceed) return false;
-      stopQueuedRuns(decision, true);
-      await unloadModel({ model_path: keptId, force_cancel_active: decision.forceCancelActive });
-      return true;
-    },
-  );
 }
 
 export async function syncInferenceStatusToStore(options?: {
@@ -3738,7 +3728,7 @@ export function useChatModelRuntime() {
     if (modelId && modelId !== checkpoint) {
       const toastId = toast.loading("Unloading model");
       try {
-        if (!(await unloadKeptModel(modelId))) {
+        if (!(await unloadAfterChatStopConfirmation(modelId))) {
           toast.dismiss(toastId);
           return false;
         }

@@ -17,12 +17,9 @@ test("deep research runs on the selected quant's copy", () => {
   );
 });
 
-test("the loaded panel scopes the active row's stop check to its quant", () => {
+test("the loaded panel scopes the active row's stop check to the checkpoint it unloads", () => {
   const eject = LOADED.slice(LOADED.indexOf("async function ejectChatRow("));
-  assert.match(
-    eject.slice(0, 400),
-    /confirmStopRunningChatsIfNeeded\(\s*"Unloading this model",\s*"unloadOne",\s*entry\.label \?\? entry\.name,\s*\)/,
-  );
+  assert.match(eject.slice(0, 900), /unload: unloadOrAbortIfDeclined,/);
 });
 
 const MONITOR = readSrc("features/api-monitor/api-monitor-page.tsx");
