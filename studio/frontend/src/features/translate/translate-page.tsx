@@ -170,6 +170,7 @@ import {
 } from "./models";
 import {
   type TranslatePhase,
+  localModelId,
   translateModelDownloaded,
 } from "./translate-runner";
 import {
@@ -910,7 +911,8 @@ const ModelMenu = memo(function ModelMenu({
   const eject = async () => {
     if (!localModel) return;
     try {
-      if (!(await unloadAfterChatStopConfirmation(localModel))) return;
+      const target = localModelId(localModel, selectedVariant);
+      if (!(await unloadAfterChatStopConfirmation(target))) return;
       setLoaded([]);
       // Typing must not load it straight back.
       setModelReady(selectedKey, false);

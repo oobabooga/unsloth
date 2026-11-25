@@ -10,7 +10,8 @@ export type ResidentModel = {
 
 export type UnloadResidentDeps = {
   readResident: () => Promise<ResidentModel | null>;
-  unload: (checkpoint: string) => Promise<void>;
+  /** False when the user keeps that model's chats running: it stays loaded and the loop ends. */
+  unload: (checkpoint: string) => Promise<unknown>;
 };
 
 export type UnloadResidentResult = {
@@ -29,7 +30,9 @@ export async function unloadResident(
   const unloadedAliases: string[] = [];
   let resident = await deps.readResident();
   for (let pass = 0; pass < passes && resident !== null; pass += 1) {
-    await deps.unload(resident.checkpoint);
+    if ((await deps.unload(resident.checkpoint)) === false) {
+      break;
+    }
     unloadedAliases.push(...resident.aliases);
     // Re-read rather than assume: only the backend knows whether that id matched.
     resident = await deps.readResident();

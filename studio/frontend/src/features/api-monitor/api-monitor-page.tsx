@@ -26,10 +26,7 @@ import { type ApiMonitorEntry, useChatModelRuntime } from "@/features/chat";
 import type { ApiMonitorResponse } from "@/features/chat/types/api";
 import { isExternalModelId } from "@/features/chat/external-providers";
 import { ggufVariantsMatch, modelIdsMatch } from "@/features/hub/lib/model-identity";
-import {
-  UNLOAD_DECLINED,
-  unloadOrAbortIfDeclined,
-} from "@/features/loaded-models/confirmed-unload";
+import { unloadAfterChatStopConfirmation } from "@/features/loaded-models/confirmed-unload";
 import {
   type ModelConfigHandoffRequest,
   createModelConfigHandoffRequestId,
@@ -1114,8 +1111,10 @@ export function ApiMonitorPage(): ReactElement {
             ),
           };
         },
-        unload: unloadOrAbortIfDeclined,
+        unload: unloadAfterChatStopConfirmation,
       });
+      // Declined before anything was unloaded.
+      if (unloadedAliases.length === 0 && stillResident) return;
       // Only clear when the store holds the model just unloaded: an external provider may be selected.
       const store = useChatRuntimeStore.getState();
       const selected = store.params.checkpoint;
@@ -1133,7 +1132,6 @@ export function ApiMonitorPage(): ReactElement {
       );
       refresh();
     } catch (err: unknown) {
-      if (err === UNLOAD_DECLINED) return;
       setUnloadError(
         err instanceof Error ? err.message : "Failed to unload the model",
       );

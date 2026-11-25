@@ -270,15 +270,17 @@ async function downloadModel(
   });
 }
 
+/** A bare repo id matches any loaded quant of it, so the picked quant is part of the id. */
+export function localModelId(repo: string, variant?: string | null): string {
+  return variant ? `${repo}:${variant}` : repo;
+}
+
 async function ensureLocalModel(
   model: LocalModel,
   signal: AbortSignal,
   onPhase: (phase: TranslatePhase) => void,
 ): Promise<string> {
-  // A bare repo id matches any loaded quant of it, so the picked quant is part of the id.
-  const requestModel = model.variant
-    ? `${model.repo}:${model.variant}`
-    : model.repo;
+  const requestModel = localModelId(model.repo, model.variant);
   const status = await getInferenceStatus(signal, requestModel);
   if (
     isServing(status, model.repo) &&
