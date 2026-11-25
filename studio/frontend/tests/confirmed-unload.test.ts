@@ -55,7 +55,7 @@ test("a quant-qualified id scopes both the confirmation and the unload to that q
   ]);
 });
 
-test("Translate's eject names the quant it loads with, not the bare repo id", () => {
+test("Translate's eject names the quant of a Hub model and the exact path of a local one", () => {
   const runner = source("translate/translate-runner.ts");
   assert.match(
     runner,
@@ -66,8 +66,8 @@ test("Translate's eject names the quant it loads with, not the bare repo id", ()
     translate.indexOf("const eject = async () => {"),
   );
   assert.match(
-    eject.slice(0, 400),
-    /const target = localModelId\(localModel, selectedVariant\);\s*if \(!\(await unloadAfterChatStopConfirmation\(target\)\)\) return;/,
+    eject.slice(0, 600),
+    /const target = looksLikeLocalPath\(localModel\)\s*\? localModel\s*: localModelId\(localModel, selectedVariant\);\s*if \(!\(await unloadAfterChatStopConfirmation\(target\)\)\) return;/,
   );
 });
 

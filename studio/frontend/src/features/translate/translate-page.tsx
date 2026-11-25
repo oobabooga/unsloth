@@ -69,6 +69,7 @@ import {
   parseExternalModelId,
 } from "@/features/chat/external-providers";
 import { useDeviceInventorySources } from "@/features/hub";
+import { looksLikeLocalPath } from "@/lib/local-path";
 import { modelIdsMatch } from "@/features/hub/lib/model-identity";
 import { unloadAfterChatStopConfirmation } from "@/features/loaded-models/confirmed-unload";
 import type {
@@ -911,7 +912,10 @@ const ModelMenu = memo(function ModelMenu({
   const eject = async () => {
     if (!localModel) return;
     try {
-      const target = localModelId(localModel, selectedVariant);
+      // The backend unloads a local folder by its own path; only a Hub id takes the quant.
+      const target = looksLikeLocalPath(localModel)
+        ? localModel
+        : localModelId(localModel, selectedVariant);
       if (!(await unloadAfterChatStopConfirmation(target))) return;
       setLoaded([]);
       // Typing must not load it straight back.
