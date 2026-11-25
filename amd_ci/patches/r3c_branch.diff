@@ -1,0 +1,409 @@
+diff --git a/studio/backend/core/inference/diffusion.py b/studio/backend/core/inference/diffusion.py
+index 52bd7e285e..f3eb96fd8f 100644
+--- a/studio/backend/core/inference/diffusion.py
++++ b/studio/backend/core/inference/diffusion.py
+@@ -4895,12 +4895,12 @@ def _image_cast_cached(cands: list, variant: Optional[str]) -> list:
+ def _converted_shards_pread(dtype: Any, small_host: Any) -> Any:
+     """Windows: transformers components converted to ``dtype`` read through ``pread`` (no copy-on-write commit for the
+     stored bytes, #14513); components the small-host route loads at their stored dtype stay memory-mapped. An Intel
+-    iGPU reads every shard through ``pread`` (#17137)."""
++    iGPU (#17137) and a Linux ROCm integrated GPU read every shard through ``pread``."""
+     from .host_pinning import xpu_is_integrated
+-    from .safetensors_pread import pread_safetensors, pread_wanted
++    from .safetensors_pread import pread_safetensors, pread_wanted, rocm_integrated
+ 
+     keep = tuple(small_host.storage_dtypes) if small_host is not None and small_host.engaged else ()
+-    every = pread_wanted() and xpu_is_integrated()
++    every = pread_wanted() and (xpu_is_integrated() or rocm_integrated())
+     return pread_safetensors(convert_to = dtype, keep = keep, every_shard = every)
+ 
+ 
+diff --git a/studio/backend/core/inference/diffusion_native_w8a8_rdna.py b/studio/backend/core/inference/diffusion_native_w8a8_rdna.py
+index d55947d78e..e05efd725b 100644
+--- a/studio/backend/core/inference/diffusion_native_w8a8_rdna.py
++++ b/studio/backend/core/inference/diffusion_native_w8a8_rdna.py
+@@ -29,7 +29,8 @@ _QUANT_CHUNK = 256
+ # rotq: (group-rows per program BLOCK_M, K step, warps, stages); BLOCK_M grows to hold one whole activation row.
+ # mm: (BLOCK_M, BLOCK_N, BLOCK_K, GROUP_M, warps, stages). gfx1151 sweep at 4096 rows: K 12288 fastest at
+ # 128x128x128 / 8 warps (8.41 ms vs 12.96 stock); K <= 4096 at 64x128x128 / 4 warps (1.92 vs 2.04 ms for the
+-# 128-row tile, 2.45 stock; N 3072 and 12288 alike). Under 1024 rows the 64-wide tile.
++# 128-row tile, 2.45 stock; N 3072 and 12288 alike). Under 1024 rows the buckets below; mm_small only when the
++# tile env sets it.
+ _CFG = {
+     "rotq": (64, 32, 4, 1),
+     "mm_large": (128, 128, 128, 8, 8, 2),
+@@ -37,6 +38,15 @@ _CFG = {
+     "mm_small": (64, 64, 64, 8, 4, 2),
+ }
+ _SHORT_K = 4096
++# Under 1024 rows, per row bucket: (max rows, K <= 4096 tile, longer-K tile). gfx1151 sweep at Qwen-Image-2.1,
++# Z-Image and FLUX.3 klein linears (K 3072..12288), confirmed in fresh processes vs the 64x64x64 tile: 1.23-1.86x at
++# 64..512 rows, outputs identical (int32 accumulate). 1024 rows and up keep the tiles above (no gain there).
++_SMALL_M_BUCKETS = (
++    (128, (64, 64, 128, 8, 4, 2), (64, 64, 128, 8, 4, 2)),
++    (256, (32, 64, 256, 8, 4, 2), (64, 64, 256, 8, 4, 2)),
++    (512, (128, 64, 128, 8, 4, 2), (64, 64, 256, 8, 4, 2)),
++    (1023, (128, 64, 128, 8, 4, 2), (128, 64, 128, 8, 4, 2)),
++)
+ RDNA_TILES_ENV = "UNSLOTH_NATIVE_INT8_RDNA_TILES"
+ 
+ 
+@@ -59,7 +69,8 @@ def _tile_overrides(raw: Optional[str]) -> dict:
+         return {}
+ 
+ 
+-_CFG.update(_tile_overrides(os.environ.get(RDNA_TILES_ENV)))
++_TILE_OVERRIDES = _tile_overrides(os.environ.get(RDNA_TILES_ENV))
++_CFG.update(_TILE_OVERRIDES)
+ # The per-row reduction tile is [BLOCK_M, ROWS_P2]; AMD WMMA layouts need both dims >= 16.
+ _MIN_ROWS_P2 = 16
+ 
+@@ -327,6 +338,10 @@ def _mm_launch(xq: Any, xs: Any, wq: Any, ws: Any, bias: Any, out_dtype: Any) ->
+ 
+ def _mm_cfg(m: int, k: int) -> tuple:
+     if m < 1024:
++        if "mm_small" not in _TILE_OVERRIDES:
++            for rows, short_k, long_k in _SMALL_M_BUCKETS:
++                if m <= rows:
++                    return short_k if k <= _SHORT_K else long_k
+         return _CFG["mm_small"]
+     return _CFG["mm_large_short_k"] if k <= _SHORT_K else _CFG["mm_large"]
+ 
+diff --git a/studio/backend/core/inference/safetensors_pread.py b/studio/backend/core/inference/safetensors_pread.py
+index 1acad8eba2..4c8e0fb28a 100644
+--- a/studio/backend/core/inference/safetensors_pread.py
++++ b/studio/backend/core/inference/safetensors_pread.py
+@@ -1,7 +1,10 @@
+ # SPDX-License-Identifier: AGPL-3.0-only
+ # Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
+ 
+-"""Windows converting loads use pread instead of mmap to save commit; UNSLOTH_SAFETENSORS_PREAD=0|1."""
++"""Windows converting loads, and every load on a Linux ROCm integrated GPU (unified memory), read safetensors shards
++with pread instead of mmap: no copy-on-write commit on Windows, no mapped shard held in the shared pool until its last
++tensor moved on an APU. transformers' ``safe_open`` and diffusers' ``safetensors.torch.load_file`` are routed inside a
++scope (diffusers' only on a ROCm integrated GPU). UNSLOTH_SAFETENSORS_PREAD=0 turns it off everywhere, =1 on."""
+ 
+ from __future__ import annotations
+ 
+@@ -17,6 +20,7 @@ PREAD_ENV = "UNSLOTH_SAFETENSORS_PREAD"
+ _lock = threading.Lock()
+ _depth = 0
+ _original: Any = None
++_original_load_file: Any = None
+ # per load thread, so concurrent media loads never share rules: (target dtype or None = fp32-only video rule, kept dirs,
+ # every shard)
+ _local = threading.local()
+@@ -32,7 +36,26 @@ def pread_wanted() -> bool:
+         return False
+     if value in ("1", "on", "true", "yes"):
+         return True
+-    return sys.platform == "win32"
++    return sys.platform == "win32" or rocm_integrated()
++
++
++def rocm_integrated() -> bool:
++    """Linux ROCm on an integrated GPU (unified memory: VRAM is host RAM). CUDA, discrete cards and anything
++    unclassifiable answer False. Never raises."""
++    if not sys.platform.startswith("linux"):
++        return False
++    try:
++        import torch
++
++        from .rocm_bf16 import is_rocm_torch
++
++        if not is_rocm_torch(torch) or not torch.cuda.is_available():
++            return False
++        from .host_pinning import device_is_integrated
++
++        return device_is_integrated()
++    except Exception:  # noqa: BLE001 - unclassifiable: keep mmap
++        return False
+ 
+ 
+ def _supports_backend(safe_open: Any) -> bool:
+@@ -113,6 +136,59 @@ def _with_pread(safe_open: Any) -> Any:
+     return pread_safe_open
+ 
+ 
++def _with_pread_load_file(load_file: Any, safe_open: Any) -> Any:
++    """``safetensors.torch.load_file`` (diffusers' shard reader) through ``safe_open(backend="pread")`` for shards the
++    active scope routes; everything else, and every call outside a scope, keeps the original."""
++
++    @functools.wraps(load_file)
++    def pread_load_file(
++        filename: Any,
++        device: Any = "cpu",
++        *args: Any,
++        **kwargs: Any,
++    ) -> Any:
++        if args or kwargs or not _active_rules() or _backend_for(filename) != "pread":
++            return load_file(filename, device, *args, **kwargs)
++        out = {}
++        with safe_open(filename, framework = "pt", device = device, backend = "pread") as fh:
++            for key in fh.keys():
++                out[key] = fh.get_tensor(key)
++        return out
++
++    pread_load_file._unsloth_pread = True
++    return pread_load_file
++
++
++def _install_load_file() -> None:
++    global _original_load_file
++    try:
++        import safetensors.torch as st_torch
++        from safetensors import safe_open
++
++        if not _supports_backend(safe_open):
++            return
++        current = getattr(st_torch, "load_file", None)
++        if current is not None and not getattr(current, "_unsloth_pread", False):
++            _original_load_file = current
++            st_torch.load_file = _with_pread_load_file(current, safe_open)
++    except Exception:  # noqa: BLE001 - diffusers keeps the mmap reader
++        _original_load_file = None
++
++
++def _restore_load_file() -> None:
++    global _original_load_file
++    try:
++        import safetensors.torch as st_torch
++        if (
++            _original_load_file is not None
++            and getattr(st_torch.load_file, "__wrapped__", None) is _original_load_file
++        ):
++            st_torch.load_file = _original_load_file
++    except Exception:  # noqa: BLE001
++        pass
++    _original_load_file = None
++
++
+ @contextlib.contextmanager
+ def pread_safetensors(
+     convert_to: Any = None,
+@@ -137,6 +213,9 @@ def pread_safetensors(
+                 elif current is not None and _supports_backend(current):
+                     _original = current
+                     modeling_utils.safe_open = _with_pread(current)
++                    if rocm_integrated():
++                        # diffusers' reader too, only where the shared pool is the point (CUDA / Windows untouched)
++                        _install_load_file()
+                     installed = True
+                 if installed:
+                     _depth += 1
+@@ -155,6 +234,8 @@ def pread_safetensors(
+                 _depth -= 1
+                 if not _depth:
+                     import transformers.modeling_utils as modeling_utils
++
+                     if getattr(modeling_utils.safe_open, "__wrapped__", None) is _original:
+                         modeling_utils.safe_open = _original
+                     _original = None
++                    _restore_load_file()
+diff --git a/studio/backend/core/inference/video.py b/studio/backend/core/inference/video.py
+index 7376783673..ef974680f1 100644
+--- a/studio/backend/core/inference/video.py
++++ b/studio/backend/core/inference/video.py
+@@ -7698,7 +7698,7 @@ class VideoBackend:
+                         pinned_snapshot[0],
+                         pinned_snapshot[1][:12],
+                     )
+-            from .safetensors_pread import pread_safetensors
++            from .safetensors_pread import pread_safetensors, rocm_integrated
+ 
+             from .diffusion_families import pinned_repo_revision
+ 
+@@ -7717,7 +7717,8 @@ class VideoBackend:
+             def _load(offline: bool) -> None:
+                 if forced_offline:
+                     kwargs["local_files_only"] = offline
+-                with pread_safetensors():
++                # a ROCm integrated GPU reads every shard through pread (unified memory), else fp32 shards only
++                with pread_safetensors(every_shard = rocm_integrated()):
+                     with pinned_repo_revision(
+                         kwargs.get("_base_fetch_repo"), kwargs.get("_base_fetch_revision")
+                     ):
+diff --git a/studio/backend/tests/test_diffusion_native_w8a8_rdna.py b/studio/backend/tests/test_diffusion_native_w8a8_rdna.py
+index 9cd24d9336..1b82a00702 100644
+--- a/studio/backend/tests/test_diffusion_native_w8a8_rdna.py
++++ b/studio/backend/tests/test_diffusion_native_w8a8_rdna.py
+@@ -163,7 +163,13 @@ def test_tile_overrides_parse_or_ignore():
+ 
+ 
+ def test_gemm_tile_follows_rows_and_k():
+-    assert rdna._mm_cfg(512, 3072) == rdna._CFG["mm_small"]
++    assert rdna._mm_cfg(64, 3072) == (64, 64, 128, 8, 4, 2)
++    assert rdna._mm_cfg(200, 3072) == (32, 64, 256, 8, 4, 2)
++    assert rdna._mm_cfg(200, 12288) == (64, 64, 256, 8, 4, 2)
++    assert rdna._mm_cfg(512, 3072) == (128, 64, 128, 8, 4, 2)
++    assert rdna._mm_cfg(512, 9216) == (64, 64, 256, 8, 4, 2)
++    assert rdna._mm_cfg(1023, 12288) == (128, 64, 128, 8, 4, 2)
++    assert rdna._mm_cfg(1024, 3072) == rdna._CFG["mm_large_short_k"]
+     assert rdna._mm_cfg(4096, 3072) == rdna._CFG["mm_large_short_k"]
+     assert rdna._mm_cfg(4096, 12288) == rdna._CFG["mm_large"]
+     assert rdna._tile_overrides('{"mm_large_short_k": [64, 64, 128, 8, 4, 2]}') == {
+@@ -171,6 +177,13 @@ def test_gemm_tile_follows_rows_and_k():
+     }
+ 
+ 
++def test_small_tile_override_still_wins(monkeypatch):
++    monkeypatch.setattr(rdna, "_TILE_OVERRIDES", {"mm_small": (64, 64, 64, 8, 4, 2)})
++    monkeypatch.setitem(rdna._CFG, "mm_small", (64, 64, 64, 8, 4, 2))
++    assert rdna._mm_cfg(128, 3072) == (64, 64, 64, 8, 4, 2)
++    assert rdna._mm_cfg(4096, 3072) == rdna._CFG["mm_large_short_k"]
++
++
+ def _fresh_state(monkeypatch, on = None):
+     monkeypatch.setattr(
+         rdna,
+diff --git a/studio/backend/tests/test_safetensors_pread.py b/studio/backend/tests/test_safetensors_pread.py
+index 01bb0bdfa3..f60632943b 100644
+--- a/studio/backend/tests/test_safetensors_pread.py
++++ b/studio/backend/tests/test_safetensors_pread.py
+@@ -200,7 +200,7 @@ def test_video_load_runs_inside_the_scope():
+     from core.inference.video import VideoBackend
+ 
+     source = inspect.getsource(VideoBackend._run_load)
+-    scope = source.index("with pread_safetensors():")
++    scope = source.index("with pread_safetensors(every_shard = rocm_integrated()):")
+     assert scope < source.index("self.load_pipeline(**kwargs)", scope)
+ 
+ 
+diff --git a/studio/backend/tests/test_safetensors_pread_rocm_igpu.py b/studio/backend/tests/test_safetensors_pread_rocm_igpu.py
+new file mode 100644
+index 0000000000..17d2f81859
+--- /dev/null
++++ b/studio/backend/tests/test_safetensors_pread_rocm_igpu.py
+@@ -0,0 +1,132 @@
++# SPDX-License-Identifier: AGPL-3.0-only
++# Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
++
++"""Linux ROCm integrated GPUs (unified memory) read every safetensors shard through ``pread``, transformers' and
++diffusers' readers alike; CUDA, discrete ROCm and Windows keep their behaviour. CPU only."""
++
++from __future__ import annotations
++
++import pytest
++import torch
++
++import core.inference.safetensors_pread as sp
++
++transformers = pytest.importorskip("transformers")
++import safetensors.torch as st_torch  # noqa: E402
++import transformers.modeling_utils as modeling_utils  # noqa: E402
++from safetensors.torch import save_file  # noqa: E402
++
++requires_backend = pytest.mark.skipif(
++    not sp._supports_backend(modeling_utils.safe_open),
++    reason = "installed safetensors has no backend keyword",
++)
++
++
++@pytest.fixture(autouse = True)
++def _clean(monkeypatch):
++    monkeypatch.delenv(sp.PREAD_ENV, raising = False)
++    original_load_file = st_torch.load_file
++    yield
++    assert sp._depth == 0 and sp._original is None and not sp._active_rules()
++    assert st_torch.load_file is original_load_file
++
++
++def _platform(monkeypatch, platform, rocm, integrated):
++    monkeypatch.setattr(sp.sys, "platform", platform)
++    monkeypatch.setattr(torch.version, "hip", "7.13" if rocm else None, raising = False)
++    if not rocm:
++        monkeypatch.setattr(torch, "__version__", "2.11.0+cu128", raising = False)
++    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
++    import core.inference.host_pinning as hp
++
++    monkeypatch.setattr(hp, "device_is_integrated", lambda device = None: integrated)
++
++
++@pytest.mark.parametrize(
++    "platform, rocm, integrated, expected",
++    [
++        ("linux", True, True, True),  # Strix Halo and other APUs
++        ("linux", True, False, False),  # discrete Radeon / Instinct
++        ("linux", False, True, False),  # CUDA (Jetson / GB10 keep their own route)
++        ("linux", False, False, False),  # CUDA discrete: untouched
++        ("darwin", True, True, False),
++    ],
++)
++def test_rocm_integrated_and_default(monkeypatch, platform, rocm, integrated, expected):
++    _platform(monkeypatch, platform, rocm, integrated)
++    assert sp.rocm_integrated() is expected
++    assert sp.pread_wanted() is expected
++
++
++def test_kill_switch_wins_on_rocm_integrated(monkeypatch):
++    _platform(monkeypatch, "linux", True, True)
++    monkeypatch.setenv(sp.PREAD_ENV, "0")
++    assert not sp.pread_wanted()
++    with sp.pread_safetensors(every_shard = True) as on:
++        assert not on
++    assert not getattr(st_torch.load_file, "_unsloth_pread", False)
++
++
++def test_rocm_integrated_never_raises(monkeypatch):
++    monkeypatch.setattr(sp.sys, "platform", "linux")
++
++    def boom():
++        raise RuntimeError("no driver")
++
++    monkeypatch.setattr(torch.cuda, "is_available", boom)
++    monkeypatch.setattr(torch.version, "hip", "7.13", raising = False)
++    assert sp.rocm_integrated() is False
++
++
++@requires_backend
++def test_diffusers_reader_goes_through_pread_in_scope(monkeypatch, tmp_path):
++    _platform(monkeypatch, "linux", True, True)
++    shard = tmp_path / "transformer" / "diffusion_pytorch_model.safetensors"
++    shard.parent.mkdir()
++    tensors = {
++        "a": torch.randn(4, 3, dtype = torch.bfloat16),
++        "b": torch.arange(6, dtype = torch.int64),
++    }
++    save_file(tensors, str(shard))
++    seen = []
++    from safetensors import safe_open as real_safe_open
++
++    import functools
++
++    @functools.wraps(real_safe_open)
++    def spy(*args, **kwargs):
++        seen.append(kwargs.get("backend"))
++        return real_safe_open(*args, **kwargs)
++
++    monkeypatch.setattr("safetensors.safe_open", spy)
++    plain = st_torch.load_file(str(shard))
++    with sp.pread_safetensors(every_shard = True) as on:
++        assert on
++        assert getattr(st_torch.load_file, "_unsloth_pread", False)
++        got = st_torch.load_file(str(shard))
++    assert seen == ["pread"]
++    assert set(got) == set(plain) and all(torch.equal(got[k], plain[k]) for k in plain)
++
++
++@requires_backend
++def test_cuda_discrete_keeps_the_diffusers_reader(monkeypatch, tmp_path):
++    _platform(monkeypatch, "linux", False, False)
++    monkeypatch.setenv(
++        sp.PREAD_ENV, "1"
++    )  # even forced on, diffusers' reader is only routed on a ROCm APU
++    with sp.pread_safetensors(every_shard = True) as on:
++        assert on
++        assert not getattr(st_torch.load_file, "_unsloth_pread", False)
++
++
++@requires_backend
++def test_reader_outside_a_scope_is_the_original(monkeypatch, tmp_path):
++    _platform(monkeypatch, "linux", True, True)
++    shard = tmp_path / "model.safetensors"
++    save_file({"x": torch.ones(2)}, str(shard))
++    with sp.pread_safetensors(every_shard = True):
++        wrapped = st_torch.load_file
++    # another thread (no rules) calling the wrapper while a scope is open elsewhere gets the original path
++    out = sp._with_pread_load_file(st_torch.load_file, None)(str(shard))
++    assert torch.equal(out["x"], torch.ones(2))
++    assert wrapped is not st_torch.load_file
