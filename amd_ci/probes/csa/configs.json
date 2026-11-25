@@ -1,0 +1,73 @@
+{
+ "zimage": {
+  "_class_name": "ZImageTransformer2DModel",
+  "_diffusers_version": "0.36.0.dev0",
+  "all_f_patch_size": [
+   1
+  ],
+  "all_patch_size": [
+   2
+  ],
+  "axes_dims": [
+   32,
+   48,
+   48
+  ],
+  "axes_lens": [
+   1536,
+   512,
+   512
+  ],
+  "cap_feat_dim": 2560,
+  "dim": 3840,
+  "in_channels": 16,
+  "n_heads": 30,
+  "n_kv_heads": 30,
+  "n_layers": 30,
+  "n_refiner_layers": 2,
+  "norm_eps": 1e-05,
+  "qk_norm": true,
+  "rope_theta": 256.0,
+  "t_scale": 1000.0
+ },
+ "qwen21": {
+  "_class_name": "QwenImage21Transformer2DModel",
+  "_diffusers_version": "0.37.0.dev0",
+  "attention_head_dim": 128,
+  "axes_dims_rope": [
+   16,
+   56,
+   56
+  ],
+  "context_in_dim": 4096,
+  "in_channels": 64,
+  "num_attention_heads": 32,
+  "num_layers": 32,
+  "out_channels": 64,
+  "patch_size": 1,
+  "mlp_ratio": 3,
+  "eps": 1e-06,
+  "causal_condition": true
+ },
+ "flux3": {
+  "_class_name": "Flux3Transformer2DModel",
+  "_diffusers_version": "0.41.0.dev0",
+  "attention_head_dim": 128,
+  "axes_dims_rope": [
+   32,
+   32,
+   32,
+   32
+  ],
+  "cond_in_channels": 128,
+  "eps": 1e-06,
+  "in_channels": 128,
+  "joint_attention_dim": 20480,
+  "mlp_ratio": 3.0,
+  "num_attention_heads": 24,
+  "num_layers": 5,
+  "num_single_layers": 28,
+  "rope_theta": 10000,
+  "timestep_channels": 256
+ }
+}
