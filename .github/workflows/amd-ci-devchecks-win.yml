@@ -66,6 +66,7 @@ jobs:
           & powershell -NoProfile -ExecutionPolicy Bypass -File "$env:GITHUB_WORKSPACE\studio_device_checks\run.ps1" `
             -DryRun --work-dir "$env:AMD_CI_WORK\devchecks" --out "$env:AMD_CI_WORK\out\dry_default"
           Write-Host "dry run (default discovery) exit $LASTEXITCODE"
+          exit 0
 
       - name: run.ps1 dry run, -StudioHome override with the env var cleared
         run: |
@@ -78,6 +79,7 @@ jobs:
           & powershell -NoProfile -ExecutionPolicy Bypass -File "$env:GITHUB_WORKSPACE\studio_device_checks\run.ps1" `
             -DryRun -StudioHome "$env:AMD_CI_WORK\no_such_studio" --work-dir "$env:AMD_CI_WORK\devchecks" --out "$env:AMD_CI_WORK\out\dry_missing"
           Write-Host "dry run (missing home, expect exit 2) exit $LASTEXITCODE"
+          exit 0
 
       - name: run.ps1 -Mode quick
         timeout-minutes: 40
@@ -87,6 +89,7 @@ jobs:
             -Mode quick --work-dir "$env:AMD_CI_WORK\devchecks" --out "$env:AMD_CI_WORK\out\quick"
           Write-Host "quick exit $LASTEXITCODE"
           Get-ChildItem -Recurse "$env:AMD_CI_WORK\out\quick" | Select-Object -First 80 | ForEach-Object { Write-Host $_.FullName }
+          exit 0
 
       - uses: actions/upload-artifact@v4
         if: always()

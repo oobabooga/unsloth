@@ -911,7 +911,8 @@ def check_fp8_full(run: Run):
     if head_err:
         return run.add("fp8.render", n, title, FAIL, summ + "; head errors: " + "; ".join(
             f"{k}: {v[:200]}" for k, v in head_err.items()), details)
-    ok = gemm is not None and (e.get("lpips_mean") is None or e["lpips_mean"] < 0.25)
+    lp = [sc["lpips_mean"] for sc in (e, c) if sc.get("lpips_mean") is not None]
+    ok = (gemm or gemm_c) is not None and all(v < 0.25 for v in lp)
     return run.add("fp8.render", n, title, PASS if ok else FAIL, summ, details)
 
 

@@ -48,9 +48,15 @@ if ($py) {
     $driverArgs += @("--studio-python", $py)
 } else {
     # No Studio venv found: let any Python run the driver so it can report what it searched.
-    foreach ($name in @("py", "python", "python3")) {
-        $cmd = Get-Command $name -ErrorAction SilentlyContinue
-        if ($cmd) { $py = $cmd.Source; break }
+    # Any working Python will do (skip launchers that point at a missing install and the WindowsApps stub).
+    foreach ($name in @("python", "python3", "py")) {
+        foreach ($cmd in @(Get-Command $name -All -ErrorAction SilentlyContinue)) {
+            if ($cmd.Source -like "*\WindowsApps\*") { continue }
+            $ok = $false
+            try { & $cmd.Source -c "import sys" 2>$null; $ok = ($LASTEXITCODE -eq 0) } catch { $ok = $false }
+            if ($ok) { $py = $cmd.Source; break }
+        }
+        if ($py) { break }
     }
     if (-not $py) {
         Write-Host "No Unsloth Studio install found (searched: $($homes -join ', ')) and no Python on PATH."
