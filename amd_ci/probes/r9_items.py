@@ -16,6 +16,7 @@ process. Small items first so a crash in a later one cannot lose them.
 from __future__ import annotations
 
 import json
+import shutil
 import statistics as st
 from pathlib import Path
 
@@ -168,4 +169,64 @@ def item_c61_krea(ctx, obs):
         ctx["save"]()
 
 
-ITEMS = {"smoke": item_smoke, "c63": item_c63, "m4": item_m4, "c61_knee": item_c61_knee, "c61_krea": item_c61_krea}
+WAN_VAE = "unsloth/Wan2.2-TI2V-5B-FP8"
+LTX_VAE = "unsloth/LTX-2.5-FP8"
+# (mode, tag, check arm, tables): S = MIOpen (stock F.conv3d), T = vendored aiter Triton conv3d with the PR #6973
+# gfx1151 tables, G = the same kernels with aiter's gfx1100 tables (the "without the 8 tables" arm)
+C153_PLAN = [("decode", t, *a) for t, a in zip(
+    ("S1", "T1", "G1", "G2", "T2", "S2"),
+    (("stock", "pr6973"), ("triton", "pr6973"), ("triton", "gfx1100"), ("triton", "gfx1100"), ("triton", "pr6973"),
+     ("stock", "pr6973")))] + [("ltxdecode", t, *a) for t, a in zip(
+    ("S1", "T1", "T2", "S2"), (("stock", "pr6973"), ("triton", "pr6973"), ("triton", "pr6973"), ("stock", "pr6973")))]
+
+
+def item_c153(ctx, obs):
+    """C15-3: Wan 2.2 TI2V-5B VAE decode 704x1280x49 S / T / G, then LTX-2.5 VAE decode S / T; LPIPS vs S1."""
+    res: dict = {"arms": [], "lpips": {}}
+    obs["c153"] = res
+    try:
+        import importlib.util
+        if importlib.util.find_spec("lpips") is None:
+            import subprocess
+            r = subprocess.run([ctx["py"], "-m", "pip", "install", "-q", "lpips"], capture_output = True, text = True,
+                               timeout = 900)
+            res["lpips_install_rc"] = r.returncode
+    except Exception as exc:  # noqa: BLE001
+        res["lpips_install_error"] = repr(exc)[:300]
+    dirs = {}
+    for mode, repo in (("decode", WAN_VAE), ("ltxdecode", LTX_VAE)):
+        pf = prefetch(ctx, repo, ["vae/*"], timeout = 3600)
+        res[f"prefetch_{mode}"] = {k: pf.get(k) for k in ("rc", "path", "wall_s", "tail")}
+        dirs[mode] = pf.get("path")
+    od = Path(ctx["work"]) / "c153"
+    od.mkdir(parents = True, exist_ok = True)
+    sv = Path(ctx["scratch"]) / "c153"
+    sv.mkdir(parents = True, exist_ok = True)
+    for mode, tag, arm, tables in C153_PLAN:
+        if not dirs.get(mode):
+            res["arms"].append({"mode": mode, "tag": tag, "not_run": "VAE prefetch failed"})
+            continue
+        o = od / f"{mode}_{tag}.json"
+        r = run_py(ctx, R9 / "c153_arm.py", ["--tables", tables, "--mode", mode, "--arm", arm, "--vae-dir", dirs[mode],
+                                             "--out", o, "--save", sv / f"{mode}_{tag}.pt"], o, timeout = 3600,
+                   tag = f"c153_{mode}_{tag}")
+        tp = Path(str(o) + ".tables.json")
+        if tp.is_file():
+            r["tables_facts"] = json.loads(tp.read_text(encoding = "utf-8"))
+        r.update(mode = mode, tag = tag, arm_kind = tag[0], tables = tables)
+        res["arms"].append(r)
+        ctx["save"]()
+    for mode in ("decode", "ltxdecode"):
+        ref = sv / f"{mode}_S1.pt"
+        cmps = [f"{p.stem.split('_')[-1]}={p}" for p in sorted(sv.glob(f"{mode}_*.pt")) if p != ref]
+        if ref.is_file() and cmps:
+            o = od / f"lpips_{mode}.json"
+            args = ["--ref", ref, "--out", o]
+            for c in cmps:
+                args += ["--cmp", c]
+            res["lpips"][mode] = run_py(ctx, R9 / "c153_lpips.py", args, o, timeout = 1800, tag = f"c153_lpips_{mode}")
+        ctx["save"]()
+    shutil.rmtree(sv, ignore_errors = True)
+
+
+ITEMS = {"c153": item_c153, "smoke": item_smoke, "c63": item_c63, "m4": item_m4, "c61_knee": item_c61_knee, "c61_krea": item_c61_krea}

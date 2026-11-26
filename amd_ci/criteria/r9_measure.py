@@ -11,7 +11,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-TITLE = "gfx1151 round 9: C6-3 / C6-1 / C6-4 / M4 / M3"
+TITLE = "gfx1151 round 9: C6-3 / C6-1 / M4 / M3 / C15-3"
 MODE = "regression"
 NEEDS = ["gpu", "rocm", "exclusive_gpu", "nvidia", "windows", "multi_gpu"]
 JUDGES = ("r9_judge", "r9_judge_m3")
@@ -54,7 +54,7 @@ def gates(obs: dict) -> list:
 
 def _needed_mods(items):
     need = []
-    if set(items) & {"smoke", "c63", "m4", "c61_knee", "c61_krea"}:
+    if set(items) & {"smoke", "c63", "m4", "c61_knee", "c61_krea", "c153"}:
         need.append("r9_items")
     if "m3" in items:
         need.append("r9_m3")

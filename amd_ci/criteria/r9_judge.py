@@ -47,6 +47,14 @@ def gates(h: dict, items: list) -> list:
         out.append(("c61 knee arms measured (15)", len(ok) >= 13, f"{len(ok)} of {len(rows)}"))
         bal = [r.get("ballast_gib") for r in ok]
         out.append(("c61 ballast held 42 GiB in every arm", bool(bal) and min(bal) >= 41.9, f"min {min(bal or [0])}"))
+    if "c153" in items:
+        c = h.get("c153") or {}
+        ok = [r for r in c.get("arms") or [] if r.get("med_s")]
+        out.append(("c153 decode arms measured (10)", len(ok) >= 8, f"{len(ok)} ok"))
+        eng = [r.get("coverage") for r in ok if r.get("arm_kind") in ("T", "G")]
+        out.append(("c153 Triton arms engaged (coverage > 0)", bool(eng) and all(x and x > 0 for x in eng), str(eng)))
+        g = [(r.get("tables_facts") or {}).get("tables") for r in ok if r.get("arm_kind") == "G"]
+        out.append(("c153 G arms ran with gfx1100 tables", bool(g) and all(x == "gfx1100" for x in g), str(g)))
     if "c61_krea" in items:
         out.append(("c61_krea ran or gated off", bool(h.get("c61_krea_skip")) or len(
             [r for r in h.get("c61_krea") or [] if r.get("renders")]) == 4, h.get("c61_krea_skip") or
@@ -206,9 +214,69 @@ def _krea_lines(h):
     return L
 
 
+def _c153_lines(h):
+    c = h.get("c153") or {}
+    if not c:
+        return []
+    L = ["C15-3 vendored aiter Triton conv3d, S = MIOpen, T = PR #6973 gfx1151 tables, G = gfx1100 tables:"]
+    by: dict = {}
+    for r in c.get("arms") or []:
+        k = (r.get("mode"), r.get("arm_kind"))
+        L.append(f"  {r.get('mode')} {r.get('tag')}: med_s {_f(r.get('med_s'))} s {r.get('s')} first {_f(r.get('first_s'))} "
+                 f"peak {_f(r.get('peak_gib'))} GiB coverage {_f(r.get('coverage'))} counts {r.get('counts')} tables "
+                 f"{(r.get('tables_facts') or {}).get('any_1x1x1_in_force')} err {(r.get('error') or r.get('not_run') or '')[:200]}")
+        if r.get("med_s"):
+            by.setdefault(k, []).append(r)
+    lp = c.get("lpips") or {}
+    for mode, x in lp.items():
+        L.append(f"  LPIPS {mode} vs S1: {x.get('rows')} {x.get('verdict')} {(x.get('error') or '')[-200:]}")
+
+    def med(mode, kind, key = "med_s"):
+        v = [r[key] for r in by.get((mode, kind), []) if r.get(key) is not None]
+        return st.median(v) if v else None
+
+    def lp_upper(mode, kind):
+        rows = (lp.get(mode) or {}).get("rows") or {}
+        ups = [v["ci95"][1] for t, v in rows.items() if t.startswith(kind) and v.get("ci95")]
+        return max(ups) if ups else None
+    out = []
+    for mode, name, kill, other in (("decode", "Wan 5B decode", 0.10, "G"), ("ltxdecode", "LTX-2.5 decode", 0.15, "S")):
+        t, o, s_ = med(mode, "T"), med(mode, other), med(mode, "S")
+        cov = [r.get("coverage") for r in by.get((mode, "T"), [])]
+        if not t or not o:
+            out.append(f"{name} INCOMPLETE")
+            continue
+        gain = o / t - 1
+        aa = [r["med_s"] for r in by.get((mode, "T"), [])]
+        aa = (max(aa) - min(aa)) / st.median(aa) if len(aa) > 1 else None
+        floor = lp_upper(mode, "S") or 0.0
+        up = lp_upper(mode, "T")
+        dpeak = (med(mode, "T", "peak_gib") or 0) - (med(mode, other, "peak_gib") or 0)
+        dpeak_s = (med(mode, "T", "peak_gib") or 0) - (med(mode, "S", "peak_gib") or 0)
+        L.append(f"  {name}: T {t:.2f} s vs {other} {o:.2f} s = {gain:.1%} faster (T A/A {_f(aa)}); vs MIOpen "
+                 f"{_f(s_ / t - 1 if s_ else None)}; T coverage {cov}; LPIPS upper T {_f(up)} vs S/S floor {_f(floor)}; "
+                 f"peak T-{other} {dpeak:+.2f} GiB, T-S {dpeak_s:+.2f} GiB")
+        why = []
+        if not all(cov) or min(cov) <= 0:
+            why.append("not engaged (coverage 0)")
+        if gain < kill:
+            why.append(f"under {kill:.0%} faster ({gain:.1%})")
+        if aa is not None and abs(gain) <= aa:
+            why.append("inside the T A/A spread")
+        if up is not None and up - floor > 0.01:
+            why.append(f"LPIPS upper +{up - floor:.4f} > 0.01")
+        if up is None:
+            why.append("LPIPS not measured")
+        if dpeak > 2.0:
+            why.append(f"peak +{dpeak:.2f} GiB > 2 GiB")
+        out.append(f"{name} " + ("KILL (" + "; ".join(why) + ")" if why else f"KEEP ({gain:.1%} faster)"))
+    L.append("  VERDICT C15-3: " + " | ".join(out))
+    return L
+
+
 def table(h: dict) -> list:
     L = [f"smoke {h.get('smoke')}"]
-    for fn in (_c63_lines, _m4_lines, _knee_lines, _krea_lines):
+    for fn in (_c63_lines, _m4_lines, _knee_lines, _krea_lines, _c153_lines):
         try:
             L.extend(fn(h))
         except Exception as exc:  # noqa: BLE001
