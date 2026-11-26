@@ -125,8 +125,8 @@ jobs:
             --root "$env:AMD_CI_WORK" --out "$env:AMD_CI_WORK\out\states.json"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
-      - name: Test environment
-        timeout-minutes: 60
+      - name: Studio environment (head tree's Windows installer)
+        timeout-minutes: 150
         run: |
           $ErrorActionPreference = "Continue"
           # One job runs per runner, so every process under this runner's temp dir is an orphan of a
@@ -138,17 +138,30 @@ jobs:
           $orphans | Stop-Process -Force -ErrorAction SilentlyContinue
           Write-Host "orphans stopped: $($orphans.Count)"
           if ($orphans.Count -gt 0) { Start-Sleep -Seconds 3 }
-          & $env:AMD_CI_PY -m venv "$env:AMD_CI_WORK\venv"
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          $py = "$env:AMD_CI_WORK\venv\Scripts\python.exe"
-          & $py -m pip install -q --upgrade pip
+          $env:UNSLOTH_STUDIO_HOME = "$env:AMD_CI_WORK\studio"
+          Add-Content -Path $env:GITHUB_ENV -Value "UNSLOTH_STUDIO_HOME=$env:UNSLOTH_STUDIO_HOME"
+          $states = Get-Content "$env:AMD_CI_WORK\out\states.json" -Raw -Encoding UTF8 | ConvertFrom-Json
+          Push-Location $states.paths.head
+          & powershell -NoProfile -ExecutionPolicy Bypass -File ".\install.ps1" --local --skip-autostart --no-rollback *>&1 |
+            Tee-Object -FilePath "$env:AMD_CI_WORK\out\studio_install.log" | Select-Object -Last 40 | Out-String | Write-Host
+          $irc = $LASTEXITCODE
+          Pop-Location
+          Write-Host "install.ps1 exit $irc"
+          $py = "$env:UNSLOTH_STUDIO_HOME\unsloth_studio\Scripts\python.exe"
+          if (-not (Test-Path -LiteralPath $py)) {
+            Write-Host "FATAL: no Studio venv at $py (installer exit $irc); out\studio_install.log has the whole log"
+            exit 1
+          }
+          & $py -m pip --version *> $null
+          if ($LASTEXITCODE -ne 0) { & $py -m ensurepip -q }
           & $py -m pip install -q pytest pytest-asyncio pytest-timeout
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          if ($LASTEXITCODE -ne 0) { Write-Host "FATAL: pytest install into the Studio venv failed"; exit 1 }
+          & $py -c "import torch, importlib.util as u; print('torch', torch.__version__, 'hip', torch.version.hip, 'triton', u.find_spec('triton') is not None, 'httpx', u.find_spec('httpx') is not None)"
           Add-Content -Path $env:GITHUB_ENV -Value "AMD_CI_PY=$py"
-          # If the change needs a ROCm torch, install it here and then re-gate with
-          # --require rocm gpu --expect-arch gfx1151. The gate EXITS 1 when it is
-          # absent, which is the point: whether these boxes carry a ROCm-enabled
-          # torch has not been measured, and a green skip would hide that.
+          # With the Studio torch present the gate is meaningful; it EXITS 1 without ROCm on a gfx1151.
+          & $py "$env:GITHUB_WORKSPACE\amd_ci\lib\gate.py" --require windows rocm gpu --expect-arch gfx1151 `
+            --out "$env:AMD_CI_WORK\out\host_rocm.json"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Differential
         run: |
