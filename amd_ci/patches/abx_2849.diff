@@ -1,0 +1,73 @@
+diff --git a/tests/test_moe_grouped_mm_training_probe.py b/tests/test_moe_grouped_mm_training_probe.py
+index 2a620c0b4..777507045 100644
+--- a/tests/test_moe_grouped_mm_training_probe.py
++++ b/tests/test_moe_grouped_mm_training_probe.py
+@@ -194,14 +194,40 @@ def test_a_correct_grouped_mm_still_selects_grouped_mm(fresh, capsys):
+     assert "cannot run MoE training" not in capsys.readouterr().out
+ 
+ 
+-@pytest.mark.parametrize("defect", ["zeros", "dx", "empty_dw", "no_backward"])
++def test_fp32_residue_in_a_correct_grouped_mm_still_selects_grouped_mm(fresh):
++    # gfx1151 (ROCm, Linux and Windows wheels): forward, dX and dW are off the exact integer answer by 2**-19.
++    eps = 2.0 ** -19
++    class Residue(torch.autograd.Function):
++        @staticmethod
++        def forward(ctx, x, w, offs):
++            ctx.save_for_backward(x, w, offs)
++            return _reference_grouped_mm(x, w, offs) + eps
++        @staticmethod
++        def backward(ctx, grad):
++            x, w, offs = ctx.saved_tensors
++            with torch.enable_grad():
++                x_, w_ = x.detach().requires_grad_(), w.detach().requires_grad_()
++                dx, dw = torch.autograd.grad(_reference_grouped_mm(x_, w_, offs), (x_, w_), grad)
++            return dx + eps, dw + eps, None
++    def grouped_mm(x, w, offs = None):
++        return Residue.apply(x, w, offs)
++    fresh.setattr(torch, "_grouped_mm", grouped_mm, raising = False)
++    assert mu._select_moe_backend() == "grouped_mm"
++    assert mu._GROUPED_MM_TRAINING_PROBE_FAILURE is None
++
++
++@pytest.mark.parametrize("defect", ["zeros", "dx", "empty_dw", "no_backward", "nan"])
+ def test_the_probe_checks_forward_and_both_grads(fresh, defect):
+     class Wrong(torch.autograd.Function):
+         @staticmethod
+         def forward(ctx, x, w, offs):
+             ctx.save_for_backward(x, w, offs)
+-            return torch.zeros(x.shape[0], w.shape[-1], dtype = x.dtype) if defect == "zeros" else \
+-                _reference_grouped_mm(x, w, offs)
++            if defect == "zeros":
++                return torch.zeros(x.shape[0], w.shape[-1], dtype = x.dtype)
++            out = _reference_grouped_mm(x, w, offs)
++            if defect == "nan":
++                out[0, 0] = float("nan")
++            return out
+         @staticmethod
+         def backward(ctx, grad):
+             if defect == "no_backward":
+diff --git a/unsloth_zoo/temporary_patches/moe_utils.py b/unsloth_zoo/temporary_patches/moe_utils.py
+index 4b40967c4..a67c0546f 100644
+--- a/unsloth_zoo/temporary_patches/moe_utils.py
++++ b/unsloth_zoo/temporary_patches/moe_utils.py
+@@ -2309,7 +2309,7 @@ def _grouped_mm_on_device(device):
+ 
+ def _grouped_mm_trains_on(device):
+     """Training-shaped fwd + dX + dW vs per-expert matmuls; None when it runs, else why not. Windows CUDA wheels serve
+-    one fp16 expert but refuse bf16 multi-expert. Integer operands make the comparison exact. OOM is no verdict."""
++    one fp16 expert but refuse bf16 multi-expert. Integer operands: a wrong result misses by 1 or more. OOM is no verdict."""
+     if os.environ.get("UNSLOTH_MOE_GROUPED_MM_PROBE", "1") == "0": return None
+     dtype = _grouped_mm_probe_dtype(device)
+     counts = _GROUPED_MM_PROBE_COUNTS
+@@ -2334,7 +2334,10 @@ def _grouped_mm_trains_on(device):
+                 ("dW", dw, torch.stack([x[s:e].T @ dy[s:e] for s, e in spans])),
+             )
+             for name, got, ref in want:
+-                if got.shape != ref.shape or not torch.equal(got.detach().double().cpu(), ref):
++                # The exact answers are small integers (at most 192, exact in bf16 / fp16), so a wrong kernel misses
++                # by 1 or more. A correct one can still carry fp32 accumulation residue: gfx1151's grouped_mm gives
++                # 2**-19 where the answer is 0. Half a unit tells the two apart; `not <=` also rejects a NaN.
++                if got.shape != ref.shape or not float((got.detach().double().cpu() - ref).abs().max()) <= 0.5:
+                     raise RuntimeError(f"{name} differs from per-expert matmuls")
+         return None
+     except torch.OutOfMemoryError:
