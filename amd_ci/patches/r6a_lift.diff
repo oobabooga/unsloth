@@ -1,0 +1,596 @@
+diff --git a/studio/backend/core/inference/diffusion_flux3_qk_rope.py b/studio/backend/core/inference/diffusion_flux3_qk_rope.py
+index 7a5cd62a5a..2d8f865a36 100644
+--- a/studio/backend/core/inference/diffusion_flux3_qk_rope.py
++++ b/studio/backend/core/inference/diffusion_flux3_qk_rope.py
+@@ -32,6 +32,24 @@ _ROWS = 16
+ _WARPS = 4
+ 
+ 
++# Measurement arm (round 6 R6-A): UNSLOTH_DIFFUSION_ROCM_FUSED_LIFT=1 lets ROCm take this exact kernel, with the
++# CUDA-only rounding intrinsics (PTX mul.rn / add.rn, libdevice add_rn / div_rn) replaced by plain fp32 ops under
++# enable_fp_fusion=False; the module's own bit-exact self-check still decides per device.
++def _rocm_lift() -> bool:
++    import os as _os
++    return (_os.environ.get("UNSLOTH_DIFFUSION_ROCM_FUSED_LIFT") or "").strip().lower() in (
++        "1",
++        "true",
++        "yes",
++        "on",
++    )
++
++
++def _is_rocm() -> bool:
++    import torch
++    return bool(is_rocm_torch(torch))
++
++
+ def enabled() -> bool:
+     off = ("0", "off", "false", "no")
+     return all(
+@@ -69,8 +87,18 @@ def _kernel() -> Any:
+ 
+     # torch's row kernel: ::rsqrtf, an IEEE division by N, an fp32 add of eps
+     _rsqrt = libdevice.rsqrt
+-    _div = libdevice.div_rn
+-    _add = libdevice.add_rn
++    if _rocm_lift() and _is_rocm():
++
++        @triton.jit
++        def _div(a, b):
++            return a / b
++
++        @triton.jit
++        def _add(a, b):
++            return a + b
++    else:
++        _div = libdevice.div_rn
++        _add = libdevice.add_rn
+ 
+     @triton.jit(do_not_specialize = ["n_rows", "n_heads", "seq"])
+     def _f3_qk_norm_rope(
+@@ -547,7 +575,11 @@ def wanted(device: Any = "cuda") -> bool:
+         import triton  # noqa: F401
+     except Exception:  # noqa: BLE001
+         return False
+-    return str(device).startswith("cuda") and torch.cuda.is_available() and not is_rocm_torch(torch)
++    return (
++        str(device).startswith("cuda")
++        and torch.cuda.is_available()
++        and (not is_rocm_torch(torch) or _rocm_lift())
++    )
+ 
+ 
+ def reset() -> None:
+diff --git a/studio/backend/core/inference/diffusion_rocm_aiter_conv3d.py b/studio/backend/core/inference/diffusion_rocm_aiter_conv3d.py
+new file mode 100644
+index 0000000000..2c4e251a3d
+--- /dev/null
++++ b/studio/backend/core/inference/diffusion_rocm_aiter_conv3d.py
+@@ -0,0 +1,142 @@
++# SPDX-License-Identifier: AGPL-3.0-only
++# Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
++
++"""gfx1151 (opt-in): route the Wan VAE's causal Conv3d calls through AITER's Triton direct / Winograd conv3d
++(ROCm/aiter #5952 + #8215, gfx1151 configs #6973) instead of MIOpen. Measured on AMD CI Linux gfx1151 (Wan 2.2
++TI2V-5B VAE, 704x1280x49 decode): 51.9 -> 32.3 s, PSNR 54.7 dB vs MIOpen, peak 11.8 -> 18.7 GiB, every conv routed.
++
++Needs an AITER checkout (``UNSLOTH_AITER_DIR``, its ``aiter/ops/triton/conv`` is pure Triton, imported through stub
++packages so no HIP build runs). ``UNSLOTH_DIFFUSION_ROCM_AITER_CONV3D=1`` turns it on; anything failing keeps MIOpen
++for that call (counted in ``COUNTS``)."""
++
++from __future__ import annotations
++
++import os
++import threading
++from typing import Any, Optional
++
++ENABLE_ENV = "UNSLOTH_DIFFUSION_ROCM_AITER_CONV3D"
++AITER_DIR_ENV = "UNSLOTH_AITER_DIR"
++ARCHES = ("gfx1151",)
++COUNTS = {"aiter": 0, "fallback": 0}
++_LOCK = threading.Lock()
++_MOD: dict = {}
++
++
++def enabled() -> bool:
++    return (os.environ.get(ENABLE_ENV) or "").strip().lower() in ("1", "true", "yes", "on")
++
++
++def _conv3d_module() -> Optional[Any]:
++    """aiter.ops.triton.conv.conv3d through stub parent packages (skips aiter/__init__.py and its HIP JIT)."""
++    with _LOCK:
++        if "mod" in _MOD:
++            return _MOD["mod"]
++        mod = None
++        root = os.environ.get(AITER_DIR_ENV) or ""
++        try:
++            import importlib.machinery
++            import importlib.util
++            import sys
++
++            if root and os.path.isfile(
++                os.path.join(root, "aiter", "ops", "triton", "conv", "conv3d.py")
++            ):
++                for name, sub in (
++                    ("aiter", "aiter"),
++                    ("aiter.ops", "aiter/ops"),
++                    ("aiter.ops.triton", "aiter/ops/triton"),
++                ):
++                    if name not in sys.modules:
++                        spec = importlib.machinery.ModuleSpec(name, None, is_package = True)
++                        spec.submodule_search_locations = [os.path.join(root, sub)]
++                        sys.modules[name] = importlib.util.module_from_spec(spec)
++                from aiter.ops.triton.conv import conv3d as mod  # type: ignore[no-redef]
++        except Exception:  # noqa: BLE001
++            mod = None
++        _MOD["mod"] = mod
++        return mod
++
++
++def _arch_ok(device: Any) -> bool:
++    try:
++        import torch
++
++        from .rocm_bf16 import is_rocm_torch
++
++        if not is_rocm_torch(torch):
++            return False
++        name = getattr(torch.cuda.get_device_properties(device), "gcnArchName", "") or ""
++        return name.split(":")[0] in ARCHES
++    except Exception:  # noqa: BLE001
++        return False
++
++
++def install(vae: Any, logger: Any = None) -> int:
++    """Route every WanCausalConv3d of ``vae`` (per instance). Returns the number routed; 0 when off / not eligible."""
++    if vae is None or not enabled():
++        return 0
++    try:
++        import torch
++        import torch.nn.functional as F
++        from diffusers.models.autoencoders import autoencoder_kl_wan as W
++    except Exception:  # noqa: BLE001
++        return 0
++    dev = next((p.device for p in vae.parameters()), None)
++    if dev is None or dev.type != "cuda" or not _arch_ok(dev):
++        return 0
++    conv = _conv3d_module()
++    if conv is None:
++        if logger is not None:
++            logger.info(
++                "diffusion.rocm_aiter_conv3d: no AITER conv3d at %s=%r",
++                AITER_DIR_ENV,
++                os.environ.get(AITER_DIR_ENV),
++            )
++        return 0
++    n = 0
++    for m in vae.modules():
++        if not isinstance(m, W.WanCausalConv3d) or getattr(m, "_unsloth_aiter", False):
++            continue
++
++        def fwd(
++            x,
++            cache_x = None,
++            _m = m,
++        ):
++            padding = list(_m._padding)
++            if cache_x is not None and _m._padding[4] > 0:
++                x = torch.cat([cache_x.to(x.device), x], dim = 2)
++                padding[4] -= cache_x.shape[2]
++            x = F.pad(x, padding)
++            if (
++                x.dtype in (torch.bfloat16, torch.float16)
++                and _m.groups == 1
++                and _m.padding_mode == "zeros"
++            ):
++                try:
++                    y = conv.conv3d(
++                        x,
++                        _m.weight,
++                        _m.bias,
++                        stride = _m.stride,
++                        padding = _m.padding,
++                        dilation = _m.dilation,
++                    )
++                    COUNTS["aiter"] += 1
++                    return y
++                except torch.OutOfMemoryError:
++                    raise
++                except Exception:  # noqa: BLE001 -- MIOpen for this call
++                    pass
++            COUNTS["fallback"] += 1
++            return torch.nn.Conv3d.forward(_m, x)
++
++        m.forward = fwd
++        m._unsloth_aiter = True
++        n += 1
++    if n and logger is not None:
++        logger.info(
++            "diffusion.rocm_aiter_conv3d: %d Wan VAE Conv3d routed to AITER Triton conv3d", n
++        )
++    return n
+diff --git a/studio/backend/core/inference/diffusion_rocm_weight_pitch.py b/studio/backend/core/inference/diffusion_rocm_weight_pitch.py
+new file mode 100644
+index 0000000000..fd9260ea43
+--- /dev/null
++++ b/studio/backend/core/inference/diffusion_rocm_weight_pitch.py
+@@ -0,0 +1,104 @@
++# SPDX-License-Identifier: AGPL-3.0-only
++# Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
++
++"""gfx1151 (opt-in): store the denoiser's 16-bit ``nn.Linear`` weights with a padded row pitch (K + P elements, a
++view of an [N, K + P] buffer) so hipBLASLt reads them off the power-of-two strides that alias on this APU's memory
++channels. Bit-identical (same GEMM, another leading dimension). AMD CI Linux gfx1151, untuned hipBLASLt, P = 64:
++block linear sums 1.09x Wan 5B, 1.26x Krea-2, 1.31x Qwen-Image-2.1, 1.30x LTX-2.5, 1.10x FLUX.3 klein; weight memory
+++P / K (0.4-2%).
++
++``UNSLOTH_DIFFUSION_ROCM_WEIGHT_PITCH=<P>`` (elements, > 0) turns it on; unset / 0 keeps contiguous weights."""
++
++from __future__ import annotations
++
++import os
++from typing import Any
++
++PITCH_ENV = "UNSLOTH_DIFFUSION_ROCM_WEIGHT_PITCH"
++ARCHES = ("gfx1151",)
++MIN_IN_FEATURES = 1024
++STATS = {"padded": 0, "bytes": 0}
++
++
++def pitch() -> int:
++    raw = (os.environ.get(PITCH_ENV) or "").strip()
++    return int(raw) if raw.isdigit() else 0
++
++
++def _arch_ok(device: Any) -> bool:
++    try:
++        import torch
++
++        from .rocm_bf16 import is_rocm_torch
++
++        if not is_rocm_torch(torch):
++            return False
++        name = getattr(torch.cuda.get_device_properties(device), "gcnArchName", "") or ""
++        return name.split(":")[0] in ARCHES
++    except Exception:  # noqa: BLE001
++        return False
++
++
++def install(module: Any, logger: Any = None) -> int:
++    """Speed optims run before placement, so the re-store waits for the module's first forward (weights on the card
++    by then); returns 1 when the hook is armed."""
++    if (
++        module is None
++        or pitch() <= 0
++        or getattr(module, "_unsloth_weight_pitch_hook", None) is not None
++    ):
++        return 0
++
++    def hook(mod, args):
++        handle = getattr(mod, "_unsloth_weight_pitch_hook", None)
++        if handle is not None:
++            handle.remove()
++        mod._unsloth_weight_pitch_hook = False
++        pad_weights(mod, logger)
++
++    module._unsloth_weight_pitch_hook = module.register_forward_pre_hook(hook)
++    return 1
++
++
++def pad_weights(module: Any, logger: Any = None) -> int:
++    """Re-store every eligible plain ``nn.Linear`` weight of ``module`` with the padded pitch. Returns the count."""
++    p = pitch()
++    if module is None or p <= 0:
++        return 0
++    import torch
++
++    n = 0
++    checked = {}
++    with torch.no_grad():
++        for m in module.modules():
++            if type(m) is not torch.nn.Linear:
++                continue
++            w = m.weight
++            if (
++                not isinstance(w, torch.nn.Parameter)
++                or type(w.data) is not torch.Tensor
++                or w.dim() != 2
++                or w.device.type != "cuda"
++                or w.dtype not in (torch.bfloat16, torch.float16)
++                or w.requires_grad
++                or not w.is_contiguous()
++                or w.shape[1] < MIN_IN_FEATURES
++            ):
++                continue
++            idx = w.device.index or 0
++            if idx not in checked:
++                checked[idx] = _arch_ok(w.device)
++            if not checked[idx]:
++                continue
++            N, K = w.shape
++            buf = torch.empty((N, K + p), dtype = w.dtype, device = w.device)
++            buf[:, :K].copy_(w.data)
++            m.weight.data = buf[:, :K]
++            n += 1
++            STATS["bytes"] += N * p * w.element_size()
++    STATS["padded"] += n
++    if n and logger is not None:
++        logger.info(
++            "diffusion.rocm_weight_pitch: %d Linear weights re-stored with row pitch K + %d", n, p
++        )
++    return n
+diff --git a/studio/backend/core/inference/diffusion_speed.py b/studio/backend/core/inference/diffusion_speed.py
+index a97a8c8aaf..7c0dea2086 100644
+--- a/studio/backend/core/inference/diffusion_speed.py
++++ b/studio/backend/core/inference/diffusion_speed.py
+@@ -607,6 +607,15 @@ def apply_speed_optims(
+     family_allows_compile = bool(getattr(family, "supports_torch_compile", True))
+     filter_reductions = compile_config.family_filters_reductions(family)
+ 
++    try:
++        from . import diffusion_rocm_weight_pitch  # noqa: PLC0415 - opt-in, gfx1151 only
++        for name in ("transformer", "transformer_2", "unet"):
++            applied.setdefault("rocm_weight_pitch", 0)
++            applied["rocm_weight_pitch"] += diffusion_rocm_weight_pitch.install(
++                getattr(pipe, name, None), logger
++            )
++    except Exception as exc:  # noqa: BLE001 - optimisation only
++        _warn(logger, "rocm weight pitch", exc)
+     applied["vae_single_frame"] = _vae_single_frame(pipe, logger)
+     # Lossless: a channels-last VAE speeds up its convs with no numeric change.
+     applied["channels_last"] = _vae_channels_last(
+@@ -1892,6 +1901,11 @@ def _install_fused_vae(
+     ``encoder=False`` leaves the VAE encoder stock (the family's ``vae_fused_encoder``)."""
+     if os.environ.get(COMPILE_VAE_ENV, "").strip().lower() in _VAE_TRUE_TOKENS:
+         return False
++    try:
++        from . import diffusion_rocm_aiter_conv3d  # noqa: PLC0415 - opt-in, gfx1151 only
++        diffusion_rocm_aiter_conv3d.install(getattr(pipe, "vae", None), logger)
++    except Exception as exc:  # noqa: BLE001 - optimisation only
++        _warn(logger, "aiter conv3d", exc)
+     try:
+         from . import diffusion_vae_fused  # noqa: PLC0415 - Triton import only on CUDA loads
+         return diffusion_vae_fused.install(getattr(pipe, "vae", None), logger, encoder = encoder) > 0
+diff --git a/studio/backend/core/inference/video_minimax_h3_qknorm.py b/studio/backend/core/inference/video_minimax_h3_qknorm.py
+index f0ea11465e..0abee8c689 100644
+--- a/studio/backend/core/inference/video_minimax_h3_qknorm.py
++++ b/studio/backend/core/inference/video_minimax_h3_qknorm.py
+@@ -39,6 +39,19 @@ _VERDICTS: dict = {}
+ STATS = {"fused": 0, "rope": 0, "stock": 0, "once_fused": 0, "once_rope": 0, "once_stock": 0}
+ 
+ 
++# Measurement arm (round 6 R6-A): UNSLOTH_DIFFUSION_ROCM_FUSED_LIFT=1 lets ROCm take this exact kernel, with the
++# CUDA-only rounding intrinsics (PTX mul.rn / add.rn, libdevice add_rn / div_rn) replaced by plain fp32 ops under
++# enable_fp_fusion=False; the module's own bit-exact self-check still decides per device.
++def _rocm_lift() -> bool:
++    import os as _os
++    return (_os.environ.get("UNSLOTH_DIFFUSION_ROCM_FUSED_LIFT") or "").strip().lower() in (
++        "1",
++        "true",
++        "yes",
++        "on",
++    )
++
++
+ def qk_rope_enabled() -> bool:
+     return (os.environ.get(QK_ROPE_ENV) or "1").strip().lower() not in ("0", "off", "false", "no")
+ 
+@@ -128,22 +141,46 @@ def _kernel() -> Any:
+ 
+     # torch's row kernel: ::rsqrtf (MUFU), an IEEE division by N, an fp32 add of eps
+     _rsqrt = libdevice.rsqrt
+-    _div = libdevice.div_rn
+-    _add = libdevice.add_rn
++    import torch as _torch
++
++    _plain = _rocm_lift() and bool(is_rocm_torch(_torch))
++    if _plain:
++
++        @triton.jit
++        def _div(a, b):
++            return a / b
++
++        @triton.jit
++        def _add(a, b):
++            return a + b
++    else:
++        _div = libdevice.div_rn
++        _add = libdevice.add_rn
+ 
+     # Explicit-rounding PTX: plain ops get contracted into one bf16 FMA (skips eager's per-product rounding),
+     # and libdevice *_rn flushes subnormals.
+-    @triton.jit
+-    def _mul_rn(a, b):
+-        return tl.inline_asm_elementwise(
+-            "mul.rn.f32 $0, $1, $2;", "=f,f,f", [a, b], dtype = tl.float32, is_pure = True, pack = 1
+-        )
++    if _plain:
+ 
+-    @triton.jit
+-    def _add_rn(a, b):
+-        return tl.inline_asm_elementwise(
+-            "add.rn.f32 $0, $1, $2;", "=f,f,f", [a, b], dtype = tl.float32, is_pure = True, pack = 1
+-        )
++        @triton.jit
++        def _mul_rn(a, b):
++            return a * b
++
++        @triton.jit
++        def _add_rn(a, b):
++            return a + b
++    else:
++
++        @triton.jit
++        def _mul_rn(a, b):
++            return tl.inline_asm_elementwise(
++                "mul.rn.f32 $0, $1, $2;", "=f,f,f", [a, b], dtype = tl.float32, is_pure = True, pack = 1
++            )
++
++        @triton.jit
++        def _add_rn(a, b):
++            return tl.inline_asm_elementwise(
++                "add.rn.f32 $0, $1, $2;", "=f,f,f", [a, b], dtype = tl.float32, is_pure = True, pack = 1
++            )
+ 
+     @triton.jit(do_not_specialize = ["n_rows", "n_heads"])
+     def _qk_norm_rope_kernel(
+@@ -233,7 +270,7 @@ def _kernel() -> Any:
+ def _triton_ok(x: Any) -> bool:
+     try:
+         import torch
+-        if not (x.is_cuda and not is_rocm_torch(torch)):
++        if not (x.is_cuda and (not is_rocm_torch(torch) or _rocm_lift())):
+             return False
+         import triton  # noqa: F401
+     except Exception:  # noqa: BLE001
+@@ -293,6 +330,7 @@ def _launch(
+             G = max(1, dim // 128),
+             ONCE = rounding == ROUNDING_ONCE,
+             num_warps = int(warps or _WARPS),
++            **({"enable_fp_fusion": False} if _rocm_lift() and is_rocm_torch(torch) else {}),
+         )
+     return out
+ 
+diff --git a/studio/backend/core/inference/video_wan_fused.py b/studio/backend/core/inference/video_wan_fused.py
+index a5efdffe8b..f1f3663555 100644
+--- a/studio/backend/core/inference/video_wan_fused.py
++++ b/studio/backend/core/inference/video_wan_fused.py
+@@ -36,6 +36,24 @@ _VERIFY_OOM: set = set()
+ _COUNTS = {"fused": 0, "stock": 0}
+ 
+ 
++# Measurement arm (round 6 R6-A): UNSLOTH_DIFFUSION_ROCM_FUSED_LIFT=1 lets ROCm take this exact kernel, with the
++# CUDA-only rounding intrinsics (PTX mul.rn / add.rn, libdevice add_rn / div_rn) replaced by plain fp32 ops under
++# enable_fp_fusion=False; the module's own bit-exact self-check still decides per device.
++def _rocm_lift() -> bool:
++    import os as _os
++    return (_os.environ.get("UNSLOTH_DIFFUSION_ROCM_FUSED_LIFT") or "").strip().lower() in (
++        "1",
++        "true",
++        "yes",
++        "on",
++    )
++
++
++def _half(dtype) -> bool:
++    import torch
++    return dtype is torch.float16 or (dtype is torch.bfloat16 and _rocm_lift())
++
++
+ def disabled() -> bool:
+     return (os.environ.get(WAN_FUSED_ENV) or "").strip().lower() in ("0", "off", "false", "no")
+ 
+@@ -48,9 +66,9 @@ def wanted(dtype: Any, device: Any = "cuda") -> bool:
+         import torch
+     except Exception:  # noqa: BLE001
+         return False
+-    if dtype is not torch.float16 or not str(device).startswith("cuda"):
++    if not _half(dtype) or not str(device).startswith("cuda"):
+         return False
+-    if is_rocm_torch(torch):
++    if is_rocm_torch(torch) and not _rocm_lift():
+         return False
+     return _kernels() is not None
+ 
+@@ -74,12 +92,21 @@ def _kernels() -> Optional[dict]:
+     )
+     unspec = ["L"] if any_length else []
+ 
+-    @triton.jit
+-    def _mul_rn(a, b):
+-        # enable_fp_fusion=False is not enough (ptxas forms FFMA2 on sm_100), hence inline PTX.
+-        return tl.inline_asm_elementwise(
+-            "mul.rn.f32 $0, $1, $2;", "=r,r,r", [a, b], dtype = tl.float32, is_pure = True, pack = 1
+-        )
++    import torch as _torch
++
++    if _rocm_lift() and is_rocm_torch(_torch):
++
++        @triton.jit
++        def _mul_rn(a, b):
++            return a * b
++    else:
++
++        @triton.jit
++        def _mul_rn(a, b):
++            # enable_fp_fusion=False is not enough (ptxas forms FFMA2 on sm_100), hence inline PTX.
++            return tl.inline_asm_elementwise(
++                "mul.rn.f32 $0, $1, $2;", "=r,r,r", [a, b], dtype = tl.float32, is_pure = True, pack = 1
++            )
+ 
+     @triton.jit(do_not_specialize = unspec)
+     def _modnorm(
+@@ -338,8 +365,8 @@ def _affine_fp32_norm(norm: Any, dim: int) -> bool:
+         and len(tuple(getattr(norm, "normalized_shape", ()))) == 1
+         and torch.is_tensor(w)
+         and torch.is_tensor(b)
+-        and w.dtype in (torch.float32, torch.float16)
+-        and b.dtype in (torch.float32, torch.float16)
++        and (w.dtype in (torch.float32, torch.float16) or _half(w.dtype))
++        and (b.dtype in (torch.float32, torch.float16) or _half(b.dtype))
+         and tuple(w.shape) == (dim,)
+         and tuple(b.shape) == (dim,)
+         and w.is_contiguous()
+@@ -350,7 +377,7 @@ def _affine_fp32_norm(norm: Any, dim: int) -> bool:
+ def _eligible(block: Any, x: Any, enc: Any, temb: Any) -> bool:
+     import torch
+ 
+-    if not torch.is_tensor(x) or x.dtype is not torch.float16 or not x.is_cuda or x.dim() != 3:
++    if not torch.is_tensor(x) or not _half(x.dtype) or not x.is_cuda or x.dim() != 3:
+         return False
+     if torch.is_grad_enabled() and (
+         x.requires_grad or any(p.requires_grad for p in block.parameters(recurse = False))
+@@ -365,7 +392,7 @@ def _eligible(block: Any, x: Any, enc: Any, temb: Any) -> bool:
+     # float32 as diffusers keeps it (_keep_in_fp32_modules); an fp16 table upcasts exactly in both paths
+     if (
+         not torch.is_tensor(table)
+-        or table.dtype not in (torch.float32, torch.float16)
++        or not (table.dtype in (torch.float32, torch.float16) or _half(table.dtype))
+         or tuple(table.shape) != (1, 6, D)
+     ):
+         return False
+@@ -373,7 +400,7 @@ def _eligible(block: Any, x: Any, enc: Any, temb: Any) -> bool:
+         return False
+     if not torch.is_tensor(temb) or temb.device != x.device or temb.stride(-1) != 1:
+         return False
+-    if temb.dtype not in (torch.float16, torch.float32):
++    if not (temb.dtype in (torch.float16, torch.float32) or _half(temb.dtype)):
+         return False
+     if temb.dim() == 4:
+         if tuple(temb.shape) != (B, L, 6, D):
+@@ -438,8 +465,8 @@ def _self_attention(attn: Any, hidden_states: Any, rotary_emb: Any) -> Any:
+     key = key.unflatten(2, (attn.heads, -1))
+     value = value.unflatten(2, (attn.heads, -1))
+     if (
+-        query.dtype is not torch.float16
+-        or key.dtype is not torch.float16
++        not _half(query.dtype)
++        or not _half(key.dtype)
+         or not query.is_contiguous()
+         or not key.is_contiguous()
+         or query.shape[-1] % 2
+@@ -492,7 +519,7 @@ def _fused_block(
+     attn = _self_attention(block.attn1, n, rotary_emb) if rotary_emb is not None else None
+     if attn is None:
+         attn = block.attn1(n, None, None, rotary_emb)
+-    attn = attn if attn.dtype is torch.float16 and attn.is_contiguous() else None
++    attn = attn if _half(attn.dtype) and attn.is_contiguous() else None
+     if attn is None:
+         raise _Fallback()
+     x = k["gate_residual"](x, attn, temb, table, 2)
+@@ -505,13 +532,13 @@ def _fused_block(
+         n = k["affine_norm"](x, mean, rstd, norm2.weight, norm2.bias)
+     attn = block.attn2(n, encoder_hidden_states, None, None)
+     x = x + attn
+-    if x.dtype is not torch.float16 or not x.is_contiguous():
++    if not _half(x.dtype) or not x.is_contiguous():
+         raise _Fallback()
+     # 3. feed-forward: norm3 + (c_shift, c_scale) = chunks 3, 4; c_gate = chunk 5
+     mean, rstd = _stats(x, block.norm3.eps)
+     n = k["modnorm"](x, mean, rstd, temb, table, 3, 4)
+     ff = block.ffn(n)
+-    if ff.dtype is not torch.float16 or not ff.is_contiguous() or ff.shape != x.shape:
++    if not _half(ff.dtype) or not ff.is_contiguous() or ff.shape != x.shape:
+         raise _Fallback()
+     return k["gate_residual"](x, ff, temb, table, 5)
+ 
