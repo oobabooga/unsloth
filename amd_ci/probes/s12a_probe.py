@@ -102,6 +102,8 @@ if not mark.is_file():
         py = v.get("python")
     if not st.get("venv", {}).get("error"):
         st["trl_peft"] = pipi(py, *a.trl_peft.split(","), f"transformers=={a.transformers}", log = log)
+        # unsloth imports bitsandbytes unconditionally (no 4-bit load here).
+        st["bitsandbytes"] = pipi(py, "bitsandbytes", log = log)
         st["unsloth"] = pipi(py, f"unsloth @ git+https://github.com/unslothai/unsloth@{a.unsloth_ref}", log = log,
                              no_deps = True, reinstall = True)
         st["python"] = py
