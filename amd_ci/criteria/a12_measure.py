@@ -10,7 +10,7 @@ import statistics as st
 TITLE = "gfx1151: round-5 A1/A2 (K [D,BN], W8A8 stages, thenoise layout/padding, LLC head groups, SDPA compile, attention race, AITER conv3d)"
 MODE = "regression"
 NEEDS = ["gpu", "rocm", "exclusive_gpu", "nvidia", "windows", "multi_gpu"]
-MIN_OK = {"aconv": 1, "lift": 10, "w8bo": 6, "fa": 6, "tune": 3, "blk": 3, "lint": 6, "hgs": 60, "kt": 40, "hg_int8": 20, "hg_sdpa": 20, "w8a8": 3, "lin": 3, "sdc": 4, "race": 6, "conv3d": 3}
+MIN_OK = {"aconv": 1, "lift": 10, "w8bo": 6, "fa": 6, "tune_bench": 3, "blk": 3, "lint": 6, "hgs": 60, "kt": 40, "hg_int8": 20, "hg_sdpa": 20, "w8a8": 3, "lin": 3, "sdc": 4, "race": 6, "conv3d": 3}
 
 
 def _ok(rs):
@@ -22,7 +22,7 @@ def gates(obs: dict) -> list:
     arch = (h.get("env") or {}).get("arch") or ""
     items = ((h.get("args") or {}).get("items") or "").split(",")
     out = [("gfx1151", arch.startswith("gfx1151"), arch)]
-    keys = {"aconv": [], "lift": ["lift"], "w8bo": ["w8bo"], "fa": ["fa"], "tune": ["tune"], "blk": ["blk"], "lint": ["lint"], "hgs": ["hgs"], "kt": ["kt"], "hg": ["hg_int8", "hg_sdpa"], "w8a8": ["w8a8"], "lin": ["lin"], "sdc": ["sdc"],
+    keys = {"aconv": [], "lift": ["lift"], "w8bo": ["w8bo"], "fa": ["fa"], "tune": ["tune_bench"], "blk": ["blk"], "lint": ["lint"], "hgs": ["hgs"], "kt": ["kt"], "hg": ["hg_int8", "hg_sdpa"], "w8a8": ["w8a8"], "lin": ["lin"], "sdc": ["sdc"],
             "race": ["race"], "conv3d": ["conv3d"]}
     for item in items:
         for k in keys.get(item, []):

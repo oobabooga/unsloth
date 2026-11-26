@@ -36,15 +36,15 @@ env:
   MERGED: "0"
   # Set by scaffold.py --patch: base = PATCH_BASE, head = PATCH_BASE plus this diff (relative to the checkout).
   PATCH_BASE: "614840e3b3621f26d9d4105e1d8db7bf4ca997ad"
-  PATCH_FILE: "amd_ci/patches/r6a_lift2.diff"
-  PATCH_SHA256: "10894f5f85c6bde54155c6c714fe60b1f709a1f68325a9bc617b054cfa705c03"
+  PATCH_FILE: "amd_ci/patches/r6a_lift3.diff"
+  PATCH_SHA256: "31150ca8a71b4bf91e5f07e372964089c560ae7bd5a1ce0e89212b25e8881b81"
 
 jobs:
 
   gpu:
     name: "PR 0 GPU measurement (exclusive)"
     runs-on: [self-hosted, Linux, strix-halo, devlab-dispatch]
-    timeout-minutes: 300
+    timeout-minutes: 330
     # A shared constant, deliberately: it serialises every GPU measurement across
     # all branches. That is stricter than co-tenancy strictly requires now that the
     # pool is many machines, but nothing in the label set can pin or exclude a

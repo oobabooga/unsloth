@@ -122,15 +122,19 @@ KEYS = ("rocm_aiter_conv3d", "aiter conv3d", "rocm_weight_pitch", "weight pitch"
 
 
 def item_wane2e(ctx, obs, run, rounds, HERE):
-    """Wan 2.2 TI2V-5B at Studio defaults (832x480x49, 8 steps): B = main, A = AITER conv3d VAE (9.3),
-    P = Linear weight pitch +64, AP = both. Order B1 A1 P1 AP1 AP2 P2 A2 B2; LPIPS vs B1."""
+    """Wan 2.2 TI2V-5B at Studio defaults (832x480x49, 8 steps). B = main; T = head default (the new TunableOp table
+    loads by itself); A = AITER conv3d VAE, P = Linear weight pitch +64 (both with the head's table off, i.e. main's
+    GEMMs); TA = table + AITER conv3d. Order B1 T1 A1 P1 TA1 TA2 P2 A2 T2 B2; LPIPS vs B1."""
     sys.path.insert(0, str(HERE))
     import aiter_items
     w = aiter_items._setup(ctx, obs, HERE)
     a_env = {"UNSLOTH_DIFFUSION_ROCM_AITER_CONV3D": "1", "UNSLOTH_AITER_DIR": str(w / "aiter")}
-    plan = [("B1", "base", {}), ("A1", "head", a_env), ("P1", "head", PITCH), ("AP1", "head", {**a_env, **PITCH}),
-            ("AP2", "head", {**a_env, **PITCH}), ("P2", "head", PITCH), ("A2", "head", a_env), ("B2", "base", {})]
-    _e2e(ctx, obs, HERE, "wane2e", "wan", plan, {"num_frames": 49}, "A1:B1,P1:B1,AP1:B1,B2:B1,A2:A1,P2:P1", KEYS)
+    off = {"UNSLOTH_DIFFUSION_ROCM_TUNABLEOP": "0"}
+    plan = [("B1", "base", {}), ("T1", "head", {}), ("A1", "head", {**a_env, **off}), ("P1", "head", {**PITCH, **off}),
+            ("TA1", "head", a_env), ("TA2", "head", a_env), ("P2", "head", {**PITCH, **off}),
+            ("A2", "head", {**a_env, **off}), ("T2", "head", {}), ("B2", "base", {})]
+    _e2e(ctx, obs, HERE, "wane2e", "wan", plan, {"num_frames": 49},
+         "T1:B1,A1:B1,P1:B1,TA1:B1,B2:B1,T2:T1,A2:A1,P2:P1,TA2:TA1", KEYS + ("tunableop", "TunableOp"))
 
 
 def item_q21e2e(ctx, obs, run, rounds, HERE):
