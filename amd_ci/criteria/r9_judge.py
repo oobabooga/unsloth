@@ -270,6 +270,9 @@ def _c153_lines(h):
         if dpeak > 2.0:
             why.append(f"peak +{dpeak:.2f} GiB > 2 GiB")
         out.append(f"{name} " + ("KILL (" + "; ".join(why) + ")" if why else f"KEEP ({gain:.1%} faster)"))
+    L.append("  note: T is byte-for-byte the productisation ticket's Triton A (its vendored aiter conv3d already inlines "
+             "the PR #6973 gfx1151 tables), so 'aiter + #6973 vs Triton A' is an A/A; the tables' own effect is T vs G, "
+             "and the bar for the lever is the faster of S and T")
     L.append("  VERDICT C15-3: " + " | ".join(out))
     return L
 

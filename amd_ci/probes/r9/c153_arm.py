@@ -34,6 +34,9 @@ def main() -> int:
         C.TABLES["gfx1151"] = json.loads((HERE / "c153_gfx1100_tables.json").read_text(encoding = "utf-8"))
     facts["any_1x1x1_in_force"] = C.TABLES["gfx1151"]["CONV3D-1X1X1"]["any"]
     facts["families"] = sorted(C.TABLES["gfx1151"])
+    import hashlib
+    facts["pkg_sha256"] = {f.name: hashlib.sha256(f.read_bytes()).hexdigest()[:16]
+                           for f in sorted((HERE / "c153_pkg" / "core" / "inference" / "rocm_triton_conv3d").glob("*.py"))}
     Path(out + ".tables.json").write_text(json.dumps(facts), encoding = "utf-8")
     sys.argv = [str(HERE / "c153_vendor_check.py"), "--backend", pkg, *argv]
     try:
