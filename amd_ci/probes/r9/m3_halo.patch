@@ -1,0 +1,1471 @@
+diff --git a/ggml/src/ggml-vulkan/ggml-vulkan-types.h b/ggml/src/ggml-vulkan/ggml-vulkan-types.h
+index b71e73dd0..49e49278d 100644
+--- a/ggml/src/ggml-vulkan/ggml-vulkan-types.h
++++ b/ggml/src/ggml-vulkan/ggml-vulkan-types.h
+@@ -472,17 +472,22 @@ struct vk_xe_fa_pipeline_state {
+     }
+ };
+ 
++// See vk_conv_halo_params::key() for the order of the specialization values.
++typedef std::array<uint32_t, 12> vk_conv_halo_key;
++
+ struct vk_conv2d_pipeline_state {
+-    vk_conv2d_pipeline_state(uint32_t s0, uint32_t s1, uint32_t p0, uint32_t p1, uint32_t d0, uint32_t d1, uint32_t KW, uint32_t KH, uint32_t aligned)
+-        : s0(s0), s1(s1), p0(p0), p1(p1), d0(d0), d1(d1), KW(KW), KH(KH), aligned(aligned) {}
++    vk_conv2d_pipeline_state(uint32_t s0, uint32_t s1, uint32_t p0, uint32_t p1, uint32_t d0, uint32_t d1, uint32_t KW, uint32_t KH, uint32_t aligned, uint32_t split_k)
++        : s0(s0), s1(s1), p0(p0), p1(p1), d0(d0), d1(d1), KW(KW), KH(KH), aligned(aligned), split_k(split_k) {}
+ 
+     uint32_t s0, s1, p0, p1, d0, d1, KW, KH;
+     // when set, shader can skip K/CRS/NPQ bounds checks and address clamps
+     uint32_t aligned;
++    // number of workgroups the CRS loop is split across (1 = no split)
++    uint32_t split_k;
+ 
+     bool operator<(const vk_conv2d_pipeline_state &b) const {
+-        return std::tie(s0, s1, p0, p1, d0, d1, KW, KH, aligned) <
+-               std::tie(b.s0, b.s1, b.p0, b.p1, b.d0, b.d1, b.KW, b.KH, b.aligned);
++        return std::tie(s0, s1, p0, p1, d0, d1, KW, KH, aligned, split_k) <
++               std::tie(b.s0, b.s1, b.p0, b.p1, b.d0, b.d1, b.KW, b.KH, b.aligned, b.split_k);
+     }
+ };
+ 
+@@ -795,6 +800,7 @@ struct vk_device_struct {
+     bool coopmat_m1_per_element_ops {};
+     bool coopmat_m1_get_coordinate {};
+     bool coopmat_support_16x16x16_f16acc {};
++    bool coopmat_support_16x8x16_f16acc {};
+     bool coopmat_support_16x16x16_f32acc {};
+     bool coopmat1_fa_support {};
+     uint32_t coopmat_m;
+@@ -916,6 +922,7 @@ struct vk_device_struct {
+     vk_pipeline pipeline_cpy_f32_quant[GGML_TYPE_COUNT];
+     vk_pipeline pipeline_cpy_quant_f32[GGML_TYPE_COUNT];
+     vk_pipeline pipeline_cpy_transpose_16, pipeline_cpy_transpose_32;
++    vk_pipeline pipeline_cpy_transpose_f32_f16;
+     vk_pipeline pipeline_cpy_transpose_02_16, pipeline_cpy_transpose_02_32;
+     // [src0 0=fp32,1=fp16][dst]
+     vk_pipeline pipeline_set_rows_i32[2][GGML_TYPE_COUNT];
+@@ -1028,6 +1035,8 @@ struct vk_device_struct {
+     vk_pipeline pipeline_opt_step_sgd_f32;
+     std::map<vk_conv2d_pipeline_state, vk_pipeline> pipeline_conv2d_f32[CONV_SHAPE_COUNT];
+     std::map<vk_conv2d_pipeline_state, vk_pipeline> pipeline_conv2d_f16_f32[CONV_SHAPE_COUNT];
++    std::map<vk_conv_halo_key, vk_pipeline> pipeline_conv2d_halo_f16_f32;
++    std::map<vk_conv_halo_key, vk_pipeline> pipeline_conv3d_halo_f16_f32;
+     std::map<vk_conv2d_pipeline_state, vk_pipeline> pipeline_conv_transpose_2d_f32[CONV_SHAPE_COUNT];
+     std::map<vk_conv2d_pipeline_state, vk_pipeline> pipeline_conv_transpose_2d_f16_f32[CONV_SHAPE_COUNT];
+     std::map<vk_conv3d_pipeline_state, vk_pipeline> pipeline_conv3d_f32[CONV_SHAPE_COUNT];
+diff --git a/ggml/src/ggml-vulkan/ggml-vulkan.cpp b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+index f28690f68..9b8526d0a 100644
+--- a/ggml/src/ggml-vulkan/ggml-vulkan.cpp
++++ b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+@@ -1963,6 +1963,47 @@ static bool ggml_vk_amd_large_tile_supported(const vk_device& device) {
+     return major > 2 || (major == 2 && build >= 416);
+ }
+ 
++// Use KHR cooperative matrices on coopmat2 devices too. The coopmat2 shader measured slower overall.
++static bool ggml_vk_conv_halo_cm1(const vk_device & device) {
++#if defined(VK_KHR_cooperative_matrix) && defined(GGML_VULKAN_COOPMAT_GLSLC_SUPPORT)
++    return device->coopmat_support && device->coopmat_support_16x16x16_f16acc &&
++           device->subgroup_size_control && (device->subgroup_size == 32 || device->subgroup_size == 64);
++#else
++    GGML_UNUSED(device);
++    return false;
++#endif
++}
++
++// Splits the coopmat1 halo accumulator (bs_k channels x nt columns) between
++// the subgroups as a grid, giving each a wm x wn tile of whole 16 x fn
++// fragments. Keeps as many subgroups busy as possible. Among such grids it
++// picks the one with the least data loaded per subgroup and tap (wm / 16
++// fragments from the filter plus wn / fn from the box), which is the
++// squarest tile.
++static void ggml_vk_conv_halo_cm1_tile(uint32_t bs_k, uint32_t nt, uint32_t fn, uint32_t subgroups, uint32_t & wm, uint32_t & wn) {
++    const uint32_t frag_rows = bs_k / 16;
++    const uint32_t frag_cols = nt / fn;
++    uint32_t best_busy = 0, best_loads = 0;
++    for (uint32_t row_splits = 1; row_splits <= frag_rows; ++row_splits) {
++        if (frag_rows % row_splits != 0 || row_splits > subgroups) {
++            continue;
++        }
++        uint32_t col_splits = std::min(subgroups / row_splits, frag_cols);
++        while (frag_cols % col_splits != 0) {
++            col_splits--;
++        }
++        const uint32_t busy  = row_splits * col_splits;
++        // in units of 8 x 16 halves
++        const uint32_t loads = 2 * frag_rows / row_splits + (frag_cols / col_splits) * fn / 8;
++        if (busy > best_busy || (busy == best_busy && loads < best_loads)) {
++            best_busy  = busy;
++            best_loads = loads;
++            wm = bs_k / row_splits;
++            wn = nt / col_splits;
++        }
++    }
++}
++
+ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
+     VK_LOG_DEBUG("ggml_vk_load_shaders(" << device->name << ")");
+ 
+@@ -3734,6 +3775,7 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
+ 
+     ggml_vk_create_pipeline(device, device->pipeline_cpy_transpose_32, "cpy_transpose_32", cpy_transpose_32_len, cpy_transpose_32_data, "main", 2, sizeof(vk_op_unary_push_constants), {1, 1, 1}, {}, 1);
+     ggml_vk_create_pipeline(device, device->pipeline_cpy_transpose_16, "cpy_transpose_16", cpy_transpose_16_len, cpy_transpose_16_data, "main", 2, sizeof(vk_op_unary_push_constants), {1, 1, 1}, {}, 1);
++    ggml_vk_create_pipeline(device, device->pipeline_cpy_transpose_f32_f16, "cpy_transpose_f32_f16", cpy_transpose_f32_f16_len, cpy_transpose_f32_f16_data, "main", 2, sizeof(vk_op_unary_push_constants), {1, 1, 1}, {}, 1);
+     ggml_vk_create_pipeline(device, device->pipeline_cpy_transpose_02_32, "cpy_transpose_02_32", cpy_transpose_02_32_len, cpy_transpose_02_32_data, "main", 2, sizeof(vk_op_unary_push_constants), {1, 1, 1}, {}, 1);
+     ggml_vk_create_pipeline(device, device->pipeline_cpy_transpose_02_16, "cpy_transpose_02_16", cpy_transpose_02_16_len, cpy_transpose_02_16_data, "main", 2, sizeof(vk_op_unary_push_constants), {1, 1, 1}, {}, 1);
+ 
+@@ -4432,6 +4474,7 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
+             spec_constants_cpy.push_back(conv2d_csh_store); \
+             spec_constants_cpy.push_back(conv2d_WM); \
+             spec_constants_cpy.push_back(conv2d_WN); \
++            spec_constants_cpy.push_back(state.split_k); \
+             ggml_vk_create_pipeline( \
+                 device, c.second, #name #type_suffix, \
+                 name##type_suffix##spv_suffix##_len, name##type_suffix##spv_suffix##_data, "main", 3, \
+@@ -4509,6 +4552,32 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
+ #undef CREATE_CONV3D
+     }
+ 
++#if defined(VK_KHR_cooperative_matrix) && defined(GGML_VULKAN_COOPMAT_GLSLC_SUPPORT)
++    if (ggml_vk_conv_halo_cm1(device)) {
++        // spv: { 16-pixel fragments, 8-pixel fragments }
++        auto create_halo = [&](std::map<vk_conv_halo_key, vk_pipeline> & pipelines, const char * name,
++                               const std::array<size_t, 2> & spv_lens, const std::array<const void *, 2> & spv_datas, uint32_t pc_size) {
++            for (auto & c : pipelines) {
++                const vk_conv_halo_key & k = c.first;
++                const uint32_t fn = k[11];
++                const uint32_t variant = fn == 8 ? 1 : 0;
++                uint32_t wm = 0, wn = 0;
++                ggml_vk_conv_halo_cm1_tile(k[0], k[1] * k[2], fn, 256 / device->subgroup_size, wm, wn);
++                const std::vector<uint32_t> spec = { 256, k[0], 16, k[1], k[2], k[3], k[4], k[5], k[6], k[7], k[8], k[9], k[10], wm, wn };
++                ggml_vk_create_pipeline(device, c.second, name, spv_lens[variant], spv_datas[variant], "main", 3, pc_size, { k[0], 1, 1 },
++                                        spec, 1, true, true, device->subgroup_size);
++            }
++        };
++        create_halo(device->pipeline_conv2d_halo_f16_f32, "conv2d_halo_f16_f32",
++                    { conv2d_halo_f16_f32_cm1_len, conv2d_halo_n8_f16_f32_cm1_len },
++                    { conv2d_halo_f16_f32_cm1_data, conv2d_halo_n8_f16_f32_cm1_data },
++                    sizeof(vk_op_conv2d_push_constants));
++        create_halo(device->pipeline_conv3d_halo_f16_f32, "conv3d_halo_f16_f32",
++                    { conv3d_halo_f16_f32_cm1_len, conv3d_halo_n8_f16_f32_cm1_len },
++                    { conv3d_halo_f16_f32_cm1_data, conv3d_halo_n8_f16_f32_cm1_data },
++                    sizeof(vk_op_conv3d_push_constants));
++    }
++#endif
+     ggml_vk_create_pipeline(device, device->pipeline_conv2d_dw_whcn_f32, "conv2d_dw_whcn_f32", conv2d_dw_whcn_f32_len, conv2d_dw_whcn_f32_data, "main", 3, sizeof(vk_op_conv2d_dw_push_constants), {512, 1, 1}, {}, 1);
+     ggml_vk_create_pipeline(device, device->pipeline_conv2d_dw_cwhn_f32, "conv2d_dw_cwhn_f32", conv2d_dw_cwhn_f32_len, conv2d_dw_cwhn_f32_data, "main", 3, sizeof(vk_op_conv2d_dw_push_constants), {512, 1, 1}, {}, 1);
+     ggml_vk_create_pipeline(device, device->pipeline_conv2d_dw_whcn_f16_f32, "conv2d_dw_whcn_f16_f32", conv2d_dw_whcn_f16_f32_len, conv2d_dw_whcn_f16_f32_data, "main", 3, sizeof(vk_op_conv2d_dw_push_constants), {512, 1, 1}, {}, 1);
+@@ -5385,6 +5454,9 @@ vk_device ggml_vk_get_device(size_t idx) {
+                         if (prop.MSize == 16 && prop.NSize == 16 && prop.KSize == 16) {
+                             device->coopmat_support_16x16x16_f16acc = true;
+                         }
++                        if (prop.MSize == 16 && prop.NSize == 8 && prop.KSize == 16) {
++                            device->coopmat_support_16x8x16_f16acc = true;
++                        }
+                     }
+                 } else if ((vk::ComponentTypeKHR)prop.AType      == vk::ComponentTypeKHR::eSint8 &&
+                            (vk::ComponentTypeKHR)prop.BType      == vk::ComponentTypeKHR::eSint8 &&
+@@ -9664,7 +9736,7 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
+     }
+ }
+ 
+-static vk_conv_shapes ggml_vk_conv_select_shape(ggml_backend_vk_context * ctx, uint32_t K, uint32_t NPQ) {
++static vk_conv_shapes ggml_vk_conv_base_shape(ggml_backend_vk_context * ctx, uint32_t K, uint32_t NPQ) {
+     auto n_tiles = [&](vk_conv_shapes s) {
+         return CEIL_DIV(K, vk_conv_block_sizes[s].K)
+             * CEIL_DIV(NPQ, vk_conv_block_sizes[s].NPQ);
+@@ -9696,43 +9768,76 @@ static vk_conv_shapes ggml_vk_conv_select_shape(ggml_backend_vk_context * ctx, u
+     }
+ }
+ 
+-static vk_conv_shapes ggml_vk_conv3d_select_shape(ggml_backend_vk_context * ctx, const ggml_tensor * kernel, const ggml_tensor * dst, uint32_t & split_k) {
++// On coopmat2, use split-K to fill the GPU while keeping larger tiles.
++static vk_conv_shapes ggml_vk_conv_select_shape(ggml_backend_vk_context * ctx, const ggml_tensor * kernel, const ggml_tensor * dst, uint32_t & split_k) {
+     split_k = 1;
+-    const uint32_t K = ggml_get_op_params_i32(dst, 11);
+-    const uint32_t NPQ = ggml_get_op_params_i32(dst, 10) * dst->ne[0] * dst->ne[1] * dst->ne[2];
+-    const vk_conv_shapes fallback = ggml_vk_conv_select_shape(ctx, K, NPQ);
++    const bool is_3d = dst->op == GGML_OP_CONV_3D;
++    uint32_t K, NPQ;
++    uint64_t crs;
++    if (is_3d) {
++        K   = ggml_get_op_params_i32(dst, 11);
++        NPQ = ggml_get_op_params_i32(dst, 10) * dst->ne[0] * dst->ne[1] * dst->ne[2];
++        crs = (uint64_t)ggml_get_op_params_i32(dst, 9) * kernel->ne[0] * kernel->ne[1] * kernel->ne[2];
++    } else {
++        K   = (uint32_t)dst->ne[2];
++        NPQ = (uint32_t)(dst->ne[3] * dst->ne[1] * dst->ne[0]);
++        crs = (uint64_t)kernel->ne[0] * kernel->ne[1] * kernel->ne[2];
++    }
++    const vk_conv_shapes fallback = ggml_vk_conv_base_shape(ctx, K, NPQ);
+     const uint32_t shader_core_count = ctx->device->shader_core_count;
+-    // Slowdowns were observed on DGX Spark with drivers older than R615.
+-    const bool driver_supported = ctx->device->driver_id != vk::DriverId::eNvidiaProprietary ||
+-                                  (ctx->device->properties.driverVersion >> 22) >= 615;
+-    if (!ctx->device->coopmat2 || shader_core_count == 0 || K == 0 || NPQ == 0 || !driver_supported) {
++    if (!ctx->device->coopmat2 || shader_core_count == 0 || K == 0 || NPQ == 0) {
+         return fallback;
+     }
+-    const auto & block = vk_conv_block_sizes[CONV_SHAPE_256x128];
++    auto n_tiles = [&](vk_conv_shapes s) {
++        return (uint64_t)CEIL_DIV(K, vk_conv_block_sizes[s].K) * CEIL_DIV(NPQ, vk_conv_block_sizes[s].NPQ);
++    };
+     const auto & limits = ctx->device->properties.limits;
++    // Slowdowns were observed on DGX Spark with drivers older than R615.
++    const bool driver_supported = ctx->device->driver_id != vk::DriverId::eNvidiaProprietary ||
++                                  (ctx->device->properties.driverVersion >> 22) >= 615;
+     // Use the largest cm2 padding and include the dummy Csh[8].
++    const auto & large = vk_conv_block_sizes[CONV_SHAPE_256x128];
+     const uint32_t pad = 8, csh_elems = 8;
+-    const uint32_t shmem = (block.K * (block.CRS + pad) + block.CRS * (block.NPQ + pad) + csh_elems) * sizeof(uint16_t);
+-    if (shmem > limits.maxComputeSharedMemorySize) {
+-        return fallback;
++    const uint32_t shmem = (large.K * (large.CRS + pad) + large.CRS * (large.NPQ + pad) + csh_elems) * sizeof(uint16_t);
++    const bool large_ok = driver_supported && shmem <= limits.maxComputeSharedMemorySize;
++
++    vk_conv_shapes shape;
++    if (is_3d) {
++        if (!large_ok) {
++            return fallback;
++        }
++        shape = CONV_SHAPE_256x128;
++        // Keep full channel tiles when the grid already fills the GPU.
++        if (n_tiles(shape) >= shader_core_count) {
++            return K % vk_conv_block_sizes[shape].K == 0 ? shape : fallback;
++        }
++        static const bool disable_split_k = getenv("GGML_VK_DISABLE_CONV3D_SPLIT_K") != nullptr;
++        // Do not use a tile with more than half its output channels padded.
++        if (disable_split_k || K < vk_conv_block_sizes[shape].K / 2) {
++            return fallback;
++        }
++    } else {
++        static const bool disable_split_k = getenv("GGML_VK_DISABLE_CONV2D_SPLIT_K") != nullptr;
++        // Only layers that would get a small tile change.
++        if (dst->op != GGML_OP_CONV_2D || disable_split_k || K <= 64 || fallback == CONV_SHAPE_128x128) {
++            return fallback;
++        }
++        shape = K % 256 == 0 && large_ok ? CONV_SHAPE_256x128 : CONV_SHAPE_128x128;
++        if (n_tiles(shape) >= shader_core_count) {
++            return K % vk_conv_block_sizes[shape].K == 0 ? shape : fallback;
++        }
+     }
+-    const uint32_t channel_tiles = CEIL_DIV(K, block.K);
+-    const uint64_t n_tiles = (uint64_t)channel_tiles * CEIL_DIV(NPQ, block.NPQ);
+-    // Keep full channel tiles when the grid already fills the GPU.
+-    if (n_tiles >= shader_core_count) {
+-        return K % block.K == 0 ? CONV_SHAPE_256x128 : fallback;
+-    }
+-    static const bool disable_split_k = getenv("GGML_VK_DISABLE_CONV3D_SPLIT_K") != nullptr;
+-    // Do not use a tile with more than half its output channels padded.
+-    if (disable_split_k || K < block.K / 2 || !ggml_is_contiguous(dst) || get_misalign_bytes(ctx, dst) != 0) {
++
++    if (!ggml_is_contiguous(dst) || get_misalign_bytes(ctx, dst) != 0) {
+         return fallback;
+     }
++    const auto & block = vk_conv_block_sizes[shape];
++    const uint32_t channel_tiles = CEIL_DIV(K, block.K);
+     // Use power-of-two splits to give each core at least one workgroup.
+     uint64_t splits = 1;
+-    while (n_tiles * splits < shader_core_count) {
++    while (n_tiles(shape) * splits < shader_core_count) {
+         splits *= 2;
+     }
+-    const uint64_t crs = (uint64_t)ggml_get_op_params_i32(dst, 9) * kernel->ne[0] * kernel->ne[1] * kernel->ne[2];
+     const uint64_t operand_bytes = block.K * ggml_type_size(kernel->type) + block.NPQ * sizeof(float);
+     const uint64_t scratch_bytes = 2 * sizeof(float) * block.K * block.NPQ;
+     // Do not add more scratch bytes than the estimated operand load bytes.
+@@ -9747,7 +9852,7 @@ static vk_conv_shapes ggml_vk_conv3d_select_shape(ggml_backend_vk_context * ctx,
+         return fallback;
+     }
+     split_k = (uint32_t)splits;
+-    return CONV_SHAPE_256x128;
++    return shape;
+ }
+ 
+ static vk_pipeline ggml_vk_rms_norm_pipeline(const std::array<vk_pipeline, 3> & pipelines, int64_t ncols) {
+@@ -9807,6 +9912,201 @@ static vk_pipeline ggml_vk_float_pipeline(const vk_pipeline (&pipelines)[3], con
+     return pipelines[ggml_vk_float_type_idx(dst->type)];
+ }
+ 
++// Each workgroup computes bs_k output channels for an out_rows x out_cols tile
++// of one output depth slice.
++struct vk_conv_halo_params {
++    uint32_t bs_k, out_rows, out_cols, KW, KH, a_pad, pad_w, pad_h;
++    uint32_t filter_copy; // transpose filter to make output channels contiguous
++    uint32_t KD, pad_d;
++    uint32_t fn;        // accumulator fragment width in pixels: 16, or 8 (FRAG_N8)
++    uint32_t tiles;     // number of output tiles, over all batches and depth slices
++    uint32_t split_k;
++
++    vk_conv_halo_key key() const {
++        return { bs_k, out_rows, out_cols, KW, KH, a_pad, pad_w, pad_h, filter_copy, KD, pad_d, fn };
++    }
++};
++
++// Decides whether the halo shader handles this convolution and, if so, picks
++// its tile shape, split-K and filter staging. The shader needs stride 1, dilation 1,
++// padding smaller than the filter, a contiguous f16 or f32 filter, f32 input
++// and output, and input channels in blocks of 16.
++static bool ggml_vk_conv_halo_params(ggml_backend_vk_context * ctx, const ggml_tensor * src0, const ggml_tensor * src1,
++                                     const ggml_tensor * dst, vk_conv_halo_params & hp) {
++#if defined(VK_KHR_cooperative_matrix) && defined(GGML_VULKAN_COOPMAT_GLSLC_SUPPORT)
++    static const bool disabled = getenv("GGML_VK_DISABLE_CONV_HALO") != nullptr;
++    const bool is_3d = dst->op == GGML_OP_CONV_3D;
++    if (disabled || (dst->op != GGML_OP_CONV_2D && !is_3d) || !ggml_vk_conv_halo_cm1(ctx->device) ||
++        (src0->type != GGML_TYPE_F16 && src0->type != GGML_TYPE_F32) || src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32 ||
++        !ggml_is_contiguous(src0)) {
++        return false;
++    }
++    const int32_t * op = dst->op_params;
++    int32_t s[3], pd[3], dl[3]; // width, height, depth
++    uint32_t Cin, Cout, N, OD;
++    if (is_3d) {
++        // op params: s0, s1, s2, p0, p1, p2, d0, d1, d2, IC, N, OC
++        for (int i = 0; i < 3; ++i) {
++            s[i] = op[i];
++            pd[i] = op[3 + i];
++            dl[i] = op[6 + i];
++        }
++        Cin = (uint32_t)op[9];
++        N = (uint32_t)op[10];
++        Cout = (uint32_t)op[11];
++        hp.KD = (uint32_t)src0->ne[2];
++        OD = (uint32_t)dst->ne[2];
++    } else {
++        // op params: s0, s1, p0, p1, d0, d1
++        s[0] = op[0]; s[1] = op[1]; s[2] = 1;
++        pd[0] = op[2]; pd[1] = op[3]; pd[2] = 0;
++        dl[0] = op[4]; dl[1] = op[5]; dl[2] = 1;
++        Cin = (uint32_t)src1->ne[2];
++        Cout = (uint32_t)dst->ne[2];
++        N = (uint32_t)dst->ne[3];
++        hp.KD = 1;
++        OD = 1;
++    }
++    hp.KW = (uint32_t)src0->ne[0];
++    hp.KH = (uint32_t)src0->ne[1];
++    const uint32_t ksize[3] = { hp.KW, hp.KH, hp.KD };
++    // Stride 1, dilation 1, and padding smaller than the filter, in every dimension.
++    for (int i = 0; i < 3; ++i) {
++        if (s[i] != 1 || dl[i] != 1 || pd[i] < 0 || (uint32_t)pd[i] >= ksize[i]) {
++            return false;
++        }
++    }
++    hp.pad_w = (uint32_t)pd[0];
++    hp.pad_h = (uint32_t)pd[1];
++    hp.pad_d = (uint32_t)pd[2];
++    // All spatial taps in the pass must fit in shared memory together.
++    const uint32_t taps = hp.KW * hp.KH;
++    if (Cin % 16 != 0 || taps > 16 || hp.KW > 9) {
++        return false;
++    }
++    // 1x1 filters have nothing to reuse; conv2d_mm/conv3d_mm are faster.
++    if (taps == 1) {
++        return false;
++    }
++    const uint32_t OW = (uint32_t)dst->ne[0], OH = (uint32_t)dst->ne[1];
++    // The transpose pays for itself at about 8K output positions. 3D also needs it to align filter slices to 8 bytes.
++    const uint64_t npq = (uint64_t)N * OD * OH * OW;
++    hp.filter_copy = is_3d || npq >= 8192 ? 1 : 0;
++    // The in-place path loads 8-byte packets of f16 weights.
++    if (!hp.filter_copy && (src0->type != GGML_TYPE_F16 || get_misalign_bytes(ctx, src0) % 8 != 0)) {
++        hp.filter_copy = 1;
++    }
++    if (hp.filter_copy && (uint64_t)Cin * ROUNDUP_POW2(Cout, 8) * taps * hp.KD * sizeof(ggml_fp16_t) > ctx->device->properties.limits.maxStorageBufferRange) {
++        return false;
++    }
++    // Match conv_halo.comp: the filter and input box share storage with the output staging tile.
++    const size_t limit = ctx->device->properties.limits.maxComputeSharedMemorySize;
++    auto shmem = [&](uint32_t cols, uint32_t rows, uint32_t bs_k, uint32_t pad) {
++        const size_t filter = hp.filter_copy ? (size_t)taps * 16 * (bs_k + pad) * 2 : (size_t)taps * bs_k * (16 + pad) * 2;
++        const size_t pass = filter + (size_t)(rows + hp.KH - 1) * (cols + hp.KW - 1) * 24 * 2;
++        const size_t out = (size_t)bs_k * (rows * cols + 8) * 2;
++        return std::max(pass, out);
++    };
++    // A small spatial tile can fit all channels in one workgroup and avoid padding to a multiple of 64.
++    const uint32_t bs_k_all = Cout > 64 && Cout <= 128 && Cout % 64 != 0 ? ROUNDUP_POW2(Cout, 16) : 0;
++    auto fit = [&](uint32_t cols, uint32_t rows, uint32_t & bs_k, uint32_t & a_pad) {
++        if (bs_k_all && cols * rows <= 128) {
++            bs_k = bs_k_all;
++            a_pad = 8;
++            if (shmem(cols, rows, bs_k, a_pad) <= limit) {
++                return true;
++            }
++        }
++        bs_k = Cout <= 32 ? 32 : 64;
++        for (;;) {
++            // Padding avoids up to eight-way bank conflicts in the copied layout. The in-place layout can tolerate two-way conflicts.
++            a_pad = hp.filter_copy || shmem(cols, rows, bs_k, 8) <= limit ? 8 : 0;
++            if (shmem(cols, rows, bs_k, a_pad) <= limit) {
++                return true;
++            }
++            if (bs_k <= 32) {
++                return false;
++            }
++            bs_k = 32;
++        }
++    };
++    // Output tile: the shape with the lowest padded area (output pixels and
++    // channels) times its cost per output.
++    const uint32_t sms = ctx->device->shader_core_count > 0 ? ctx->device->shader_core_count : 32;
++    double best = 0;
++    const uint32_t shapes[10][2] = { { 32, 8 }, { 16, 16 }, { 8, 32 }, { 56, 4 }, { 16, 8 }, { 8, 16 }, { 32, 4 }, { 8, 8 }, { 16, 4 }, { 32, 2 } };
++    for (const auto & shape : shapes) {
++        // 8-pixel fragments need 16x8x16 cooperative matrices.
++        if (shape[0] % 16 != 0 && !ctx->device->coopmat_support_16x8x16_f16acc) {
++            continue;
++        }
++        // The 56 x 4 tile saves padding for widths 49 to 56 when the grid is large enough.
++        if (shape[0] == 56 && (uint64_t)CEIL_DIV(Cout, 64) * N * OD * CEIL_DIV(OH, shape[1]) * CEIL_DIV(OW, shape[0]) < sms / 2) {
++            continue;
++        }
++        uint32_t bs_k, a_pad;
++        if (!fit(shape[0], shape[1], bs_k, a_pad)) {
++            continue;
++        }
++        const uint32_t nt = shape[0] * shape[1];
++        const double cost = (shape[0] % 16 != 0 ? 1.15 : 1.0) * (nt >= 192 ? 1.0 : nt >= 128 ? 1.2 : 1.4) * (bs_k < 64 && Cout > 32 ? 1.15 : 1.0);
++        const double area = (double)CEIL_DIV(OW, shape[0]) * shape[0] * CEIL_DIV(OH, shape[1]) * shape[1] * cost * CEIL_DIV(Cout, bs_k) * bs_k / Cout;
++        if (best == 0 || area < best) {
++            best = area;
++            hp.out_cols = shape[0];
++            hp.out_rows = shape[1];
++            hp.bs_k = bs_k;
++            hp.a_pad = a_pad;
++        }
++    }
++    if (best == 0) {
++        return false;
++    }
++    hp.fn = hp.out_cols % 16 == 0 ? 16 : 8;
++    const uint64_t slices = (uint64_t)N * OD;
++    auto tiles_for = [&](uint32_t rows) {
++        return (uint64_t)CEIL_DIV(Cout, hp.bs_k) * slices * CEIL_DIV(OH, rows) * CEIL_DIV(OW, hp.out_cols);
++    };
++    // For in-place filters, a smaller channel tile can fill the SMs without writing split-K partials.
++    if (tiles_for(hp.out_rows) < 2 * sms && hp.bs_k == 64 && !hp.filter_copy && taps * hp.KD > 1 && Cin / 16 * hp.KD >= 8) {
++        hp.bs_k = 32;
++        hp.a_pad = shmem(hp.out_cols, hp.out_rows, 32, 8) <= limit ? 8 : 0;
++    }
++    // Use split-K to target two workgroups per SM, then shrink the tiles if the grid is still too small.
++    const uint32_t stages = Cin / 16 * hp.KD;
++    hp.split_k = 1;
++    if (tiles_for(hp.out_rows) < 2 * sms) {
++        hp.split_k = (uint32_t)std::max<uint64_t>(1, std::min<uint64_t>(2 * sms / tiles_for(hp.out_rows), stages / 4));
++        while (tiles_for(hp.out_rows) * hp.split_k < sms / 2 && hp.out_rows > 2) {
++            hp.out_rows /= 2;
++        }
++        if (tiles_for(hp.out_rows) * hp.split_k < sms && hp.bs_k > 32) {
++            hp.bs_k = 32;
++            hp.a_pad = hp.filter_copy || shmem(hp.out_cols, hp.out_rows, 32, 8) <= limit ? 8 : 0;
++        }
++    }
++    // Split-K scratch uses the dense output layout with no descriptor offset.
++    if (hp.split_k > 1 && (!ggml_is_contiguous(dst) || get_misalign_bytes(ctx, dst) != 0)) {
++        hp.split_k = 1;
++    }
++    hp.tiles = (uint32_t)(slices * CEIL_DIV(OH, hp.out_rows) * CEIL_DIV(OW, hp.out_cols));
++    return true;
++#else
++    GGML_UNUSED(ctx); GGML_UNUSED(src0); GGML_UNUSED(src1); GGML_UNUSED(dst); GGML_UNUSED(hp);
++    return false;
++#endif
++}
++
++static vk_pipeline ggml_vk_conv_halo_pipeline(ggml_backend_vk_context * ctx, const vk_conv_halo_params & hp, bool is_3d) {
++    std::lock_guard<std::mutex> guard(ctx->device->compile_mutex);
++    auto & pipelines = is_3d ? ctx->device->pipeline_conv3d_halo_f16_f32 : ctx->device->pipeline_conv2d_halo_f16_f32;
++    vk_pipeline & slot = pipelines[hp.key()];
++    if (!slot) {
++        slot = std::make_shared<vk_pipeline_struct>();
++    }
++    return slot;
++}
++
+ static vk_pipeline ggml_vk_op_get_pipeline(ggml_backend_vk_context * ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * src2, const ggml_tensor * dst, ggml_op op) {
+     switch (op) {
+     case GGML_OP_GET_ROWS:
+@@ -10301,9 +10601,14 @@ static vk_pipeline ggml_vk_op_get_pipeline(ggml_backend_vk_context * ctx, const
+     case GGML_OP_CONV_2D:
+     case GGML_OP_CONV_TRANSPOSE_2D:
+         if (src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
++            vk_conv_halo_params hp;
++            if (ggml_vk_conv_halo_params(ctx, src0, src1, dst, hp)) {
++                return ggml_vk_conv_halo_pipeline(ctx, hp, false);
++            }
+             uint32_t K = dst->ne[2]; // Cout
+             uint32_t NPQ = dst->ne[3] * dst->ne[1] * dst->ne[0]; // N * OH * OW
+-            vk_conv_shapes shape = ggml_vk_conv_select_shape(ctx, K, NPQ);
++            uint32_t split_k;
++            vk_conv_shapes shape = ggml_vk_conv_select_shape(ctx, src0, dst, split_k);
+ 
+             bool transpose = dst->op == GGML_OP_CONV_TRANSPOSE_2D;
+             uint32_t KW = (uint32_t)src0->ne[0];
+@@ -10325,7 +10630,7 @@ static vk_pipeline ggml_vk_op_get_pipeline(ggml_backend_vk_context * ctx, const
+                                       (CRS % BS_CRS == 0) &&
+                                       (NPQ % BS_NPQ == 0)) ? 1u : 0u;
+ 
+-            vk_conv2d_pipeline_state conv2d_pipeline_state(s0, s1, p0, p1, d0, d1, KW, KH, aligned);
++            vk_conv2d_pipeline_state conv2d_pipeline_state(s0, s1, p0, p1, d0, d1, KW, KH, aligned, split_k);
+ 
+             std::map<vk_conv2d_pipeline_state, vk_pipeline> *pipelines = nullptr;
+             if (op == GGML_OP_CONV_2D) {
+@@ -10374,12 +10679,16 @@ static vk_pipeline ggml_vk_op_get_pipeline(ggml_backend_vk_context * ctx, const
+         return nullptr;
+     case GGML_OP_CONV_3D:
+         if (src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
++            vk_conv_halo_params hp;
++            if (ggml_vk_conv_halo_params(ctx, src0, src1, dst, hp)) {
++                return ggml_vk_conv_halo_pipeline(ctx, hp, true);
++            }
+             const uint32_t OC = (uint32_t)ggml_get_op_params_i32(dst, 11);
+             const uint32_t IC = (uint32_t)ggml_get_op_params_i32(dst, 9);
+             const uint32_t N  = (uint32_t)ggml_get_op_params_i32(dst, 10);
+             const uint32_t NPQ = N * dst->ne[2] * dst->ne[1] * dst->ne[0];
+             uint32_t split_k;
+-            const vk_conv_shapes shape = ggml_vk_conv3d_select_shape(ctx, src0, dst, split_k);
++            const vk_conv_shapes shape = ggml_vk_conv_select_shape(ctx, src0, dst, split_k);
+ 
+             const uint32_t KW = (uint32_t)src0->ne[0];
+             const uint32_t KH = (uint32_t)src0->ne[1];
+@@ -10676,11 +10985,17 @@ static void ggml_vk_op_f32(ggml_backend_vk_context * ctx, vk_context& subctx, co
+     case GGML_OP_CONV_2D:
+     case GGML_OP_CONV_TRANSPOSE_2D:
+         if constexpr (std::is_same_v<PC, vk_op_conv2d_push_constants>) {
+-            const uint32_t NPQ = pc.N * pc.OH * pc.OW;
+-            const vk_conv_shapes shape = ggml_vk_conv_select_shape(ctx, pc.Cout, NPQ);
+-            const uint32_t NPQ_blocks = CEIL_DIV(NPQ, vk_conv_block_sizes[shape].NPQ);
+-
+-            elements = { pc.Cout, NPQ_blocks, 1 };
++            vk_conv_halo_params hp;
++            if (ggml_vk_conv_halo_params(ctx, src0, src1, dst, hp)) {
++                elements = { CEIL_DIV(pc.Cout, hp.bs_k) * hp.bs_k * hp.split_k, hp.tiles, 1 };
++            } else {
++                const uint32_t NPQ = pc.N * pc.OH * pc.OW;
++                const vk_conv_shapes shape = ggml_vk_conv_select_shape(ctx, src0, dst, split_k);
++                const auto & block = vk_conv_block_sizes[shape];
++                const uint32_t NPQ_blocks = CEIL_DIV(NPQ, block.NPQ);
++                const uint32_t channel_groups = split_k > 1 ? CEIL_DIV(pc.Cout, block.K) * block.K * split_k : pc.Cout;
++                elements = { channel_groups, NPQ_blocks, 1 };
++            }
+             if (elements[1] > 512) {
+                 elements[2] = CEIL_DIV(elements[1], 512);
+                 elements[1] = 512;
+@@ -10691,13 +11006,18 @@ static void ggml_vk_op_f32(ggml_backend_vk_context * ctx, vk_context& subctx, co
+         break;
+     case GGML_OP_CONV_3D:
+         if constexpr (std::is_same_v<PC, vk_op_conv3d_push_constants>) {
+-            const uint32_t NPQ = pc.N * pc.OD * pc.OH * pc.OW;
+-            const vk_conv_shapes shape = ggml_vk_conv3d_select_shape(ctx, src0, dst, split_k);
+-            const auto & block = vk_conv_block_sizes[shape];
+-            const uint32_t NPQ_blocks = CEIL_DIV(NPQ, block.NPQ);
+-            const uint32_t channel_groups = split_k > 1 ? CEIL_DIV(pc.OC, block.K) * block.K * split_k : pc.OC;
++            vk_conv_halo_params hp;
++            if (ggml_vk_conv_halo_params(ctx, src0, src1, dst, hp)) {
++                elements = { CEIL_DIV(pc.OC, hp.bs_k) * hp.bs_k * hp.split_k, hp.tiles, 1 };
++            } else {
++                const uint32_t NPQ = pc.N * pc.OD * pc.OH * pc.OW;
++                const vk_conv_shapes shape = ggml_vk_conv_select_shape(ctx, src0, dst, split_k);
++                const auto & block = vk_conv_block_sizes[shape];
++                const uint32_t NPQ_blocks = CEIL_DIV(NPQ, block.NPQ);
++                const uint32_t channel_groups = split_k > 1 ? CEIL_DIV(pc.OC, block.K) * block.K * split_k : pc.OC;
+ 
+-            elements = { channel_groups, NPQ_blocks, 1 };
++                elements = { channel_groups, NPQ_blocks, 1 };
++            }
+             if (elements[1] > 512) {
+                 elements[2] = CEIL_DIV(elements[1], 512);
+                 elements[1] = 512;
+@@ -10828,7 +11148,80 @@ static void ggml_vk_op_f32(ggml_backend_vk_context * ctx, vk_context& subctx, co
+         break;
+     }
+ 
+-    if constexpr (std::is_same_v<PC, vk_op_conv3d_push_constants>) {
++    if constexpr (std::is_same_v<PC, vk_op_conv3d_push_constants> || std::is_same_v<PC, vk_op_conv2d_push_constants>) {
++        vk_conv_halo_params hp;
++        if (ggml_vk_conv_halo_params(ctx, src0, src1, dst, hp)) {
++            vk_subbuffer out_buf = dst_buf;
++            if (hp.split_k > 1) {
++                const size_t scratch_size = ggml_nbytes(dst) * hp.split_k;
++                if (ctx->prealloc_size_split_k < scratch_size) {
++                    ctx->prealloc_size_split_k = scratch_size;
++                    ggml_vk_preallocate_buffers(ctx, subctx);
++                }
++                if (ctx->prealloc_split_k_need_sync) {
++                    ggml_vk_sync_buffers(ctx, subctx);
++                }
++                out_buf = { ctx->prealloc_split_k, 0, scratch_size };
++                pc.dst_offset = 0;
++                ggml_pipeline_request_descriptor_sets(ctx, ctx->device->pipeline_matmul_split_k_reduce, 1);
++            }
++            auto reduce = [&]() {
++                if (hp.split_k > 1) {
++                    ggml_vk_sync_buffers(ctx, subctx);
++                    const uint32_t ne = (uint32_t)ggml_nelements(dst);
++                    const std::array<uint32_t, 2> reduce_pc = { ne, hp.split_k };
++                    ggml_vk_dispatch_pipeline(ctx, subctx, ctx->device->pipeline_matmul_split_k_reduce, { out_buf, dst_buf }, reduce_pc, { ne, 1, 1 });
++                    ctx->prealloc_split_k_need_sync = true;
++                }
++            };
++            if (!hp.filter_copy) {
++                ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { src0_buf, src1_buf, out_buf }, pc, elements);
++                reduce();
++                return;
++            }
++            // Transpose [OC][IC][KD][KH][KW] to f16 [IC][KD][KH][KW][OCP].
++            // Round OC up to 8 to align each row to 16 bytes. The transpose leaves the padding unwritten.
++            uint32_t IC, OC;
++            if constexpr (std::is_same_v<PC, vk_op_conv3d_push_constants>) {
++                IC = pc.IC;
++                OC = pc.OC;
++            } else {
++                IC = pc.Cin;
++                OC = pc.Cout;
++            }
++            const uint32_t rows = IC * hp.KW * hp.KH * hp.KD;
++            const uint32_t ocp = ROUNDUP_POW2(OC, 8);
++            const uint64_t size = (uint64_t)rows * ocp * sizeof(ggml_fp16_t);
++            if (ctx->prealloc_size_x < size) {
++                ctx->prealloc_size_x = size;
++                ggml_vk_preallocate_buffers(ctx, subctx);
++            }
++            vk_pipeline cpy = src0->type == GGML_TYPE_F32 ? ctx->device->pipeline_cpy_transpose_f32_f16 : ctx->device->pipeline_cpy_transpose_16;
++            ggml_pipeline_request_descriptor_sets(ctx, cpy, 1);
++            if (ctx->prealloc_x_need_sync) {
++                ggml_vk_sync_buffers(ctx, subctx);
++            }
++            vk_op_unary_push_constants cp{};
++            cp.ne = OC * rows;
++            cp.ne00 = OC; cp.ne01 = rows; cp.ne02 = 1; cp.ne03 = 1;
++            cp.nb00 = rows; cp.nb01 = 1;
++            cp.ne10 = OC; cp.ne11 = rows; cp.ne12 = 1; cp.ne13 = 1;
++            cp.nb10 = 1; cp.nb11 = ocp;
++            cp.misalign_offsets = pc.knl_offset << 16;
++            init_pushconst_fastdiv(cp);
++            // The transpose loops over tiles beyond the grid limit.
++            const auto & max_groups = ctx->device->properties.limits.maxComputeWorkGroupCount;
++            const std::array<uint32_t, 3> cpy_elements = { std::min(CEIL_DIV(OC, 32u), max_groups[0]),
++                                                           std::min(CEIL_DIV(rows, 32u), max_groups[1]), 1 };
++            vk_subbuffer knl = { ctx->prealloc_x, 0, size };
++            ggml_vk_dispatch_pipeline(ctx, subctx, cpy, { src0_buf, knl }, cp, cpy_elements);
++            ggml_vk_sync_buffers(ctx, subctx);
++            pc.knl_offset = 0;
++            ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { knl, src1_buf, out_buf }, pc, elements);
++            ctx->prealloc_x_need_sync = true;
++            reduce();
++            return;
++        }
+         if (split_k > 1) {
+             const uint32_t ne = (uint32_t)ggml_nelements(dst);
+             const size_t scratch_size = ggml_nbytes(dst) * split_k;
+diff --git a/ggml/src/ggml-vulkan/vulkan-shaders/conv2d_mm.comp b/ggml/src/ggml-vulkan/vulkan-shaders/conv2d_mm.comp
+index 5ed15a258..ca2135bcf 100644
+--- a/ggml/src/ggml-vulkan/vulkan-shaders/conv2d_mm.comp
++++ b/ggml/src/ggml-vulkan/vulkan-shaders/conv2d_mm.comp
+@@ -34,42 +34,7 @@ layout(binding = 2) writeonly buffer D {
+     D_TYPE dst_data[];
+ };  // dst - result:    [OW, OH, Cout, N]
+ 
+-layout(push_constant) uniform parameter {
+-    // I/O channels, batch size
+-    uint32_t Cout;
+-    uint32_t Cin;
+-    uint32_t N;
+-
+-    // Tensor spatial sizes: input, output
+-    uint32_t W;
+-    uint32_t H;
+-    uint32_t OW;
+-    uint32_t OH;
+-
+-    // Strides in elements
+-    uint32_t nb01;
+-    uint32_t nb02;
+-    uint32_t nb03;
+-
+-    uint32_t nb11;
+-    uint32_t nb12;
+-    uint32_t nb13;
+-
+-    uint32_t nb1;
+-    uint32_t nb2;
+-    uint32_t nb3;
+-
+-    // fastdiv helper values
+-    uint32_t OWmp;   uint32_t OWL;
+-    uint32_t OWOHmp; uint32_t OWOHL;
+-
+-    // element offsets for misaligned buffer bindings
+-    uint32_t knl_offset;
+-    uint32_t src_offset;
+-    uint32_t dst_offset;
+-}
+-
+-p;
++#include "conv2d_push_constants.glsl"
+ 
+ layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
+ // Blocktile sizes
+@@ -124,6 +89,9 @@ const bool stride_in_bounds = (s0 == 1) && (s1 == 1);
+ const bool stride_in_bounds = true;
+ #endif
+ 
++// Number of workgroups the CRS loop is split across (1 = no split).
++layout(constant_id = 19) const uint split_k        = 1;
++
+ uint32_t       tid     = gl_LocalInvocationID.x;
+ const uint32_t WG_SIZE = gl_WorkGroupSize.x;
+ 
+@@ -131,8 +99,8 @@ uint splitWork(uint work_size, uint block_size) {
+     return (block_size + work_size - 1) / block_size;
+ }
+ 
+-uint32_t K   = p.Cout;
+-uint32_t CRS = p.Cin * KH * KW;
++uint32_t K   = p.OC;
++uint32_t CRS = p.IC * KH * KW;
+ uint32_t NPQ = p.N * p.OH * p.OW;
+ 
+ uint32_t n_elems_out = K * NPQ;
+@@ -185,8 +153,12 @@ R,S=KH,KW
+ P,Q=OH,OW
+ */
+ 
+-uint32_t B_idx_K   = gl_WorkGroupID.x;
+-uint32_t B_idx_NPQ = gl_WorkGroupID.y + gl_WorkGroupID.z * 512;
++// Each split covers a contiguous part of CRS and writes a separate partial output.
++// Keep the split constant across neighboring channel tiles so they can reuse input loads.
++uint32_t B_idx_K     = split_k > 1 ? gl_WorkGroupID.x % splitWork(K, BS_K) : gl_WorkGroupID.x;
++uint32_t B_idx_split = split_k > 1 ? gl_WorkGroupID.x / splitWork(K, BS_K) : 0;
++uint32_t B_idx_NPQ   = gl_WorkGroupID.y + gl_WorkGroupID.z * 512;
++uint32_t split_offset = B_idx_split * K * NPQ;
+ 
+ uint32_t T_y = tid / NT_NPQ;
+ uint32_t T_x = tid % NT_NPQ;
+@@ -202,16 +174,18 @@ const uint32_t BrpWg = WG_SIZE / BS_NPQ;
+ #ifdef COOPMAT2
+ #define ACC_TYPE float16_t
+ 
+-ACC_TYPE perElemOpStore(const in uint32_t r, const in uint32_t c, const in ACC_TYPE elem)
++// Pass the tile position explicitly to avoid slow private-variable loads in the callback.
++ACC_TYPE perElemOpStore(const in uint32_t r, const in uint32_t c, const in ACC_TYPE elem,
++                        const in uint32_t K_base, const in uint32_t NPQ_base, const in uint32_t split_base)
+ {
+-    uint32_t K_idx   = B_idx_K * BS_K + r;
+-    uint32_t NPQ_idx = B_idx_NPQ * BS_NPQ + c;
++    uint32_t K_idx   = K_base + r;
++    uint32_t NPQ_idx = NPQ_base + c;
+     uint32_t N_idx   = fastdiv(NPQ_idx, p.OWOHmp, p.OWOHL); // divide by p.OH * p.OW;
+     uint32_t OH_idx  = fastdiv(NPQ_idx - N_idx * p.OH * p.OW, p.OWmp, p.OWL); // divide by p.OW;
+     uint32_t OW_idx  = NPQ_idx - N_idx * p.OH * p.OW - OH_idx * p.OW;
+     uint32_t dst_idx = OW_idx + OH_idx * p.nb1 + K_idx * p.nb2 + N_idx * p.nb3;
+-    if (aligned != 0 || (K_idx < K && NPQ_idx < NPQ)) {
+-        dst_data[dst_idx + p.dst_offset] = D_TYPE(elem);
++    if (aligned != 0 || (K_idx < p.OC && NPQ_idx < p.N * p.OH * p.OW)) {
++        dst_data[dst_idx + p.dst_offset + split_base] = D_TYPE(elem);
+     }
+     return elem;
+ }
+@@ -241,7 +215,11 @@ void main() {
+     }
+ #endif
+     /* Advance block in CRS dim */
+-    [[dont_unroll]] for (uint32_t B_idx_CRS = 0; B_idx_CRS < NB_CRS; B_idx_CRS++) {
++    const uint32_t crs_count = NB_CRS / split_k;
++    const uint32_t crs_extra = NB_CRS % split_k;
++    const uint32_t crs_begin = B_idx_split * crs_count + min(B_idx_split, crs_extra);
++    const uint32_t crs_end   = crs_begin + crs_count + uint32_t(B_idx_split < crs_extra);
++    [[dont_unroll]] for (uint32_t B_idx_CRS = crs_begin; B_idx_CRS < crs_end; B_idx_CRS++) {
+         uint32_t CRS_idx_a;
+         uint32_t Cin_idx_a;
+         uint32_t KH_idx_a;
+@@ -344,7 +322,7 @@ void main() {
+             uint32_t src_idx = W_idx + H_idx * p.nb11 + Cin_idx_b * p.nb12 + N_idx * p.nb13;
+             // skip clamp when address can't go OOB
+             if (aligned == 0 || !hw_in_bounds || !stride_in_bounds) {
+-                src_idx = min(max(src_idx, 0), p.Cin * p.N * p.W * p.H - 1);
++                src_idx = min(max(src_idx, 0), p.IC * p.N * p.IW * p.IH - 1);
+             }
+             float val = src_data[src_idx + p.src_offset];
+             bool oob = false;
+@@ -352,7 +330,7 @@ void main() {
+                 oob = true;
+             }
+             // also catches lower-bound underflow (idx wraps to 0x80000000+)
+-            if (!hw_in_bounds && (H_idx >= p.H || W_idx >= p.W)) {
++            if (!hw_in_bounds && (H_idx >= p.IH || W_idx >= p.IW)) {
+                 oob = true;
+             }
+ #ifdef TRANSPOSE
+@@ -449,13 +427,13 @@ void main() {
+             uint32_t OW_idx  = NPQ_idx - N_idx * p.OH * p.OW - OH_idx * p.OW;
+             uint32_t dst_idx = OW_idx + OH_idx * p.nb1 + K_idx * p.nb2 + N_idx * p.nb3;
+             if (aligned != 0 || (K_idx < K && NPQ_idx < NPQ)) {
+-                dst_data[dst_idx + p.dst_offset] = D_TYPE(Csh[k_local * Csh_stride + npq_thread]);
++                dst_data[dst_idx + p.dst_offset + split_offset] = D_TYPE(Csh[k_local * Csh_stride + npq_thread]);
+             }
+         }
+     }
+ #ifdef COOPMAT2
+     else {
+-        coopMatPerElementNV(matC, matC, perElemOpStore);
++        coopMatPerElementNV(matC, matC, perElemOpStore, B_idx_K * BS_K, B_idx_NPQ * BS_NPQ, split_offset);
+     }
+ #endif
+ #else
+@@ -469,7 +447,7 @@ void main() {
+                 uint32_t OW_idx  = NPQ_idx - N_idx * p.OH * p.OW - OH_idx * p.OW;
+                 uint32_t dst_idx = OW_idx + OH_idx * p.nb1 + K_idx * p.nb2 + N_idx * p.nb3;
+                 if (aligned != 0 || (K_idx < K && NPQ_idx < NPQ)) {
+-                    dst_data[dst_idx + p.dst_offset] = regC[T_ly][T_lx];
++                    dst_data[dst_idx + p.dst_offset + split_offset] = regC[T_ly][T_lx];
+                 }
+             }
+         }
+diff --git a/ggml/src/ggml-vulkan/vulkan-shaders/conv2d_push_constants.glsl b/ggml/src/ggml-vulkan/vulkan-shaders/conv2d_push_constants.glsl
+new file mode 100644
+index 000000000..d3c636c0a
+--- /dev/null
++++ b/ggml/src/ggml-vulkan/vulkan-shaders/conv2d_push_constants.glsl
+@@ -0,0 +1,43 @@
++#if !defined(GGML_CONV2D_PUSH_CONSTANTS)
++#define GGML_CONV2D_PUSH_CONSTANTS
++
++// Push constants of conv2d_mm.comp and conv_halo.comp for CONV_2D and
++// CONV_TRANSPOSE_2D, matching vk_op_conv2d_push_constants. Filter
++// [KW, KH, IC, OC] ([KW, KH, OC, IC] for CONV_TRANSPOSE_2D), input
++// [IW, IH, IC, N], output [OW, OH, OC, N].
++layout(push_constant) uniform parameter {
++    // I/O channels, batch size
++    uint OC;
++    uint IC;
++    uint N;
++
++    // Tensor spatial sizes: input, output
++    uint IW;
++    uint IH;
++    uint OW;
++    uint OH;
++
++    // Strides in elements
++    uint nb01;
++    uint nb02;
++    uint nb03;
++
++    uint nb11;
++    uint nb12;
++    uint nb13;
++
++    uint nb1;
++    uint nb2;
++    uint nb3;
++
++    // fastdiv helper values
++    uint OWmp;   uint OWL;
++    uint OWOHmp; uint OWOHL;
++
++    // element offsets for misaligned buffer bindings
++    uint knl_offset;
++    uint src_offset;
++    uint dst_offset;
++} p;
++
++#endif
+diff --git a/ggml/src/ggml-vulkan/vulkan-shaders/conv3d_mm.comp b/ggml/src/ggml-vulkan/vulkan-shaders/conv3d_mm.comp
+index 42ab48fce..5821f8e2f 100644
+--- a/ggml/src/ggml-vulkan/vulkan-shaders/conv3d_mm.comp
++++ b/ggml/src/ggml-vulkan/vulkan-shaders/conv3d_mm.comp
+@@ -30,45 +30,7 @@ layout(binding = 2) writeonly buffer D {
+     D_TYPE dst_data[];
+ };  // dst - result:    [OW, OH, OD, OC*N]
+ 
+-layout(push_constant) uniform parameter {
+-    // I/O channels, batch size
+-    uint32_t OC;
+-    uint32_t IC;
+-    uint32_t N;
+-
+-    // Tensor spatial sizes: input, output
+-    uint32_t IW;
+-    uint32_t IH;
+-    uint32_t ID;
+-    uint32_t OW;
+-    uint32_t OH;
+-    uint32_t OD;
+-
+-    // Strides in elements
+-    uint32_t nb01;
+-    uint32_t nb02;
+-    uint32_t nb03;
+-
+-    uint32_t nb11;
+-    uint32_t nb12;
+-    uint32_t nb13;
+-
+-    uint32_t nb1;
+-    uint32_t nb2;
+-    uint32_t nb3;
+-
+-    // fastdiv helper values
+-    uint32_t OWmp;   uint32_t OWL;
+-    uint32_t OWOHmp; uint32_t OWOHL;
+-    uint32_t OWOHODmp; uint32_t OWOHODL;
+-
+-    // element offsets for misaligned buffer bindings
+-    uint32_t knl_offset;
+-    uint32_t src_offset;
+-    uint32_t dst_offset;
+-}
+-
+-p;
++#include "conv3d_push_constants.glsl"
+ 
+ layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
+ // Blocktile sizes
+@@ -213,18 +175,20 @@ void split_npq(uint32_t npq_idx, out uint32_t n, out uint32_t od, out uint32_t o
+ #ifdef COOPMAT2
+ #define ACC_TYPE float16_t
+ 
+-ACC_TYPE perElemOpStore(const in uint32_t r, const in uint32_t c, const in ACC_TYPE elem)
++// Pass the tile position explicitly to avoid slow private-variable loads in the callback.
++ACC_TYPE perElemOpStore(const in uint32_t r, const in uint32_t c, const in ACC_TYPE elem,
++                        const in uint32_t K_base, const in uint32_t NPQ_base, const in uint32_t split_base)
+ {
+-    uint32_t K_idx   = B_idx_K * BS_K + r;
+-    uint32_t NPQ_idx = B_idx_NPQ * BS_NPQ + c;
++    uint32_t K_idx   = K_base + r;
++    uint32_t NPQ_idx = NPQ_base + c;
+     uint32_t N_idx;
+     uint32_t OD_idx;
+     uint32_t OH_idx;
+     uint32_t OW_idx;
+     split_npq(NPQ_idx, N_idx, OD_idx, OH_idx, OW_idx);
+     uint32_t dst_idx = OW_idx + OH_idx * p.nb1 + OD_idx * p.nb2 + (N_idx * p.OC + K_idx) * p.nb3;
+-    if (aligned != 0 || (K_idx < K && NPQ_idx < NPQ)) {
+-        dst_data[dst_idx + p.dst_offset + split_offset] = D_TYPE(elem);
++    if (aligned != 0 || (K_idx < p.OC && NPQ_idx < p.N * p.OD * p.OH * p.OW)) {
++        dst_data[dst_idx + p.dst_offset + split_base] = D_TYPE(elem);
+     }
+     return elem;
+ }
+@@ -413,7 +377,7 @@ void main() {
+     }
+ #ifdef COOPMAT2
+     else {
+-        coopMatPerElementNV(matC, matC, perElemOpStore);
++        coopMatPerElementNV(matC, matC, perElemOpStore, B_idx_K * BS_K, B_idx_NPQ * BS_NPQ, split_offset);
+     }
+ #endif
+ #else
+diff --git a/ggml/src/ggml-vulkan/vulkan-shaders/conv3d_push_constants.glsl b/ggml/src/ggml-vulkan/vulkan-shaders/conv3d_push_constants.glsl
+new file mode 100644
+index 000000000..62ea2b569
+--- /dev/null
++++ b/ggml/src/ggml-vulkan/vulkan-shaders/conv3d_push_constants.glsl
+@@ -0,0 +1,45 @@
++#if !defined(GGML_CONV3D_PUSH_CONSTANTS)
++#define GGML_CONV3D_PUSH_CONSTANTS
++
++// Push constants of conv3d_mm.comp and conv_halo.comp for CONV_3D, matching
++// vk_op_conv3d_push_constants. Filter [KW, KH, KD, IC * OC], input
++// [IW, IH, ID, IC * N], output [OW, OH, OD, OC * N].
++layout(push_constant) uniform parameter {
++    // I/O channels, batch size
++    uint OC;
++    uint IC;
++    uint N;
++
++    // Tensor spatial sizes: input, output
++    uint IW;
++    uint IH;
++    uint ID;
++    uint OW;
++    uint OH;
++    uint OD;
++
++    // Strides in elements
++    uint nb01;
++    uint nb02;
++    uint nb03;
++
++    uint nb11;
++    uint nb12;
++    uint nb13;
++
++    uint nb1;
++    uint nb2;
++    uint nb3;
++
++    // fastdiv helper values
++    uint OWmp;     uint OWL;
++    uint OWOHmp;   uint OWOHL;
++    uint OWOHODmp; uint OWOHODL;
++
++    // element offsets for misaligned buffer bindings
++    uint knl_offset;
++    uint src_offset;
++    uint dst_offset;
++} p;
++
++#endif
+diff --git a/ggml/src/ggml-vulkan/vulkan-shaders/conv_halo.comp b/ggml/src/ggml-vulkan/vulkan-shaders/conv_halo.comp
+new file mode 100644
+index 000000000..671facf2f
+--- /dev/null
++++ b/ggml/src/ggml-vulkan/vulkan-shaders/conv_halo.comp
+@@ -0,0 +1,380 @@
++#version 450
++#extension GL_EXT_control_flow_attributes : enable
++#extension GL_KHR_cooperative_matrix : require
++#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
++#extension GL_KHR_memory_scope_semantics : enable
++#extension GL_KHR_shader_subgroup_basic : enable
++
++// One workgroup computes BS_K output channels for an OUT_ROWS x OUT_COLS tile at output depth od.
++// One pass covers BS_C input channels starting at c0 and one filter depth slice kd (zero in 2D).
++// The pass sums one matrix product per spatial tap t = (kh, kw):
++//
++//   acc [BS_K x NT] += A [BS_K x (TAPS * BS_C)] * B [(TAPS * BS_C) x NT]
++//
++//   A = [ A(0,0) | A(0,1) | ... | A(KH-1,KW-1) ]   Each tap is BS_K x BS_C.
++//   B = [ B(0,0)       ]                            Each tap is BS_C x NT.
++//       [ B(0,1)       ]
++//       [ ...          ]
++//       [ B(KH-1,KW-1) ]
++//
++//   NT = OUT_ROWS * OUT_COLS, j = r * OUT_COLS + x for output tile pixel (r, x)
++//   A(kh,kw)[k][c] = filter[k0 + k][c0 + c][kd][kh][kw]
++//   B(kh,kw)[c][j] = input[c0 + c][od + kd - PAD_D][oh0 + r + kh - PAD_H][ow0 + x + kw - PAD_W]
++//
++// Shared memory holds the filter slices and one input box for the pass.
++//
++//   smem: [ A(0,0) | A(0,1) | ... | A(KH-1,KW-1) | box pixel 0 | box pixel 1 | ... ]
++//           ^ 0      ^ A_TAP                       ^ HS_BASE
++//
++// Each filter slice starts at t * A_TAP. The layout within a slice depends on FILTER_COPY.
++//   Filter copy:     [BS_C][BS_K + A_PAD] halves, column-major A, stride AT4.
++//   Original filter: [BS_K][BS_C + A_PAD] halves, row-major A, stride AS4.
++// The input box is [HALO_H][HALO_W][BS_C + 8] halves, with channels contiguous in each pixel.
++// Pixel (y, x) starts at smem[HS_BASE + (y * HALO_W + x) * CS4]. All strides and offsets above use f16vec4.
++//
++// Example with 64 output channels, 16 input channels, a 2 x 16 output tile, a 3 x 3 filter and FN = 8.
++// The logical A is 64 x 144, B is 144 x 32, and acc is 64 x 32. The shared input box is 4 x 18 pixels.
++//
++//   Box x     0..7      8..15     16..17
++//   y = 0     oooooooo  oooooooo  ++
++//   y = 1     oooooooo  oooooooo  ++
++//   y = 2     ++++++++  ++++++++  ++
++//   y = 3     ++++++++  ++++++++  ++
++//
++//   o = input under the output tile, + = halo input
++//   Acc column    0..7       8..15      16..23     24..31
++//   Output pixel  row 0 x0   row 0 x8   row 1 x0   row 1 x8   (8 pixels each)
++//
++// Each subgroup MMA multiplies a 16 x 16 filter fragment by 16 x FN input values for FN neighboring output pixels.
++// For each tap, shift the B load by kh * HALO_W + kw pixels within the same box.
++// For the fragment starting at output (row 0, x8), the reads are:
++//
++//   Tap       Box row   Box x    Linear box pixels
++//   (0, 0)    0         8..15    8..15
++//   (0, 2)    0         10..17   10..17
++//   (1, 0)    1         8..15    26..33
++//   (2, 2)    2         10..17   46..53
++//
++// Every accumulator column belongs to the output tile. The shifted loads reuse the box across taps.
++// After the last pass, the accumulator reuses smem from offset 0 as [BS_K][NT + 8] halves with row stride OS4.
++
++layout(binding = 0) readonly buffer A4 { uvec4 knl4[]; };    // Filter copy, 8 output channels per packet
++layout(binding = 0) readonly buffer A2 { uvec2 knl2[]; };    // Original filter, 4 halves per packet
++layout(binding = 1) readonly buffer B { float src_data[]; };
++layout(binding = 2) writeonly buffer D { float dst_data[]; };
++
++#ifdef CONV3D
++#include "conv3d_push_constants.glsl"
++uint in_depth()  { return p.ID; }
++uint out_depth() { return p.OD; }
++uint src_index(const uint n, const uint c, const uint d, const uint h, const uint w) {
++    return p.src_offset + (n * p.IC + c) * p.nb13 + d * p.nb12 + h * p.nb11 + w;
++}
++uint src_cstride() { return p.nb13; }
++uint src_dstride() { return p.nb12; }
++uint dst_index(const uint n, const uint k, const uint d, const uint h, const uint w) {
++    return p.dst_offset + (n * p.OC + k) * p.nb3 + d * p.nb2 + h * p.nb1 + w;
++}
++#else
++#include "conv2d_push_constants.glsl"
++uint in_depth()  { return 1; }
++uint out_depth() { return 1; }
++uint src_index(const uint n, const uint c, const uint d, const uint h, const uint w) {
++    return p.src_offset + n * p.nb13 + c * p.nb12 + h * p.nb11 + w;
++}
++uint src_cstride() { return p.nb12; }
++uint src_dstride() { return 0; }
++uint dst_index(const uint n, const uint k, const uint d, const uint h, const uint w) {
++    return p.dst_offset + n * p.nb3 + k * p.nb2 + h * p.nb1 + w;
++}
++#endif
++
++layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
++layout(constant_id = 1) const uint BS_K     = 64;  // output channels per workgroup
++layout(constant_id = 2) const uint BS_C     = 16;  // input channels per pass
++layout(constant_id = 3) const uint OUT_ROWS = 8;
++layout(constant_id = 4) const uint OUT_COLS = 14;
++layout(constant_id = 5) const uint KW       = 3;
++layout(constant_id = 6) const uint KH       = 3;
++layout(constant_id = 7) const uint A_PAD    = 8;   // filter padding in halves
++layout(constant_id = 8) const uint PAD_W    = 0;
++layout(constant_id = 9) const uint PAD_H    = 0;
++layout(constant_id = 10) const uint FILTER_COPY = 1;
++layout(constant_id = 11) const uint KD      = 1;
++layout(constant_id = 12) const uint PAD_D   = 0;
++layout(constant_id = 13) const uint WM      = 32;  // output channels per subgroup, a multiple of 16
++layout(constant_id = 14) const uint WN      = 32;  // accumulator columns per subgroup, a multiple of FN
++
++const uint TAPS     = KW * KH;
++#ifdef FRAG_N8
++const uint FN       = 8;                          // accumulator fragment width in pixels
++#else
++const uint FN       = 16;
++#endif
++const uint CB       = OUT_COLS / FN;              // fragments per tile row
++const uint HALO_W   = OUT_COLS + KW - 1;
++const uint HALO_H   = OUT_ROWS + KH - 1;
++const uint NT       = OUT_ROWS * OUT_COLS;        // accumulator columns
++const uint HALO_POS = HALO_H * HALO_W;
++// Shared strides are in f16vec4. Padding distributes matrix loads across banks.
++// coopMatLoad strides and start offsets must be 16-byte aligned.
++const uint CS4      = (BS_C + 8) / 4;             // box pixel stride
++const uint AT4      = (BS_K + A_PAD) / 4;         // filter column stride (copy)
++const uint AS4      = (BS_C + A_PAD) / 4;         // filter row stride (in place)
++const uint CG       = BS_C / 8;                   // 8-channel groups per box pixel
++const uint KG       = BS_K / 8;                   // 8-channel groups per filter column
++
++// Each tap's filter slice is column-major from the copy and row-major from the original filter.
++const uint A_TAP    = FILTER_COPY != 0 ? BS_C * AT4 : BS_K * AS4;
++const uint HS_BASE  = TAPS * A_TAP;
++const uint PASS_LEN = HS_BASE + HALO_POS * CS4;
++const uint OS4      = (NT + 8) / 4;               // output staging row stride, padded against bank conflicts
++const uint SMEM_LEN = PASS_LEN > BS_K * OS4 ? PASS_LEN : BS_K * OS4;
++shared f16vec4 smem[SMEM_LEN];
++
++// Threads take box pixels in width order and copied filter packets in output-channel order to coalesce loads.
++uint tid = gl_LocalInvocationID.x;
++const uint WG = gl_WorkGroupSize.x;
++const uint HALO_ITEMS = HALO_POS * CG;
++const uint HALO_IT    = (HALO_ITEMS + WG - 1) / WG;
++const uint A_ITEMS    = TAPS * BS_C * KG;
++const uint A_IT       = (A_ITEMS + WG - 1) / WG;
++const uint CG4        = BS_C / 4;
++const uint AR_ITEMS   = BS_K * CG4;
++const uint AR_IT      = (AR_ITEMS + WG - 1) / WG;
++
++float hv[HALO_IT][8];
++uvec4 aq[A_IT];
++uvec2 ar[AR_IT][TAPS];
++
++// Precompute addresses and bounds once. Each pass adds a uniform channel and depth offset.
++uint hbase[HALO_IT];
++bool hin[HALO_IT];
++uint abase[A_IT];
++bool ain[A_IT];
++uint arbase[AR_IT];
++bool arin[AR_IT];
++
++uint n, od, oh0, ow0, k0;
++uint split_off;
++
++void setupItems() {
++    [[unroll]] for (uint it = 0; it < HALO_IT; ++it) {
++        const uint i = it * WG + tid;
++        const uint pos = i % HALO_POS;
++        const uint cg = i / HALO_POS;
++        const uint y = pos / HALO_W;
++        const uint x = pos - y * HALO_W;
++        // Unsigned wraparound lets one bounds check handle both sides of the padding.
++        const uint h = oh0 + y - PAD_H, w = ow0 + x - PAD_W;
++        hin[it] = i < HALO_ITEMS && h < p.IH && w < p.IW;
++        hbase[it] = src_index(n, cg * 8, od - PAD_D, h, w);
++    }
++    // A partial packet reads row padding. Its extra channels are discarded on store.
++    const uint ocp = (p.OC + 7) & ~7u;
++    [[unroll]] for (uint it = 0; it < A_IT; ++it) {
++        const uint i = it * WG + tid;
++        const uint g = i % KG;
++        const uint c = (i / KG) % BS_C;
++        const uint t = i / (KG * BS_C);
++        ain[it] = i < A_ITEMS && k0 + g * 8 < p.OC;
++        abase[it] = ((c * KD * TAPS + t) * ocp + k0 + g * 8) / 8;
++    }
++#ifndef CONV3D
++    [[unroll]] for (uint it = 0; it < AR_IT; ++it) {
++        const uint i = it * WG + tid;
++        const uint kl = i / CG4;
++        const uint cg = i - kl * CG4;
++        arin[it] = i < AR_ITEMS && k0 + kl < p.OC;
++        arbase[it] = (p.knl_offset + (k0 + kl) * p.nb03 + cg * 4 * p.nb02) / 4;
++    }
++#endif
++}
++
++void loadStage(const uint s) {
++    const uint c0 = (s / KD) * BS_C;
++    const uint kd = s - (s / KD) * KD;
++    const uint d = od + kd - PAD_D;
++    const bool dok = d < in_depth();
++    const uint soff = c0 * src_cstride() + kd * src_dstride();
++    [[unroll]] for (uint it = 0; it < HALO_IT; ++it) {
++        const bool inb = hin[it] && dok;
++        const uint base = hbase[it] + soff;
++        [[unroll]] for (uint c = 0; c < 8; ++c) {
++            hv[it][c] = inb ? src_data[base + c * src_cstride()] : 0.0;
++        }
++    }
++#ifndef CONV3D
++    if (FILTER_COPY == 0) {
++        // Four input channels span TAPS contiguous packets in the original filter.
++        [[unroll]] for (uint it = 0; it < AR_IT; ++it) {
++            const bool kin = arin[it];
++            const uint base2 = arbase[it] + c0 * p.nb02 / 4;
++            [[unroll]] for (uint t = 0; t < TAPS; ++t) {
++                ar[it][t] = kin ? knl2[base2 + t] : uvec2(0);
++            }
++        }
++        return;
++    }
++#endif
++    const uint aoff = (c0 * KD + kd) * TAPS * ((p.OC + 7) & ~7u) / 8;
++    [[unroll]] for (uint it = 0; it < A_IT; ++it) {
++        aq[it] = ain[it] ? knl4[abase[it] + aoff] : uvec4(0);
++    }
++}
++
++void storeStage() {
++    [[unroll]] for (uint it = 0; it < HALO_IT; ++it) {
++        const uint i = it * WG + tid;
++        if (i < HALO_ITEMS) {
++            const uint pos = i % HALO_POS;
++            const uint cg = i / HALO_POS;
++            smem[HS_BASE + pos * CS4 + cg * 2 + 0] = f16vec4(hv[it][0], hv[it][1], hv[it][2], hv[it][3]);
++            smem[HS_BASE + pos * CS4 + cg * 2 + 1] = f16vec4(hv[it][4], hv[it][5], hv[it][6], hv[it][7]);
++        }
++    }
++#ifndef CONV3D
++    if (FILTER_COPY == 0) {
++        // Transpose each packet group from [channel][tap] to [tap][channel].
++        [[unroll]] for (uint it = 0; it < AR_IT; ++it) {
++            const uint i = it * WG + tid;
++            if (i < AR_ITEMS) {
++                const uint kl = i / CG4;
++                const uint cg = i - kl * CG4;
++                [[unroll]] for (uint t = 0; t < TAPS; ++t) {
++                    float16_t h[4];
++                    [[unroll]] for (uint c = 0; c < 4; ++c) {
++                        const uint e = c * TAPS + t;
++                        h[c] = unpackFloat2x16(ar[it][e / 4][(e % 4) / 2])[e % 2];
++                    }
++                    smem[(t * BS_K + kl) * AS4 + cg] = f16vec4(h[0], h[1], h[2], h[3]);
++                }
++            }
++        }
++        return;
++    }
++#endif
++    [[unroll]] for (uint it = 0; it < A_IT; ++it) {
++        const uint i = it * WG + tid;
++        if (i < A_ITEMS) {
++            const uint g = i % KG;
++            const uint c = (i / KG) % BS_C;
++            const uint t = i / (KG * BS_C);
++            const uint o = t * A_TAP + c * AT4 + g * 2;
++            smem[o + 0] = f16vec4(unpackFloat2x16(aq[it].x), unpackFloat2x16(aq[it].y));
++            smem[o + 1] = f16vec4(unpackFloat2x16(aq[it].z), unpackFloat2x16(aq[it].w));
++        }
++    }
++}
++
++// Each subgroup owns a WM x WN tile of 16 x FN fragments. Extra subgroups help with staging.
++const uint FR       = WM / 16;
++const uint FC       = WN / FN;
++const uint WARPS_N  = NT / WN;
++const uint WARPS    = (BS_K / WM) * WARPS_N;
++coopmat<float16_t, gl_ScopeSubgroup, 16, FN, gl_MatrixUseAccumulator> acc[FR * FC];
++uint warp_r, warp_c;
++// Box position of the first pixel of each of this subgroup's fragments.
++uint bpos[FC];
++
++void mmaStage() {
++    if (gl_SubgroupID >= WARPS) {
++        return;
++    }
++    [[unroll]] for (uint t = 0; t < TAPS; ++t) {
++        const uint kh = t / KW;
++        const uint kw = t - kh * KW;
++        coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> a[FR];
++        [[unroll]] for (uint i = 0; i < FR; ++i) {
++            if (FILTER_COPY != 0) {
++                coopMatLoad(a[i], smem, t * A_TAP + (warp_r * WM + i * 16) / 4, AT4, gl_CooperativeMatrixLayoutColumnMajor);
++            } else {
++                coopMatLoad(a[i], smem, t * A_TAP + (warp_r * WM + i * 16) * AS4, AS4, gl_CooperativeMatrixLayoutRowMajor);
++            }
++        }
++        [[unroll]] for (uint j = 0; j < FC; ++j) {
++            coopmat<float16_t, gl_ScopeSubgroup, 16, FN, gl_MatrixUseB> b;
++            coopMatLoad(b, smem, HS_BASE + (bpos[j] + kh * HALO_W + kw) * CS4, CS4,
++                        gl_CooperativeMatrixLayoutColumnMajor);
++            [[unroll]] for (uint i = 0; i < FR; ++i) {
++                acc[j * FR + i] = coopMatMulAdd(a[i], b, acc[j * FR + i]);
++            }
++        }
++    }
++}
++
++void storeOut(const uint r, const uint c, const float16_t e) {
++    const uint row = c / OUT_COLS;
++    const uint col = c - row * OUT_COLS;
++    const uint oh = oh0 + row, ow = ow0 + col, k = k0 + r;
++    if (oh < p.OH && ow < p.OW && k < p.OC) {
++        dst_data[dst_index(n, k, od, oh, ow) + split_off] = float(e);
++    }
++}
++
++void main() {
++    // Advance depth first so workgroups for neighboring output slices can reuse input slices in L2.
++    const uint tiles_w = (p.OW + OUT_COLS - 1) / OUT_COLS;
++    const uint tiles_h = (p.OH + OUT_ROWS - 1) / OUT_ROWS;
++    const uint per_slice = tiles_w * tiles_h;
++    const uint tile = gl_WorkGroupID.y + gl_WorkGroupID.z * 512;
++    od = tile % out_depth();
++    const uint ns = tile / out_depth();
++    n = ns / per_slice;
++    const uint rem = ns - n * per_slice;
++    oh0 = (rem / tiles_w) * OUT_ROWS;
++    ow0 = (rem - (rem / tiles_w) * tiles_w) * OUT_COLS;
++    const uint kblocks = (p.OC + BS_K - 1) / BS_K;
++    const uint split = gl_WorkGroupID.x / kblocks;
++    const uint nsplit = gl_NumWorkGroups.x / kblocks;
++    k0 = (gl_WorkGroupID.x - split * kblocks) * BS_K;
++    split_off = split * p.N * p.OC * out_depth() * p.OH * p.OW;
++    if (n >= p.N) {
++        return;
++    }
++
++    warp_r = gl_SubgroupID / WARPS_N;
++    warp_c = gl_SubgroupID - warp_r * WARPS_N;
++    [[unroll]] for (uint i = 0; i < FR * FC; ++i) {
++        acc[i] = coopmat<float16_t, gl_ScopeSubgroup, 16, FN, gl_MatrixUseAccumulator>(0.0);
++    }
++    [[unroll]] for (uint j = 0; j < FC; ++j) {
++        const uint f = warp_c * FC + j;
++        const uint r = f / CB;
++        bpos[j] = r * HALO_W + (f - r * CB) * FN;
++    }
++    setupItems();
++
++    // Each split covers a contiguous range of passes and writes its own output for the reduce pass.
++    // Load after MMA to limit register pressure and let another workgroup on the SM hide load latency.
++    const uint stages = (p.IC / BS_C) * KD;
++    const uint s_begin = split * stages / nsplit;
++    const uint s_end = (split + 1) * stages / nsplit;
++    loadStage(s_begin);
++    storeStage();
++    barrier();
++    [[dont_unroll]] for (uint s = s_begin; s + 1 < s_end; ++s) {
++        mmaStage();
++        barrier();
++        loadStage(s + 1);
++        storeStage();
++        barrier();
++    }
++    mmaStage();
++    // Reuse shared memory for the accumulator so the final stores can mask edge pixels and channels.
++    barrier();
++    if (gl_SubgroupID < WARPS) {
++        [[unroll]] for (uint j = 0; j < FC; ++j) {
++            [[unroll]] for (uint i = 0; i < FR; ++i) {
++                coopMatStore(acc[j * FR + i], smem, (warp_r * WM + i * 16) * OS4 + (warp_c * WN + j * FN) / 4, OS4,
++                             gl_CooperativeMatrixLayoutRowMajor);
++            }
++        }
++    }
++    barrier();
++    for (uint i = tid; i < BS_K * NT; i += WG) {
++        const uint r = i / NT;
++        const uint c = i - r * NT;
++        storeOut(r, c, smem[r * OS4 + c / 4][c % 4]);
++    }
++}
+diff --git a/ggml/src/ggml-vulkan/vulkan-shaders/copy_transpose.comp b/ggml/src/ggml-vulkan/vulkan-shaders/copy_transpose.comp
+index 220ccc911..47eb5e1c9 100644
+--- a/ggml/src/ggml-vulkan/vulkan-shaders/copy_transpose.comp
++++ b/ggml/src/ggml-vulkan/vulkan-shaders/copy_transpose.comp
+@@ -7,7 +7,8 @@
+ #define TILE_DIM 32
+ layout(local_size_x = 32, local_size_y = 8, local_size_z = 1) in;
+ 
+-shared uint sh[TILE_DIM][TILE_DIM + 1];
++// SH_TYPE is uint to move raw bits, or float for a converting copy.
++shared SH_TYPE sh[TILE_DIM][TILE_DIM + 1];
+ 
+ void iter(uvec3 wg_id) {
+     const uint tile_col = wg_id.x;
+@@ -30,7 +31,7 @@ void iter(uvec3 wg_id) {
+         const uint i01 = tile_row * TILE_DIM + tid_col;
+         if (i00 < p.ne00 && i01 < p.ne01 && i02 < p.ne02 && i03 < p.ne03) {
+             const uint src_idx = i00 * p.nb00 + i01 * p.nb01 + i02 * p.nb02 + i03 * p.nb03;
+-            sh[tid_row + 8 * y][tid_col] = uint(data_a[get_aoffset() + src_idx]);
++            sh[tid_row + 8 * y][tid_col] = SH_TYPE(data_a[get_aoffset() + src_idx]);
+         }
+     }
+ 
+diff --git a/ggml/src/ggml-vulkan/vulkan-shaders/vulkan-shaders-gen.cpp b/ggml/src/ggml-vulkan/vulkan-shaders/vulkan-shaders-gen.cpp
+index fb99f8f48..88a153974 100644
+--- a/ggml/src/ggml-vulkan/vulkan-shaders/vulkan-shaders-gen.cpp
++++ b/ggml/src/ggml-vulkan/vulkan-shaders/vulkan-shaders-gen.cpp
+@@ -902,8 +902,9 @@ void process_shaders() {
+     string_to_spv("cpy_f32_i32", "copy.comp", {{"A_TYPE", "float"}, {"D_TYPE", "int"}});
+     string_to_spv("cpy_i32_f32", "copy.comp", {{"A_TYPE", "int"}, {"D_TYPE", "float"}});
+ 
+-    string_to_spv("cpy_transpose_16", "copy_transpose.comp", {{"A_TYPE", "uint16_t"}, {"D_TYPE", "uint16_t"}});
+-    string_to_spv("cpy_transpose_32", "copy_transpose.comp", {{"A_TYPE", "uint"}, {"D_TYPE", "uint"}});
++    string_to_spv("cpy_transpose_16", "copy_transpose.comp", {{"A_TYPE", "uint16_t"}, {"D_TYPE", "uint16_t"}, {"SH_TYPE", "uint"}});
++    string_to_spv("cpy_transpose_32", "copy_transpose.comp", {{"A_TYPE", "uint"}, {"D_TYPE", "uint"}, {"SH_TYPE", "uint"}});
++    string_to_spv("cpy_transpose_f32_f16", "copy_transpose.comp", {{"A_TYPE", "float"}, {"D_TYPE", "float16_t"}, {"SH_TYPE", "float"}});
+     string_to_spv("cpy_transpose_02_16", "copy_transpose_02.comp", {{"A_TYPE", "uint16_t"}, {"D_TYPE", "uint16_t"}});
+     string_to_spv("cpy_transpose_02_32", "copy_transpose_02.comp", {{"A_TYPE", "uint"}, {"D_TYPE", "uint"}});
+ 
+@@ -1188,6 +1189,12 @@ void process_shaders() {
+             }
+         }
+     }
++#if defined(GGML_VULKAN_COOPMAT_GLSLC_SUPPORT)
++    string_to_spv("conv2d_halo_f16_f32", "conv_halo.comp", {}, true, true, false);
++    string_to_spv("conv3d_halo_f16_f32", "conv_halo.comp", {{"CONV3D", "1"}}, true, true, false);
++    string_to_spv("conv2d_halo_n8_f16_f32", "conv_halo.comp", {{"FRAG_N8", "1"}}, true, true, false);
++    string_to_spv("conv3d_halo_n8_f16_f32", "conv_halo.comp", {{"CONV3D", "1"}, {"FRAG_N8", "1"}}, true, true, false);
++#endif
+ 
+     for (auto unroll : {false, true}) {
+         for (auto a_f16 : {false, true}) {
+diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
+index 2e599d33a..72e19c7c3 100644
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -12230,6 +12230,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+     for (auto kernel_type : {GGML_TYPE_F32, GGML_TYPE_F16}) {
+         test_cases.emplace_back(new test_conv_2d({ 256, 256, 192, 1 }, { 3, 3, 192, 96 }, kernel_type, 1, 1, 1, 1, 1, 1, false)); // bool cwhn = false
+         test_cases.emplace_back(new test_conv_2d({ 256, 256, 192, 1 }, { 3, 3, 192, 96 }, kernel_type, 1, 1, 1, 1, 1, 1, true));  // bool cwhn = true
++        test_cases.emplace_back(new test_conv_2d({ 54, 78, 32, 3 }, { 3, 3, 32, 128 }, kernel_type, 1, 1, 0, 0, 1, 1));
++        test_cases.emplace_back(new test_conv_2d({ 40, 24, 32, 1 }, { 3, 3, 32, 112 }, kernel_type, 1, 1, 1, 1, 1, 1));
+     }
+     test_cases.emplace_back(new test_conv_2d({ 19, 17, 8, 2 }, { 3, 3, 8, 65 }, GGML_TYPE_F16, 1, 1, 1, 1, 1, 1));
+     test_cases.emplace_back(new test_conv_2d({ 19, 17, 16, 3 }, { 3, 3, 16, 33 }, GGML_TYPE_F16, 2, 3, 4, 2, 2, 1));
+@@ -12352,6 +12354,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+         test_cases.emplace_back(new test_conv_3d(3, 16, 3, 7, 9, 33, 1, 1, 1, 1, 1, 1, 0, 0, 0, 1, 1, 1, kernel_type));
+         test_cases.emplace_back(new test_conv_3d(2, 8, 7, 5, 9, 33, 3, 1, 1, 1, 1, 2, 0, 0, 2, 1, 1, 2, kernel_type));
+         test_cases.emplace_back(new test_conv_3d(2, 3, 1, 2, 1, 7, 1, 1, 1, 1, 1, 1, 3, 4, 2, 1, 1, 1, kernel_type));
++        test_cases.emplace_back(new test_conv_3d(1, 32, 6, 78, 54, 128, 3, 3, 3, 1, 1, 1, 0, 0, 0, 1, 1, 1, kernel_type));
++        test_cases.emplace_back(new test_conv_3d(1, 32, 4, 20, 36, 96, 3, 3, 3, 1, 1, 1, 1, 1, 1, 1, 1, 1, kernel_type));
++        test_cases.emplace_back(new test_conv_3d(1, 16, 3, 18, 34, 80, 3, 3, 3, 1, 1, 1, 1, 1, 1, 1, 1, 1, kernel_type));
+         test_cases.emplace_back(new test_conv_3d(2, 8, 5, 7, 9, 17, 3, 3, 3, 1, 1, 1, 1, 1, 1, 1, 1, 1, kernel_type, 1));
+         test_cases.emplace_back(new test_conv_3d(1, 1, 2, 2, 2, 1, 1, 1, 0, 1, 1, 1, 0, 0, 0, 1, 1, 1, kernel_type));
+         test_cases.emplace_back(new test_conv_3d(1, 1, 2, 2, 2, 1, 1, 0, 1, 1, 1, 1, 0, 0, 0, 1, 1, 1, kernel_type));
