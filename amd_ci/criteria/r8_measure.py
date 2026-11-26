@@ -1,0 +1,70 @@
+#!/usr/bin/env python3
+"""Criteria for probes/r8_probe.py: round-8 gfx1151 measurements on the head state (arms pick main or the patched
+tree themselves). Nothing is judged between states: the gates prove each listed item ran on gfx1151 (a gated-off
+conditional step counts as ran when its reason is recorded), and the table carries the numbers plus one verdict line
+per item against its pre-registered kill line. Keep / kill is read from those lines."""
+from __future__ import annotations
+
+import importlib
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+TITLE = "gfx1151 round 8: C15-3 / C6-W2 / C15-2 / C6-W1 (Windows); C15-6 / C18-6A / C9-3 / A1 / M8 / M10 (Linux)"
+MODE = "regression"
+NEEDS = ["gpu", "rocm", "exclusive_gpu", "nvidia", "windows", "multi_gpu"]
+JUDGES = ("r8_judge_win", "r8_judge_kern", "r8_judge_run")
+
+
+def _judges():
+    out, errs = [], {}
+    for name in JUDGES:
+        try:
+            out.append(importlib.import_module(name))
+        except Exception as exc:  # noqa: BLE001
+            errs[name] = repr(exc)[:300]
+    return out, errs
+
+
+def gates(obs: dict) -> list:
+    h = obs.get("head") or {}
+    arch = (h.get("env") or {}).get("arch") or ""
+    items = [x for x in ((h.get("args") or {}).get("items") or "").split(",") if x]
+    out = [("gfx1151", arch.startswith("gfx1151"), arch), ("items listed", bool(items), ",".join(items))]
+    js, errs = _judges()
+    for name, err in errs.items():
+        out.append((f"judge {name} imports", False, err))
+    for j in js:
+        try:
+            out.extend(j.gates(h, items))
+        except Exception as exc:  # noqa: BLE001
+            out.append((f"judge {j.__name__} gates", False, repr(exc)[:300]))
+    for it in items:
+        if h.get(f"{it}_error"):
+            out.append((f"{it} no exception", False, str(h[f"{it}_error"])[-300:]))
+    me = h.get("module_errors") or {}
+    for mod, err in me.items():
+        out.append((f"probe module {mod} imports", not any(mod.endswith(s) for s in _needed_mods(items)), err[-200:]))
+    return out
+
+
+def _needed_mods(items):
+    win = {"wsmoke", "sdma", "sdma_renders", "memset", "knee3", "knee_render", "memprof", "c153"}
+    return ["r8_win"] if set(items) & win else []
+
+
+def head_is_worse(base: dict, head: dict) -> tuple:
+    return False, "measurement only (head state; arms differ by env / tree, numbers in the table)"
+
+
+def table(obs: dict) -> str:
+    h = obs.get("head") or {}
+    L = [f"env {h.get('env')}", f"item seconds {h.get('item_s')}", ""]
+    js, _ = _judges()
+    for j in js:
+        try:
+            L.extend(j.table(h))
+        except Exception as exc:  # noqa: BLE001
+            L.append(f"judge {j.__name__} table error {exc!r}")
+    return "\n".join(f"- {x}" if x and not x.startswith("-") else x for x in L)
