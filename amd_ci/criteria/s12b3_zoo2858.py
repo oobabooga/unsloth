@@ -2,8 +2,8 @@
 """Criteria: unsloth-zoo PR 2858 on gfx1151 (ROCm). A refused hipHostRegister (same range twice) or hipHostUnregister
 (range no longer registered) leaves its error pending; base's next kernel launch raises it, head consumes it.
 
-Defect (base): each of the three GPU tests (`next_kernel`) FAILS, and the failure is the HIP already-registered
-(registration tests) / not-registered (unregistration test) error raised inside `_launch`, i.e. after the refusal
+Defect (base): each of the three judged GPU tests ([zero_bytes] arena + disk, refused_unregistration) FAILS, and the
+failure is the HIP invalid-argument (zero-byte registration) / not-registered (unregistration) error raised inside `_launch`, i.e. after the refusal
 was handled as expected. Fixed (head, merge): all three pass. Only the GPU tests are judged; the 9 CPU tests
 (they reference the new helper) are reported, not judged.
 Gates: torch is a HIP build with a GPU, device arch gfx1151, each state loaded block_swap*.py from its own tree,
@@ -18,17 +18,25 @@ TITLE = "unsloth-zoo PR 2858: refused hipHostRegister / hipHostUnregister error 
 MODE = "differential"
 # The change also has CUDA (cudaGetLastError) and Windows (amdhip64 / cudart64 DLL glob) branches: not reached here.
 NEEDS = ["rocm", "gpu", "nvidia", "windows"]
-GPU_TESTS = ["test_the_next_kernel_after_a_refused_arena_registration_runs",
-             "test_the_next_kernel_after_a_refused_disk_buffer_registration_runs",
-             "test_the_next_kernel_after_a_refused_unregistration_runs"]
-TEST_SHA = "d218630ee73868cb96ed18c8ad1deb3b2629fff5c1f603e1734faa890bd12d45"
-ALREADY = re.compile(r"HostMemoryAlreadyRegistered|already (mapped|registered)", re.I)
+FUNCS = ["test_the_next_kernel_after_a_refused_arena_registration_runs",
+         "test_the_next_kernel_after_a_refused_disk_buffer_registration_runs",
+         "test_the_next_kernel_after_a_refused_unregistration_runs"]
+# Judged: the three refusals HIP really gives. The [already_registered] cases (HIP accepts a second registration)
+# must be SKIPPED in every state.
+GPU_TESTS = [FUNCS[0] + "[zero_bytes]", FUNCS[1] + "[zero_bytes]", FUNCS[2]]
+SKIPPED = [FUNCS[0] + "[already_registered]", FUNCS[1] + "[already_registered]"]
+TEST_SHA = "f0d7574e9d4fd9fb3ddca2b898e87ab9ad82afc250fabe7b26d74e220c241da3"
+INVALID = re.compile(r"invalid argument|hipErrorInvalidValue|invalid value", re.I)
 NOTREG = re.compile(r"HostMemoryNotRegistered|not correspond to a registered|not registered", re.I)
-EXPECT = {GPU_TESTS[0]: ALREADY, GPU_TESTS[1]: ALREADY, GPU_TESTS[2]: NOTREG}
+EXPECT = {GPU_TESTS[0]: INVALID, GPU_TESTS[1]: INVALID, GPU_TESTS[2]: NOTREG}
 
 
 def _case(o, t):
-    return (((o or {}).get("gpu") or {}).get(t) or {}).get("cases", {}).get(t) or {}
+    for r in ((o or {}).get("gpu") or {}).values():
+        c = (r.get("cases") or {}).get(t)
+        if c:
+            return c
+    return {}
 
 
 def _under(path, ck):
@@ -64,6 +72,9 @@ def gates(obs):
             c = _case(o, t)
             out.append((f"{name}: {t} ran (not skipped / collected)", c.get("result") in ("passed", "failed", "error"),
                         str(c.get("result")) + " " + str(c.get("msg", ""))[:200]))
+        for t in SKIPPED:
+            c = _case(o, t)
+            out.append((f"{name}: {t} skipped (HIP)", c.get("result") == "skipped", str(c.get("result")) + " " + str(c.get("msg", ""))[:150]))
     return out
 
 
@@ -105,7 +116,7 @@ def table(obs):
         vers.append(f"{name}: torch {env.get('torch')} hip {env.get('hip')} triton {env.get('triton')} "
                     f"device {env.get('device')} arch {env.get('arch')} commit {str(o.get('commit'))[:10]} "
                     f"block_swap {((o.get('imported') or {}).get('block_swap'))}")
-        for t in GPU_TESTS:
+        for t in GPU_TESTS + SKIPPED:
             c = _case(o, t)
             rows.append(f"| {name} | {t} | {c.get('result')} | {_first_err(c.get('msg')) if c.get('result') != 'passed' else ''} |")
         cpu = ((o.get("cpu") or {}).get("cases") or {})

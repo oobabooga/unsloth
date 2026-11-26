@@ -9,8 +9,8 @@ the stages torch_launch, triton_driver, compile_only (triton.compile for the car
 
 Defect (base): on at least one old arm, compile_only raises NameError naming `tl`.
 Fixed (head / merge): on every old arm where base showed it, compile_only compiles; and where the arm's
-triton_driver stage works in that state, probe and runs_on_device return True there (a launch the stack cannot
-make at all, a crash in the driver for both states, is reported, not judged); new arm probe + runs_on_device True.
+torch_launch (a plain torch kernel, no Triton) and triton_driver stages work in that state, probe and
+runs_on_device return True there (an arm whose torch cannot launch any kernel is reported, not judged at launch); new arm probe + runs_on_device True.
 Gates: HIP torch on gfx1151, Triton < 3.4 on old arms and >= 3.4 on new, functions from the state's own tree,
 head kernel module from its own tree, base new arm probe True (current-Triton baseline)."""
 
@@ -55,8 +55,9 @@ def _compiled(o, arm):
     return r.get("ok") is True and (r.get("value") or {}).get("compiled") is True
 
 
-def _driver_ok(o, arm):
-    return _res(o, arm, "triton_driver").get("ok") is True
+def _launch_ok(o, arm):
+    """A plain torch kernel launch works in this venv (no Triton): only then can the probe's launch be judged."""
+    return _true(o, arm, "torch_launch") and _res(o, arm, "triton_driver").get("ok") is True
 
 
 def gates(obs):
@@ -101,7 +102,7 @@ def head_is_fixed(head, base = None):
     for arm in OLD:
         if not _compiled(head, arm):
             why.append(f"{arm}: compile_only {str(_res(head, arm, 'compile_only'))[:200]}")
-        if _driver_ok(head, arm):
+        if _launch_ok(head, arm):
             for stage in ("probe", "runs_on_device"):
                 if not _true(head, arm, stage):
                     why.append(f"{arm}: {stage} {str(_res(head, arm, stage))[:200]} rc {_st(head, arm, stage).get('rc')}")

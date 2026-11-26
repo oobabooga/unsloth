@@ -27,7 +27,7 @@ import s12b3_venv as V  # noqa: E402
 
 TEST_REL = "tests/test_block_swap_cuda_error.py"
 TEST_SRC = HERE / "s12b3_data" / "test_block_swap_cuda_error.py"
-TEST_SHA = "d218630ee73868cb96ed18c8ad1deb3b2629fff5c1f603e1734faa890bd12d45"
+TEST_SHA = "f0d7574e9d4fd9fb3ddca2b898e87ab9ad82afc250fabe7b26d74e220c241da3"
 GPU_TESTS = ["test_the_next_kernel_after_a_refused_arena_registration_runs",
              "test_the_next_kernel_after_a_refused_disk_buffer_registration_runs",
              "test_the_next_kernel_after_a_refused_unregistration_runs"]
@@ -162,21 +162,3 @@ for t in GPU_TESTS:
 obs["cpu"] = pytest_run("cpu", [TEST_REL], "not next_kernel")
 save()
 
-# ---- supplementary (reported, not judged): other real hipHostRegister refusals, raw and through this tree ----
-SUPP = HERE / "s12b3_reg_cell.py"
-obs["supp"] = {"raw": {}, "tree": {}}
-runs = ([("raw", k, "arena") for k in ("dup", "overlap", "badflags", "size0")] if a.state == "base" else []) + \
-    [("tree", k, t) for k in ("overlap", "badflags", "size0") for t in ("arena", "disk")]
-for mode, kind, target in runs:
-    tag = f"{mode}_{kind}_{target}"
-    out = out_dir / f"supp_{tag}.json"
-    lg = out_dir / f"supp_{tag}.log"
-    rc = V.sh([py, "-X", "faulthandler", str(SUPP), "--kind", kind, "--mode", mode, "--target", target,
-               "--test-file", str(dest), "--out", str(out)], lg, timeout = 300, env = env, cwd = str(ck))
-    r: dict = {"rc": rc}
-    if out.is_file():
-        r.update(json.loads(out.read_text(encoding = "utf-8")))
-    if not r.get("done"):
-        r["log_tail"] = lg.read_text(encoding = "utf-8", errors = "replace")[-1500:] if lg.is_file() else ""
-    obs["supp"][mode][f"{kind}/{target}" if mode == "tree" else kind] = r
-    save()
