@@ -1,0 +1,95 @@
+diff --git a/unsloth_zoo/temporary_patches/moe_grouped_fp16.py b/unsloth_zoo/temporary_patches/moe_grouped_fp16.py
+index f53b99a0d..e20de9bdd 100644
+--- a/unsloth_zoo/temporary_patches/moe_grouped_fp16.py
++++ b/unsloth_zoo/temporary_patches/moe_grouped_fp16.py
+@@ -410,9 +410,9 @@ _SMEM = {}
+ 
+ 
+ def _generic_family(device):
+-    """sm86 / sm87 use sm89's table (similar shared memory), sm12x sm120's, sm90+ sm80's."""
++    """sm86 / sm87 use sm89's table (similar shared memory), sm12x sm120's, sm90+ sm80's; ROCm (64 KB LDS) sm120's."""
+     cap = _capability(device)
+-    if cap[0] == 12:
++    if cap[0] == 12 or torch.version.hip is not None or "rocm" in torch.__version__:
+         return "sm120"
+     if cap[0] >= 9 or cap == (8, 0):
+         return "sm80"
+@@ -427,7 +427,8 @@ def _smem_limit(device):
+         if device.type == "cuda":
+             index = device.index if device.index is not None else torch.cuda.current_device()
+             props = torch.cuda.get_device_properties(index)
+-            lim = getattr(props, "shared_memory_per_block_optin", 0) or lim
++            lim = (getattr(props, "shared_memory_per_block_optin", 0)
++                   or getattr(props, "shared_memory_per_block", 0) or lim)
+         _SMEM[key] = lim
+     return lim
+ 
+@@ -877,13 +878,13 @@ def _self_check_generic(device):
+ 
+ 
+ def triton_grouped_available(device) -> bool:
+-    """Self-check once per device; a failure disables the generic path for the process (OOM propagates)."""
++    """Self-check once per device; a failure disables the generic path for the process (OOM propagates). ROCm is
++    admitted here; moe_utils' policy decides which archs route to it."""
+     global _GENERIC_DISABLED_REASON
+     if (
+         triton is None
+         or _GENERIC_DISABLED_REASON is not None
+         or getattr(device, "type", None) != "cuda"
+-        or torch.version.hip is not None
+         or os.environ.get("TRITON_INTERPRET", "0") == "1"
+     ):
+         return False
+diff --git a/unsloth_zoo/temporary_patches/moe_lora_fold.py b/unsloth_zoo/temporary_patches/moe_lora_fold.py
+index cf124194f..df9ecbd71 100644
+--- a/unsloth_zoo/temporary_patches/moe_lora_fold.py
++++ b/unsloth_zoo/temporary_patches/moe_lora_fold.py
+@@ -118,7 +118,7 @@ def lora_fold_decline_reason(inputs, first, second, source):
+     if compiling:
+         # Never run the self-check while tracing, and never key the graph on whether it has run yet (that recompiled
+         # once it had): the op body checks at run time and falls back to the separated arithmetic.
+-        if mg.triton is None or torch.version.hip is not None:
++        if mg.triton is None:
+             return "unavailable"
+     elif not mg.triton_grouped_available(inputs.device):
+         return "unavailable"
+diff --git a/unsloth_zoo/temporary_patches/moe_utils.py b/unsloth_zoo/temporary_patches/moe_utils.py
+index 454f60789..104591182 100644
+--- a/unsloth_zoo/temporary_patches/moe_utils.py
++++ b/unsloth_zoo/temporary_patches/moe_utils.py
+@@ -570,6 +570,12 @@ _TRITON_GROUPED_MM_AUTO_ROWS = {
+     (8, 6):  {"lora": -1, "many": 32,   "few": 32,  "dw": 0,   "dw_few": 0},
+     (7, 5):  {"lora": 64, "many": 0,    "few": 0,   "dw": 0,   "dw_few": 0},
+ }
++# ROCm, keyed by the gcnArch capability torch reports. torch._grouped_mm there is a per-expert mm loop that reads the
++# offsets to the host on every call; the Triton kernel is one sync-free launch. gfx1151 (Strix Halo) routes every class
++# a LoRA step uses to Triton; dW of a trainable base stack stays on torch. Other ROCm archs keep the loop.
++_TRITON_GROUPED_MM_AUTO_ROWS_ROCM = {
++    (11, 5): {"lora": -1, "many": -1, "few": -1, "dw": 0, "dw_few": 0},
++}
+ _TRITON_GROUPED_MM_CAPABILITY = {}
+ _TRITON_GROUPED_MM_POLICY = {}
+ _GROUPED_MM_TRITON_STANDIN = False
+@@ -610,8 +616,9 @@ def _triton_grouped_mm_policy(index, kind, mode, disabled, override, standin = F
+         mode = "1"
+     if mode in ("0", "false", "off") or disabled == "1":
+         return 0
+-    if is_rocm_torch(torch) or _GROUPED_MM_TRITON_OP is None or index is None:
++    if _GROUPED_MM_TRITON_OP is None or index is None:
+         return 0
++    rocm = is_rocm_torch(torch)
+     try:
+         from unsloth_zoo.temporary_patches.moe_grouped_fp16 import triton as _triton
+         if _triton is None:
+@@ -621,9 +628,9 @@ def _triton_grouped_mm_policy(index, kind, mode, disabled, override, standin = F
+         return 0
+     if mode in ("1", "true", "on"):
+         # Below sm80 Triton has no MMA: forcing it on still keeps base-sized GEMMs on cuBLAS.
+-        limit = -1 if cap >= (8, 0) or (cap >= (7, 5) and kind == "lora") else 0
++        limit = -1 if rocm or cap >= (8, 0) or (cap >= (7, 5) and kind == "lora") else 0
+     else:
+-        limit = _TRITON_GROUPED_MM_AUTO_ROWS.get(cap, {}).get(kind, 0)
++        limit = (_TRITON_GROUPED_MM_AUTO_ROWS_ROCM if rocm else _TRITON_GROUPED_MM_AUTO_ROWS).get(cap, {}).get(kind, 0)
+     if limit != 0 and override:
+         try:
+             limit = int(override)
