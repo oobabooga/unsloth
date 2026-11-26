@@ -116,4 +116,16 @@ def table(obs):
     out = "\n".join(rows) + "\n\n" + "\n".join("- " + v for v in vers)
     if raw:
         out += f"\n\nRaw runtime (base, tree independent): {raw}"
+    sup = (obs.get("base") or {}).get("supp") or {}
+    if sup.get("raw"):
+        out += "\n\nSupplementary (not judged), raw hipHostRegister refusals then a launch (base process):\n"
+        out += "\n".join(f"- {k}: pre rc {v.get('pre_register_rc')} refused rc {v.get('refused_rc')} launch {v.get('launch')}"
+                         + ("" if v.get("done") else f" CRASH rc {v.get('rc')}") for k, v in sup["raw"].items())
+    trows = ["| state | refusal / target | register rcs | construct | next launch |", "|---|---|---|---|---|"]
+    for name in ("base", "head", "merge"):
+        for k, v in (((obs.get(name) or {}).get("supp") or {}).get("tree") or {}).items():
+            trows.append(f"| {name} | {k} | {v.get('register_rcs')} | {v.get('construct')} | "
+                         f"{v.get('launch') if v.get('done') else 'CRASH rc ' + str(v.get('rc'))} |")
+    if len(trows) > 2:
+        out += "\n\nSupplementary (not judged), this tree's _Registered / _HostBuf with the registration redirected to that refusal:\n\n" + "\n".join(trows)
     return out
