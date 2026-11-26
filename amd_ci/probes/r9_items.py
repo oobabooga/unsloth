@@ -229,4 +229,34 @@ def item_c153(ctx, obs):
     shutil.rmtree(sv, ignore_errors = True)
 
 
-ITEMS = {"c153": item_c153, "smoke": item_smoke, "c63": item_c63, "m4": item_m4, "c61_knee": item_c61_knee, "c61_krea": item_c61_krea}
+def item_c63b(ctx, obs):
+    """C6-3 follow-up (Linux run 45872933868: the bf16 Qwen3-VL patch-embed F.conv3d at N=16384 raised
+    hipErrorInvalidValue inside the vision encode, while the fp32 sweep passed): bf16 / fp16 / fp32 conv3d alone at
+    N 4032 / 5600 / 16384 / 16385 / 32768, x2, then the vision encode at 16384 with and without AMD_SERIALIZE_KERNEL=3
+    (localises an async error), each in a fresh process, with Qwen3-VL-4B's 1024 channels."""
+    res: dict = {"crash": [], "share": []}
+    obs["c63b"] = res
+    od = Path(ctx["work"]) / "c63b"
+    od.mkdir(parents = True, exist_ok = True)
+    for sweep in range(2):
+        for dt in ("bf16", "fp16", "fp32"):
+            for n in (4032, 5600, 16384, 16385, 32768):
+                o = od / f"crash_{sweep}_{dt}_{n}.json"
+                r = run_py(ctx, R9 / "c63_conv3d.py", ["crash", "--n", n, "--dtype", dt, "--channels", 1024, "--out", o],
+                           o, timeout = 900, tag = f"c63b_{dt}_{n}")
+                r.update(sweep = sweep, n = n, dtype = dt)
+                res["crash"].append(r)
+                ctx["save"]()
+    pf = prefetch(ctx, QWEN3VL, ["config.json"], timeout = 600)
+    if pf.get("path"):
+        for i, ser in enumerate(("0", "3", "0")):
+            o = od / f"share_16384_{i}_ser{ser}.json"
+            r = run_py(ctx, R9 / "c63_conv3d.py", ["share", "--n", 16384, "--config", pf["path"], "--out", o], o,
+                       timeout = 1200, extra_env = {"AMD_SERIALIZE_KERNEL": ser if ser != "0" else None},
+                       tag = f"c63b_s{i}")
+            r.update(i = i, serialize = ser)
+            res["share"].append(r)
+            ctx["save"]()
+
+
+ITEMS = {"c63b": item_c63b, "c153": item_c153, "smoke": item_smoke, "c63": item_c63, "m4": item_m4, "c61_knee": item_c61_knee, "c61_krea": item_c61_krea}

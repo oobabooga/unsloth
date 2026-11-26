@@ -30,9 +30,10 @@ def crash(a, out):
     import torch.nn.functional as F
     torch.manual_seed(0)
     c = a.channels
-    conv = torch.nn.Conv3d(3, c, kernel_size = (2, 16, 16), stride = (2, 16, 16), bias = True).cuda().float()
-    x = torch.randn(a.n, 3, 2, 16, 16, device = "cuda", dtype = torch.float32)
-    out.update(n = a.n, channels = c, input_bytes = x.numel() * 4, calls = [])
+    dt = {"fp32": torch.float32, "bf16": torch.bfloat16, "fp16": torch.float16}[a.dtype]
+    conv = torch.nn.Conv3d(3, c, kernel_size = (2, 16, 16), stride = (2, 16, 16), bias = True).cuda().to(dt)
+    x = torch.randn(a.n, 3, 2, 16, 16, device = "cuda", dtype = torch.float32).to(dt)
+    out.update(n = a.n, channels = c, dtype = a.dtype, input_bytes = x.numel() * x.element_size(), calls = [])
     _save(a.out, out)
     w2 = conv.weight.reshape(c, -1)
     for i in range(3):
@@ -43,15 +44,17 @@ def crash(a, out):
         t = time.perf_counter()
         y = conv(x)
         torch.cuda.synchronize()
+        rec["finite_first"] = bool(torch.isfinite(y).all())
         rec["wall_ms"] = round((time.perf_counter() - t) * 1e3, 3)
         rec["shape"] = list(y.shape)
         rec["finite"] = bool(torch.isfinite(y).all())
         lin = F.linear(x.reshape(a.n, -1), w2, conv.bias)
         rec["maxabs_vs_linear"] = float((y.reshape(a.n, c) - lin).abs().max())
-        rec["allclose_linear"] = bool(torch.allclose(y.reshape(a.n, c), lin, rtol = 1e-4, atol = 1e-4))
+        tol = 1e-4 if a.dtype == "fp32" else 3e-2
+        rec["allclose_linear"] = bool(torch.allclose(y.reshape(a.n, c).float(), lin.float(), rtol = tol, atol = tol))
         if i == 0:
             k = min(64, a.n)
-            ref = F.linear(x[:k].double().cpu().reshape(k, -1), w2.double().cpu(), conv.bias.double().cpu())
+            ref = F.linear(x[:k].double().cpu().reshape(k, -1), w2.double().cpu(), conv.bias.double().cpu()).to(y.dtype).double()
             rec["maxabs_conv_vs_cpu64"] = float((y[:k].reshape(k, c).double().cpu() - ref).abs().max())
             rec["maxabs_linear_vs_cpu64"] = float((lin[:k].double().cpu() - ref).abs().max())
         t = time.perf_counter()
@@ -139,6 +142,7 @@ def main() -> int:
     ap.add_argument("mode", choices = ("crash", "share"))
     ap.add_argument("--n", type = int, required = True)
     ap.add_argument("--channels", type = int, default = 1152)
+    ap.add_argument("--dtype", default = "fp32", choices = ("fp32", "bf16", "fp16"))
     ap.add_argument("--config", default = "")
     ap.add_argument("--out", required = True)
     a = ap.parse_args()

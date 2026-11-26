@@ -47,6 +47,10 @@ def gates(h: dict, items: list) -> list:
         out.append(("c61 knee arms measured (15)", len(ok) >= 13, f"{len(ok)} of {len(rows)}"))
         bal = [r.get("ballast_gib") for r in ok]
         out.append(("c61 ballast held 42 GiB in every arm", bool(bal) and min(bal) >= 41.9, f"min {min(bal or [0])}"))
+    if "c63b" in items:
+        c = h.get("c63b") or {}
+        out.append(("c63b ran (30 conv processes, 3 encodes)", len(c.get("crash") or []) == 30 and
+                    len(c.get("share") or []) == 3, f"{len(c.get('crash') or [])} / {len(c.get('share') or [])}"))
     if "c153" in items:
         c = h.get("c153") or {}
         ok = [r for r in c.get("arms") or [] if r.get("med_s")]
@@ -100,6 +104,32 @@ def _c63_lines(h):
     else:
         v = f"KEEP for speed only (no crash, patch-embed share max {max(shares):.4f} >= 1%)"
     L.append(f"  VERDICT C6-3: {v}")
+    return L
+
+
+def _c63b_lines(h):
+    c = h.get("c63b") or {}
+    if not c:
+        return []
+    L = ["C6-3 follow-up: patch-embed Conv3d alone by dtype (1024 ch), then the vision encode at N=16384:"]
+    bad = []
+    for r in c.get("crash") or []:
+        calls = r.get("calls") or []
+        ok = not _crashed(r) and len(calls) == 3 and all(x.get("finite") for x in calls)
+        if not ok:
+            bad.append((r.get("dtype"), r.get("n"), r.get("rc"), (r.get("error") or "")[-160:].replace("\n", " ")))
+        L.append(f"  sweep {r.get('sweep')} {r.get('dtype')} N {r.get('n')}: rc {r.get('rc')} {r.get('verdict')} "
+                 f"ms {[x.get('wall_ms') for x in calls]} max|conv-linear| "
+                 f"{max([x.get('maxabs_vs_linear') or 0 for x in calls] or [None])}")
+    for r in c.get("share") or []:
+        L.append(f"  encode N=16384 AMD_SERIALIZE_KERNEL={r.get('serialize')}: {r.get('verdict')} encode ms "
+                 f"{r.get('encode_ms_med')} share {r.get('share_bf16')} err {(r.get('error') or '')[-300:]}")
+    enc_bad = [r for r in c.get("share") or [] if r.get("verdict") != "ok"]
+    L.append(f"  conv3d alone failures: {bad or 'none'}; encode failures {len(enc_bad)}/{len(c.get('share') or [])}")
+    v = ("KEEP (correctness): " + ("conv3d alone fails at " + str(sorted({(b[0], b[1]) for b in bad})) if bad else
+                                   "the conv3d alone passes but the encode fails at N=16384")) if bad or enc_bad else \
+        "KILL (the Linux bf16 failure does not reproduce: every conv3d and encode ran clean)"
+    L.append(f"  VERDICT C6-3 follow-up: {v}")
     return L
 
 
@@ -279,7 +309,7 @@ def _c153_lines(h):
 
 def table(h: dict) -> list:
     L = [f"smoke {h.get('smoke')}"]
-    for fn in (_c63_lines, _m4_lines, _knee_lines, _krea_lines, _c153_lines):
+    for fn in (_c63_lines, _c63b_lines, _m4_lines, _knee_lines, _krea_lines, _c153_lines):
         try:
             L.extend(fn(h))
         except Exception as exc:  # noqa: BLE001

@@ -54,7 +54,7 @@ def gates(obs: dict) -> list:
 
 def _needed_mods(items):
     need = []
-    if set(items) & {"smoke", "c63", "m4", "c61_knee", "c61_krea", "c153"}:
+    if set(items) & {"smoke", "c63", "m4", "c61_knee", "c61_krea", "c153", "c63b"}:
         need.append("r9_items")
     if "m3" in items:
         need.append("r9_m3")
