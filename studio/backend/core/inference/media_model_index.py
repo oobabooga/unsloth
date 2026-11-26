@@ -92,13 +92,13 @@ def _gguf_load_path(info, on_disk: Path, load_dir: Path) -> str:
 
 def _loader_can_open(load_path: str, filename: str) -> bool:
     """A split checkpoint needs its whole shard set beside it, or the load fails after evicting."""
-    from utils.models.model_config import colocated_split_shards
+    from utils.models.model_config import split_set_is_loadable
 
     root = Path(load_path)
     if not root.is_dir():
         # Cached repo id skips containment but needs a whole split set; uncached is the download guard's.
         cached = _cached_repo_file(load_path, filename)
-        return True if cached is None else bool(colocated_split_shards(cached)[1])
+        return cached is None or split_set_is_loadable(cached)
     from core.inference.diffusion_families import resolve_local_gguf_child
 
     try:
@@ -106,7 +106,7 @@ def _loader_can_open(load_path: str, filename: str) -> bool:
     except Exception:  # noqa: BLE001 -- whatever the loader refuses, the index does not advertise
         return False
     # a split checkpoint opens its siblings implicitly, so an incomplete set fails at load time
-    return bool(colocated_split_shards(child)[1])
+    return split_set_is_loadable(child)
 
 
 def _cached_repo_file(repo_id: str, filename: str) -> Optional[Path]:
@@ -262,6 +262,18 @@ def _loadable_directory(load_dir: Path) -> bool:
     return sole is not None and _loader_can_open(str(load_dir), sole)
 
 
+def _pull_is_incomplete(info) -> bool:
+    """An HF repo by its download state, as before the shared scan: the Model Hub also flags layouts it lists for
+    its own reasons (a lone checkpoint, an artifact mirror), and _loadable_directory judges those."""
+    if getattr(info, "source", None) != "hf_cache" or not getattr(info, "model_id", None):
+        return bool(getattr(info, "partial", False))
+    from hub.utils.inventory_scan import repo_partial_verdicts
+
+    path = Path(info.path)
+    repo_dir = path.parent.parent if path.parent.name == "snapshots" else path
+    return any(repo_partial_verdicts(info.model_id, repo_dir))
+
+
 @in_scan_memo
 def _build_index(task: str) -> dict[str, MediaModelPick]:
     """Map every name a downloaded *task* model answers to onto its load spec."""
@@ -276,7 +288,7 @@ def _build_index(task: str) -> dict[str, MediaModelPick]:
     for info in candidates:
         try:
             # a cancelled or incomplete pull still lists, and loading it fails predictably
-            if getattr(info, "partial", False):
+            if _pull_is_incomplete(info):
                 continue
             if _local_model_task(info) != task:
                 continue
