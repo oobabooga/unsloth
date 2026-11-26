@@ -37,14 +37,14 @@ env:
   # Set by scaffold.py --patch: base = PATCH_BASE, head = PATCH_BASE plus this diff (relative to the checkout).
   PATCH_BASE: "47da42752ee8ad1038dd2e02ec048e53ae7cb52d"
   PATCH_FILE: "amd_ci/patches/a7_head.diff"
-  PATCH_SHA256: "604f6fd97964a0910b44f2c652ab1c3dc64941e0250bc3b3d801f60b695a203f"
+  PATCH_SHA256: "0db275413773c928eb61d6a500a335100eeedf81bb5cbaa7d7afcdb0be7787cf"
 
 jobs:
 
   gpu:
     name: "PR 0 GPU measurement (exclusive)"
     runs-on: [self-hosted, Linux, strix-halo, devlab-dispatch]
-    timeout-minutes: 330
+    timeout-minutes: 400
     # A shared constant, deliberately: it serialises every GPU measurement across
     # all branches. That is stricter than co-tenancy strictly requires now that the
     # pool is many machines, but nothing in the label set can pin or exclude a
@@ -117,7 +117,7 @@ jobs:
             --probe amd_ci/probes/a7_probe.py \
             --criteria amd_ci/criteria/a7_measure.py \
             --out-dir "$AMD_CI_WORK/out/gpu" \
-            --python "$AMD_CI_PY" -- --items gemm,flydsl,vtb,conv,mmap,hsa
+            --python "$AMD_CI_PY" -- --items gemm,flydsl,vtb,conv,mmap,hsa,vaee2e
           cat "$AMD_CI_WORK/out/gpu/VERDICT.md" >> "$GITHUB_STEP_SUMMARY"
           # A finding keeps the job green; a NON-result (VOID / INCONCLUSIVE) does not.
           python3 "$GITHUB_WORKSPACE/amd_ci/lib/announce.py" "$AMD_CI_WORK/out/gpu"

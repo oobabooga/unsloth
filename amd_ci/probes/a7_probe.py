@@ -13,6 +13,7 @@ fresh process; no token is read or passed (public repos, token=False).
   conv    temporal-unfolded batched Conv2d vs Conv3d, Wan 5B (fp32) + LTX-2.5 (bf16) VAE   [Linux + Windows]
   mmap    native build mapping ACCESS_COPY vs ACCESS_READ (+MIMALLOC_PURGE_DELAY=0), Qwen-2.1 + Wan A14B  [Linux]
   hsa     HSA_USE_SVM=0 / +HSA_ENABLE_SDMA=0 on a cold Wan 5B load + short render             [Linux]
+  vaee2e  item 5 through Studio: Wan 5B render, main vs head + UNSLOTH_VIDEO_VAE_ROCM_UNFOLD=1   [Linux + Windows]
 """
 from __future__ import annotations
 
@@ -267,6 +268,39 @@ def item_hsa(ctx, obs):
     drop_repo(ctx, repo)
 
 
+def item_vaee2e(ctx, obs):
+    """Item 5 through Studio: Wan 2.2 TI2V-5B at 832x480x49, 8 steps, Studio defaults (its VAE tiling, MIOpen db).
+    B = main; U = head tree with UNSLOTH_VIDEO_VAE_ROCM_UNFOLD=1. Order B1 U1 U2 B2; 1 warm-up + 2 timed renders per
+    arm; LPIPS / PSNR vs B1 (wintiers/score.py)."""
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    import wintiers_probe as WP
+    WP.ENGAGE_KEYS = tuple(WP.ENGAGE_KEYS) + ("vae_rocm_unfold", "vae_rocm_pertap", "miopen")
+    repo = "Wan-AI/Wan2.2-TI2V-5B-Diffusers"
+    if not fetch(ctx, repo, [], obs, "vaee2e_fetch"):
+        return
+    spec = dict(WP.FAMILIES["wan"])
+    gen = {"width": 832, "height": 480, "num_frames": 49, "steps": 8}
+    od = ctx["work"] / "vaee2e_arms"
+    od.mkdir(parents = True, exist_ok = True)
+    trees = {"base": Path(ctx["base"]).parents[1], "head": Path(ctx["head"]).parents[1]}
+    on = {"UNSLOTH_VIDEO_VAE_ROCM_UNFOLD": "1"}
+    res = obs.setdefault("vaee2e", {})
+    for tag, tree, env in (("B1", "base", {}), ("U1", "head", on), ("U2", "head", on), ("B2", "base", {})):
+        rec = WP.run_arm(trees[tree], "wan", tag, spec, env, od, ctx["hf"], 2, 1, gen)
+        rec.pop("log_tail", None)
+        res[tag] = rec
+        obs["vaee2e"] = res
+    sc = subprocess.run([sys.executable, "-u", str(WP.TOOLS / "score.py"), "--out", str(od), "--family", "wan",
+                         "--ref", "B1", "--pairs", "U1:B1,B2:B1,U2:U1", "--kind", "video"],
+                        capture_output = True, text = True, encoding = "utf-8", errors = "replace",
+                        env = WP.arm_env(ctx["hf"], {}), timeout = 3600)
+    try:
+        obs["vaee2e_scores"] = json.loads((od / "scores_wan.json").read_text(encoding = "utf-8"))
+    except Exception as exc:  # noqa: BLE001
+        obs["vaee2e_scores"] = {"error": repr(exc)[:300], "tail": (sc.stdout + sc.stderr)[-800:]}
+    drop_repo(ctx, repo)
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--state", required = True)
@@ -305,7 +339,7 @@ def main() -> int:
         obs["env_error"] = repr(exc)
     save()
     fns = {"gemm": item_gemm, "flydsl": item_flydsl, "vtb": item_vtb, "conv": item_conv, "mmap": item_mmap,
-           "hsa": item_hsa}
+           "hsa": item_hsa, "vaee2e": item_vaee2e}
     for item in a.items.split(","):
         t = time.time()
         try:

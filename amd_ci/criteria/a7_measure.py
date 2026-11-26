@@ -41,6 +41,10 @@ def gates(obs: dict) -> list:
         elif item == "mmap":
             n = len(_ok(h.get("mmap")))
             out.append(("mmap arms ok", n >= 6, f"{n} ok of {len(h.get('mmap') or [])}"))
+        elif item == "vaee2e":
+            rs = (h.get("vaee2e") or {}).values()
+            n = sum(1 for r in rs if r.get("verdict") == "ok")
+            out.append(("vaee2e arms ok", n >= 4, f"{n} ok"))
         elif item == "hsa":
             rs = (h.get("hsa") or {}).values()
             n = sum(1 for r in rs if r.get("verdict") == "ok")
@@ -83,4 +87,9 @@ def table(obs: dict) -> str:
         rd = (r.get("renders") or [{}])[0]
         L.append(f"hsa {tag} {r.get('env')}: load_s {r.get('load_s')} render {rd.get('wall_s')} md5 {r.get('frames_md5')}"
                  f" kmsg {r.get('kmsg_before')} -> {r.get('kmsg_after')} verdict {r.get('verdict')}")
+    for tag, r in (h.get("vaee2e") or {}).items():
+        L.append(f"vaee2e {tag}: load_s {r.get('load_s')} renders "
+                 f"{[(x.get('wall_s'), x.get('vae_plus_post_s'), x.get('denoise_s')) for x in r.get('renders') or []]} "
+                 f"unfold lines {[x for x in r.get('engage_lines') or [] if 'unfold' in x][:2]} verdict {r.get('verdict')}")
+    L.append(f"vaee2e scores {str(h.get('vaee2e_scores'))[:1500]}")
     return "\n".join(L)
