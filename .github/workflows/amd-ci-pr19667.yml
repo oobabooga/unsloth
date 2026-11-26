@@ -114,8 +114,8 @@ jobs:
           set +e
           "$AMD_CI_PY" amd_ci/lib/differential.py \
             --states "$AMD_CI_WORK/out/states.json" \
-            --probe imgconc_probe.py \
-            --criteria imgconc_bench.py \
+            --probe amd_ci/probes/imgconc_probe.py \
+            --criteria amd_ci/criteria/imgconc_bench.py \
             --out-dir "$AMD_CI_WORK/out/gpu" \
             --python "$AMD_CI_PY" -- --plan staged
           cat "$AMD_CI_WORK/out/gpu/VERDICT.md" >> "$GITHUB_STEP_SUMMARY"
