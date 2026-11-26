@@ -37,7 +37,7 @@ ap.add_argument("--transformers", default = "5.17.0")
 ap.add_argument("--trl-peft", default = "trl==1.18.0,peft==0.21.3")
 ap.add_argument("--steps", type = int, default = 16)
 ap.add_argument("--warmup", type = int, default = 4)
-ap.add_argument("--timeout", type = int, default = 2400)
+ap.add_argument("--timeout", type = int, default = 3600)
 a = ap.parse_args()
 a.out = a.out.resolve()
 ck = str(Path(a.checkout).resolve())
@@ -142,13 +142,13 @@ def run(tag: str, arm: str, extra_args: list, build = False) -> dict:
 grads = shared / "grads"
 grads.mkdir(exist_ok = True)
 obs["runs"] = {}
-ref = ["--grads-ref", str(grads / "a_bf16.pt")]
+ref = ["--grads-ref", str(grads / "a_bf16.pt"), "--oracle-ref", str(grads / "oracle.pt")]
 if a.state == "base":
     if not (model_dir / "config.json").is_file():
         obs["build"] = run("build", "a", [], build = True)
         save()
     obs["model_built"] = (model_dir / "config.json").is_file()
-    plan = [("ref_a", "a", ["--grads-save", str(grads / "a_bf16.pt"), "--profile"])]
+    plan = [("ref_a", "a", ["--grads-save", str(grads / "a_bf16.pt"), "--profile", "--save-init", str(grads / "init_a.pt")])]
 else:
     # Arm c / d trees: a copy of the base checkout with the shipped patch applied (git apply, checked).
     obs["trees"] = {}
@@ -174,5 +174,9 @@ else:
             plan.append((f"r{i}_{arm}", arm, ref + (["--profile"] if i == 1 else [])))
 for tag, arm, extra in plan:
     obs["runs"][tag] = run(tag, arm, extra)
+    save()
+if a.state == "base" and (grads / "init_a.pt").is_file():
+    # fp64 oracle on CPU: plain transformers + PEFT from arm a's LoRA config and pre-step-0 tensors (no unsloth).
+    obs["oracle"] = run("oracle", "a", ["--oracle", str(grads / "oracle.pt"), "--init", str(grads / "init_a.pt")])
     save()
 save()

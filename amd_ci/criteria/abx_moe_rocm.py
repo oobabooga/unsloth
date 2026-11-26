@@ -75,6 +75,26 @@ def table(obs):
         if meds:
             m = statistics.median(meds)
             rows.append(f"arm {arm}: medians {[round(x, 4) for x in meds]} -> {m:.4f} s/step, spread {(max(meds) - min(meds)) / m:.2%}")
+    orc = (obs.get("base") or {}).get("oracle") or {}
+    rows += ["", f"fp64 oracle (CPU, plain transformers + PEFT): ok {orc.get('ok')} loss {orc.get('loss')} error {str(orc.get('error'))[:300]} "
+             f"experts_impl {orc.get('experts_implementation') or orc.get('experts_implementation_error')} names-only oracle {orc.get('names_only_oracle')} arm {orc.get('names_only_arm')}"]
+    fams = sorted({f for r in rs.values() for f in ((r.get("oracle") or {}).get("families") or {})})
+    if fams:
+        rows += ["", "| run | arm | all relL2 / cos vs oracle | loss rel | " + " | ".join(fams) + " |", "|---|---|---|---|" + "---|" * len(fams)]
+        for tag, r in rs.items():
+            o = r.get("oracle") or {}
+            if not o.get("families"):
+                rows.append(f"| {tag} | {r.get('arm')} | {o.get('error')} |")
+                continue
+            def cell(v):
+                if v.get("rel_l2") is None:
+                    return f"ref 0, arm norm {v.get('arm_norm', 0):.2e}"
+                return f"{v['rel_l2']:.2e} / {v['cosine']:.6f}"
+            rows.append(f"| {tag} | {r.get('arm')} | {cell(o['all'])} | {o.get('loss_rel', 0):.2e} | " + " | ".join(cell(o['families'].get(f, {"rel_l2": None})) for f in fams) + " |")
+        rows.append("")
+        for tag in [t for t in rs if t.startswith("r1_")]:
+            ac = ((rs[tag].get("oracle") or {}).get("acts")) or {}
+            rows.append(f"{tag} activations rel L2 vs oracle: " + "; ".join(f"{k}: {v}" for k, v in sorted(ac.items()))[:1500])
     for tag, r in rs.items():
         if r.get("profile_step"):
             rows.append(f"{tag} profiled step: {r['profile_step']}")
