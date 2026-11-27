@@ -102,6 +102,28 @@ def compare(got, ref):
             "n_tensors": len(ref), "name_mismatch": missing[:10]}
 
 
+def lora_wrappers(model):
+    """module name -> what it wraps (parameter_name for ParamWrapper, else 'linear'), its r and scaling."""
+    out = {}
+    for n, m in model.named_modules():
+        if hasattr(m, "lora_A") and hasattr(m, "scaling") and isinstance(getattr(m, "scaling"), dict):
+            out[n] = {"param": getattr(m, "parameter_name", None) or "linear",
+                      "r": {k: int(v) for k, v in (getattr(m, "r", {}) or {}).items()},
+                      "scaling": {k: float(v) for k, v in m.scaling.items()}}
+    return out
+
+
+def _key(name, wrappers):
+    """(layer path up to the wrapped module, wrapped parameter, A / B) for a LoRA tensor name."""
+    owner = name.split(".lora_")[0]
+    ab = "A" if ".lora_A." in name else "B"
+    w = wrappers.get(owner, {})
+    base = owner
+    while base.endswith(".base_layer"):
+        base = base[: -len(".base_layer")]
+    return (base, w.get("param", "?"), ab)
+
+
 ACT_SUFFIXES = ("self_attn", "mlp", "mlp.gate", "mlp.experts")
 
 
@@ -205,29 +227,57 @@ def oracle():
         rec["experts_implementation_error"] = repr(e)[:300]
         model = AutoModelForCausalLM.from_pretrained(args.model_dir, **kw)
     cfgd = dict(init["peft_config"])
+    rec["arm_rank_pattern"], rec["arm_alpha_pattern"] = cfgd.get("rank_pattern"), cfgd.get("alpha_pattern")
     fields = peft.LoraConfig.__dataclass_fields__
-    cfg = peft.LoraConfig(**{k: v for k, v in cfgd.items() if k in fields and k not in ("peft_type", "task_type", "base_model_name_or_path", "revision", "auto_mapping", "runtime_config")})
+    drop = ("peft_type", "task_type", "base_model_name_or_path", "revision", "auto_mapping", "runtime_config",
+            "rank_pattern", "alpha_pattern")  # ranks / scalings are pinned per wrapper from the arm below
+    cfg = peft.LoraConfig(**{k: v for k, v in cfgd.items() if k in fields and k not in drop})
     rec["lora_config_used"] = {k: str(v)[:200] for k, v in cfg.to_dict().items() if v not in (None, False, [], {})}
+    arm_w = init.get("wrappers") or {}
+    rec["arm_wrappers"] = {k: v for k, v in list(arm_w.items())[:12]}
     model = peft.get_peft_model(model, cfg)
-    names = {n for n, p in model.named_parameters() if p.requires_grad}
-    want = set(init["tensors"])
-    rec["names_only_oracle"], rec["names_only_arm"] = sorted(names - want)[:20], sorted(want - names)[:20]
-    if names != want:
-        raise RuntimeError(f"oracle LoRA names differ from the arm's: {len(names - want)} / {len(want - names)}")
+    orc_w = lora_wrappers(model)
+    # Map by (layer path, wrapped parameter, A / B): PEFT may nest the two expert ParamWrappers in another order.
+    arm_by_key = {_key(n, arm_w): n for n in init["tensors"]}
+    orc_names = [n for n, p in model.named_parameters() if p.requires_grad]
+    orc_by_key = {_key(n, orc_w): n for n in orc_names}
+    rec["keys_only_oracle"] = sorted(map(str, set(orc_by_key) - set(arm_by_key)))[:20]
+    rec["keys_only_arm"] = sorted(map(str, set(arm_by_key) - set(orc_by_key)))[:20]
+    if set(orc_by_key) != set(arm_by_key) or len(orc_by_key) != len(orc_names):
+        raise RuntimeError(f"oracle LoRA keys differ from the arm's: {rec['keys_only_oracle'][:3]} / {rec['keys_only_arm'][:3]}")
+    rename = {orc_by_key[k]: arm_by_key[k] for k in orc_by_key}  # oracle name -> arm name
+    params = dict(model.named_parameters())
     with torch.no_grad():
-        for n, p in model.named_parameters():
-            if n in init["tensors"]:
-                t = init["tensors"][n]
-                if t.shape != p.shape:
-                    raise RuntimeError(f"{n}: shape {tuple(t.shape)} vs oracle {tuple(p.shape)}")
-                p.copy_(t.double())
-    wrapper_params = {}
+        for on, an in rename.items():
+            t, p = init["tensors"][an], params[on]
+            if t.shape != p.shape:
+                raise RuntimeError(f"{an}: arm shape {tuple(t.shape)} vs oracle {tuple(p.shape)} ({on})")
+            p.copy_(t.double())
+    # Pin each wrapper's scaling to the arm's (alpha / r, rslora or a pattern the oracle config dropped).
+    arm_scale = {}
+    for n, w in arm_w.items():
+        b = n
+        while b.endswith(".base_layer"):
+            b = b[: -len(".base_layer")]
+        arm_scale[(b, w["param"])] = w["scaling"]
+    pinned = 0
     for n, m in model.named_modules():
-        pn = getattr(m, "parameter_name", None)
-        if pn:
-            wrapper_params[n] = pn
-    rec["wrapper_params"] = wrapper_params
-    fams = {n: family(n, wrapper_params) for n in names}
+        w = orc_w.get(n)
+        if w is None:
+            continue
+        b = n
+        while b.endswith(".base_layer"):
+            b = b[: -len(".base_layer")]
+        sc = arm_scale.get((b, w["param"]))
+        if sc is None:
+            raise RuntimeError(f"no arm scaling for {n} ({w['param']})")
+        for k, v in sc.items():
+            if k in m.scaling and m.scaling[k] != v:
+                pinned += 1
+            m.scaling[k] = v
+    rec["scalings_pinned"] = pinned
+    wrapper_params = {n: w["param"] for n, w in orc_w.items() if w["param"] != "linear"}
+    fams = {rename[n]: family(n, wrapper_params) for n in orc_names}
     g = torch.Generator().manual_seed(1)
     ids = torch.randint(3, 30000, (args.batch, args.seqlen), generator = g)
     acts, active = {}, [True]
@@ -236,9 +286,10 @@ def oracle():
     out = model(input_ids = ids, labels = ids)
     active[0] = False
     out.loss.backward()
-    grads = {n: p.grad.detach().double().clone() for n, p in model.named_parameters() if p.requires_grad and p.grad is not None}
+    grads = {rename[n]: p.grad.detach().double().clone() for n, p in model.named_parameters() if p.requires_grad and p.grad is not None}
     torch.save({"grads": grads, "families": fams, "loss": float(out.loss), "acts": acts}, args.oracle)
     rec.update(loss = float(out.loss), n_grads = len(grads), families = sorted(set(fams.values())), acts_keys = sorted(acts),
+               renamed = sum(1 for k, v in rename.items() if k != v),
                ok = True, finite = True, stage = "done")
 
 
@@ -273,7 +324,7 @@ def train():
         d = cfg.to_dict() if hasattr(cfg, "to_dict") else dict(vars(cfg))
         d = {k: (sorted(v) if isinstance(v, set) else v) for k, v in d.items()}
         torch.save({"tensors": {n: p.detach().float().cpu().clone() for n, p in model.named_parameters() if p.requires_grad},
-                    "peft_config": d}, args.save_init)
+                    "peft_config": d, "wrappers": lora_wrappers(model)}, args.save_init)
         rec["saved_init"] = args.save_init
     acts, active = {}, [False]
     if args.oracle_ref:
