@@ -1599,8 +1599,9 @@ def main():
         log(f"signal {signum}: killing run-owned processes, deleting run-owned files")
         cleanup_owned(a.keep_models)
         sys.exit(128 + signum)
-    for sg in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
-        signal.signal(sg, _on_signal)
+    for sg in (signal.SIGTERM, signal.SIGINT, getattr(signal, "SIGHUP", None)):  # no SIGHUP on Windows
+        if sg is not None:
+            signal.signal(sg, _on_signal)
     defaults = {"p": 512, "n": 128, "r": 3, "fa": "on", "ctk": "f16", "ctv": "f16", **pts.get("defaults", {})}
     device_skip = None
     expect = a.expect_gpu or pts.get("expect_gpu", "")
