@@ -102,6 +102,18 @@ def compare(got, ref):
             "n_tensors": len(ref), "name_mismatch": missing[:10]}
 
 
+def swap_factors(lora_A, lora_B, num_experts):
+    """Zoo moe_lora_factor_swap.swap_expert_lora_factors, inline (no zoo import here): (A [E*R, a_in], B [b_out, R*E])
+    -> (A' [E*R, b_out], B' [a_in, R*E]) with B'_e = A_e^T, A'_e = B_e^T; same per-expert delta, its own inverse."""
+    E = int(num_experts)
+    rows, a_in = lora_A.shape
+    b_out, cols = lora_B.shape
+    R = rows // E
+    new_B = lora_A.reshape(E, R, a_in).permute(2, 1, 0).reshape(a_in, R * E).contiguous()
+    new_A = lora_B.reshape(b_out, R, E).permute(2, 1, 0).reshape(E * R, b_out).contiguous()
+    return new_A, new_B
+
+
 def lora_wrappers(model):
     """module name -> what it wraps (parameter_name for ParamWrapper, else 'linear'), its r and scaling."""
     out = {}
@@ -231,9 +243,17 @@ def oracle():
     fields = peft.LoraConfig.__dataclass_fields__
     drop = ("peft_type", "task_type", "base_model_name_or_path", "revision", "auto_mapping", "runtime_config",
             "rank_pattern", "alpha_pattern")  # ranks / scalings are pinned per wrapper from the arm below
-    cfg = peft.LoraConfig(**{k: v for k, v in cfgd.items() if k in fields and k not in drop})
-    rec["lora_config_used"] = {k: str(v)[:200] for k, v in cfg.to_dict().items() if v not in (None, False, [], {})}
     arm_w = init.get("wrappers") or {}
+    # Exactly the modules the arm wrapped: its target_modules regex is broad (and PEFT may also apply it to the
+    # experts), so name the wrapped Linear leaves and keep the recorded expert target_parameters.
+    linear_leaves = sorted({n.rsplit(".", 1)[-1] for n, w in arm_w.items() if w["param"] == "linear"})
+    ranks = {r for w in arm_w.values() for r in w["r"].values()}
+    if len(ranks) != 1:
+        raise RuntimeError(f"arm wrappers use several ranks {sorted(ranks)}")
+    kw_cfg = {k: v for k, v in cfgd.items() if k in fields and k not in drop + ("target_modules", "layers_to_transform", "layers_pattern")}
+    kw_cfg.update(target_modules = linear_leaves, r = ranks.pop())
+    cfg = peft.LoraConfig(**kw_cfg)
+    rec["lora_config_used"] = {k: str(v)[:300] for k, v in cfg.to_dict().items() if v not in (None, False, [], {})}
     rec["arm_wrappers"] = {k: v for k, v in list(arm_w.items())[:12]}
     model = peft.get_peft_model(model, cfg)
     orc_w = lora_wrappers(model)
@@ -247,12 +267,41 @@ def oracle():
         raise RuntimeError(f"oracle LoRA keys differ from the arm's: {rec['keys_only_oracle'][:3]} / {rec['keys_only_arm'][:3]}")
     rename = {orc_by_key[k]: arm_by_key[k] for k in orc_by_key}  # oracle name -> arm name
     params = dict(model.named_parameters())
+    rec["expert_shapes"] = {str(k): {"arm": list(init["tensors"][arm_by_key[k]].shape), "oracle": list(params[on].shape)}
+                            for k, on in orc_by_key.items() if ".layers.0." in k[0] + "." and k[1] != "linear"}
+    for mn, mod in model.named_modules():
+        if mn.endswith("layers.0.mlp.experts"):
+            inner = mod
+            while type(inner).__name__ == "ParamWrapper":
+                inner = inner.base_layer
+            rec["oracle_stacks"] = {n: list(p.shape) for n, p in inner.named_parameters(recurse = False)}
+    swapped = []  # (oracle A name, oracle B name, num_experts): arm factors stored for a transposed stack
     with torch.no_grad():
-        for on, an in rename.items():
-            t, p = init["tensors"][an], params[on]
-            if t.shape != p.shape:
-                raise RuntimeError(f"{an}: arm shape {tuple(t.shape)} vs oracle {tuple(p.shape)} ({on})")
-            p.copy_(t.double())
+        for k, on in orc_by_key.items():
+            if k[2] != "A":
+                continue
+            onb = orc_by_key[(k[0], k[1], "B")]
+            ta, tb = init["tensors"][rename[on]], init["tensors"][rename[onb]]
+            pa, pb = params[on], params[onb]
+            if ta.shape == pa.shape and tb.shape == pb.shape:
+                pa.copy_(ta.double()); pb.copy_(tb.double())
+                continue
+            E = None
+            for mn, mod in model.named_modules():
+                if mn == k[0]:
+                    inner = mod
+                    while type(inner).__name__ == "ParamWrapper":
+                        inner = inner.base_layer
+                    st = getattr(inner, k[1], None)
+                    E = st.shape[0] if torch.is_tensor(st) and st.dim() == 3 else None
+            if E is None:
+                raise RuntimeError(f"{rename[on]}: arm shape {tuple(ta.shape)} vs oracle {tuple(pa.shape)} ({on})")
+            na, nb = swap_factors(ta, tb, E)
+            if na.shape != pa.shape or nb.shape != pb.shape:
+                raise RuntimeError(f"{rename[on]}: arm {tuple(ta.shape)}/{tuple(tb.shape)}, swapped {tuple(na.shape)}/{tuple(nb.shape)}, oracle {tuple(pa.shape)}/{tuple(pb.shape)}")
+            pa.copy_(na.double()); pb.copy_(nb.double())
+            swapped.append((on, onb, E))
+    rec["factor_swapped"] = [(rename[a], E) for a, _, E in swapped]
     # Pin each wrapper's scaling to the arm's (alpha / r, rslora or a pattern the oracle config dropped).
     arm_scale = {}
     for n, w in arm_w.items():
@@ -286,7 +335,10 @@ def oracle():
     out = model(input_ids = ids, labels = ids)
     active[0] = False
     out.loss.backward()
-    grads = {rename[n]: p.grad.detach().double().clone() for n, p in model.named_parameters() if p.requires_grad and p.grad is not None}
+    raw = {n: p.grad.detach().double().clone() for n, p in model.named_parameters() if p.requires_grad and p.grad is not None}
+    for a, b, E in swapped:  # the swap is its own inverse: map the oracle grads back to the arm's factors
+        raw[a], raw[b] = swap_factors(raw[a], raw[b], E)
+    grads = {rename[n]: g for n, g in raw.items()}
     torch.save({"grads": grads, "families": fams, "loss": float(out.loss), "acts": acts}, args.oracle)
     rec.update(loss = float(out.loss), n_grads = len(grads), families = sorted(set(fams.values())), acts_keys = sorted(acts),
                renamed = sum(1 for k, v in rename.items() if k != v),
