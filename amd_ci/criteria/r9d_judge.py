@@ -65,6 +65,14 @@ def gates(h: dict, items: list) -> list:
                     ", ".join(f"{r['layout']}:{(r.get('weights') or [[0, 0, 0]])[0][2]}" for r in ok[:4])))
         gem = all((v.get("share") or {}).get("gemm", 0) > 0 for r in ok for v in (r.get("shapes") or {}).values())
         out.append(("c62 engagement: GEMM kernels in every arm's profile", bool(ok) and gem, ""))
+    if "bufops" in items:
+        b = h.get("bufops") or {}
+        ok = [r for r in b.get("arms") or [] if r.get("verdict") == "ok" and len(r.get("renders") or []) >= 2]
+        out.append(("bufops render arms ok (12 processes)", len(ok) >= 10, f"{len(ok)} of {len(b.get('arms') or [])}: "
+                    + "; ".join(str(r.get("error"))[-150:] for r in b.get("arms") or [] if r.get("verdict") != "ok")))
+        eng = [r for r in ok if (r.get("isa") or {}).get("amdgcn_files")]
+        out.append(("bufops engagement: compiled ISA present in every arm's fresh Triton cache", len(eng) == len(ok) and bool(ok),
+                    f"{len(eng)} of {len(ok)}"))
     if "c66" in items:
         c = h.get("c66") or {}
         ran = bool(c.get("not_run")) or len(_ok(c.get("arms"))) >= 6
@@ -130,6 +138,7 @@ def table(h: dict) -> list:
         L.append(f"VERDICT C6-2 transposed_problem: {'PASS ' + str(clean) if clean else 'KILL (' + '; '.join(reasons) + ')'}")
     else:
         L.append("VERDICT C6-2 transposed_problem: NOT MEASURED (no ok arm)")
+    L.extend(_bufops_table(h.get("bufops") or {}))
     c = h.get("c66") or {}
     if c:
         L.append(f"C6-6 glue share by shape (contig arms, inductor+aten glue+copy) {c.get('glue_by_shape')}")
@@ -164,3 +173,49 @@ def table(h: dict) -> list:
             L.append("VERDICT C6-6 flags: " + ("PASS " + str(best) if best and best[0] >= GAIN else
                                                f"KILL (best flag gain {_f(best and best[0] * 100, 1)}% under 5%)"))
     return L
+
+
+BUF_GAIN = 0.02
+
+
+def _bufops_table(b: dict) -> list:
+    if not b:
+        return []
+    L = [f"bufops Triton default {b.get('default')}"]
+    ok = [r for r in b.get("arms") or [] if r.get("verdict") == "ok" and len(r.get("renders") or []) >= 2]
+    if not ok:
+        return L + ["VERDICT bufops render: NOT MEASURED (no ok arm)"]
+    per = {"A": [], "B": []}
+    sps = {"A": [], "B": []}
+    md5 = {"A": set(), "B": set()}
+    for r in ok:
+        x = r["renders"][-1]
+        per[r["arm"]].append(x.get("wall_s"))
+        sps[r["arm"]].append(x.get("s_per_step"))
+        md5[r["arm"]].add(x.get("md5"))
+        isa = r.get("isa") or {}
+        L.append(f"  {r['i']} {r['arm']} render1 {_f(x.get('wall_s'), 2)} s, {_f(x.get('s_per_step'), 4)} s/step, md5 "
+                 f"{str(x.get('md5'))[:12]}, quant {(r.get('status') or {}).get('transformer_quant')}, rdna_mm "
+                 f"{x.get('rdna_mm')}; ISA files {isa.get('amdgcn_files')} buffer_load {isa.get('buffer_load')} "
+                 f"buffer_store {isa.get('buffer_store')} global_load {isa.get('global_load')}")
+    a, bb = _med(per["A"]), _med(per["B"])
+    al = [x for x in per["A"] if x]
+    aa = (max(al) - min(al)) / st.median(al) if len(al) >= 2 else None
+    gain = a / bb - 1 if a and bb else None
+    bl_a = _med([(r.get("isa") or {}).get("buffer_load") for r in ok if r["arm"] == "A"])
+    bl_b = _med([(r.get("isa") or {}).get("buffer_load") for r in ok if r["arm"] == "B"])
+    engaged = bl_b is not None and bl_a is not None and bl_b > bl_a
+    same = md5["A"] == md5["B"] and len(md5["A"]) == 1
+    L.append(f"bufops render1 wall median A(=0) {_f(a, 2)} s {per['A']} vs B(=1) {_f(bb, 2)} s {per['B']}: gain "
+             f"{_f(None if gain is None else gain * 100, 2)}%; A/A spread {_f(aa)}; s/step A {_f(_med(sps['A']), 4)} B "
+             f"{_f(_med(sps['B']), 4)}; md5 A {sorted(m[:12] for m in md5['A'] if m)} B {sorted(m[:12] for m in md5['B'] if m)}; "
+             f"ISA buffer_load median A {bl_a} B {bl_b} (engaged {engaged})")
+    if not engaged:
+        v = "NOT PROVEN (B compiled no more buffer_load than A: the variable did not change codegen)"
+    elif not same:
+        v = "KILL (md5 changed between A and B, or within an arm)"
+    elif gain is None or gain < max(BUF_GAIN, aa or 0):
+        v = f"KILL (render gain {_f(None if gain is None else gain * 100, 2)}% under 2% or inside A/A)"
+    else:
+        v = f"PASS ({gain * 100:.2f}% render, md5 identical)"
+    return L + [f"VERDICT bufops render: {v}"]

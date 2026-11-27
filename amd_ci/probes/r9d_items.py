@@ -9,12 +9,19 @@ running probes/r9d/block_arm.py: a torch.compile'd diffusers WanTransformerBlock
   c66    C6-6: glue share from the c62 contig arms; ONLY if glue >= 10% (either shape): Inductor flags cdt
          (coordinate_descent_tuning) / mag (max_autotune_gemm) / maxat (max_autotune + cdt), processes
          cdt mag maxat A maxat mag cdt.
+  bufops AMDGCN_USE_BUFFER_OPS render gate: Qwen-Image-2.1 at Studio defaults (INT8 on gfx1151) 1024^2, default
+         steps, =0 (A) vs =1 (B), processes ABBA x3, each 1 warm-up + 1 measured render; fresh TRITON_CACHE_DIR per
+         process (Inductor's cache ignores the variable); engagement = buffer_load / buffer_store counts in that
+         process's compiled .amdgcn; Triton's own default recorded first.
 """
 from __future__ import annotations
 
 from pathlib import Path
 
-from r9d_common import R9, run_code, run_py
+import json
+import shutil
+
+from r9d_common import R9, e2e, prefetch, run_code, run_py
 
 GLUE_GATE = 0.10
 
@@ -99,4 +106,51 @@ def item_c66(ctx, obs):
         ctx["save"]()
 
 
-ITEMS = {"smoke": item_smoke, "c62": item_c62, "c66": item_c66}
+QWEN = "unsloth/Qwen-Image-2.1"
+BUFOPS_DEFAULT = r"""
+import json, os, triton
+out = {"triton": triton.__version__, "env": os.environ.get("AMDGCN_USE_BUFFER_OPS")}
+try:
+    out["knob_default"] = bool(triton.knobs.amd.use_buffer_ops)
+except Exception as exc:
+    out["knob_error"] = repr(exc)
+print("R9JSON " + json.dumps(out), flush = True)
+"""
+
+
+def _isa_counts(d: Path) -> dict:
+    c = {"amdgcn_files": 0, "buffer_load": 0, "buffer_store": 0, "global_load": 0, "global_store": 0}
+    for p in d.rglob("*.amdgcn"):
+        c["amdgcn_files"] += 1
+        t = p.read_text(encoding = "utf-8", errors = "replace")
+        for k in ("buffer_load", "buffer_store", "global_load", "global_store"):
+            c[k] += t.count(k)
+    return c
+
+
+def item_bufops(ctx, obs):
+    res: dict = {"arms": []}
+    obs["bufops"] = res
+    res["default"] = run_code(ctx, BUFOPS_DEFAULT, [], timeout = 300, tag = "bufops_default",
+                              extra_env = {"AMDGCN_USE_BUFFER_OPS": None})
+    res["prefetch"] = prefetch(ctx, QWEN)
+    ctx["save"]()
+    for i, arm in enumerate("ABBAABBAABBA"):
+        tag = f"bufops_{i}_{arm}"
+        tdir = Path(ctx["scratch"]) / f"tri_{tag}"
+        shutil.rmtree(tdir, ignore_errors = True)
+        r = e2e(ctx, ctx["main_backend"], QWEN, tag, ["--renders", "2", "--gen", json.dumps({"width": 1024, "height": 1024})],
+                extra_env = {"AMDGCN_USE_BUFFER_OPS": "1" if arm == "B" else "0", "TRITON_CACHE_DIR": str(tdir)})
+        keep = {k: r.get(k) for k in ("verdict", "error", "load_s", "rc", "wall_s")}
+        keep["renders"] = [{k: x.get(k) for k in ("r", "wall_s", "s_per_step", "md5", "rdna_mm", "transformer_quant",
+                                                  "speed_optims")} for x in r.get("renders") or []]
+        st_ = r.get("status") or {}
+        keep["status"] = {k: st_.get(k) for k in ("transformer_quant", "transformer_quant_backend", "speed_mode",
+                                                  "attention_backend")}
+        keep.update(arm = arm, i = i, isa = _isa_counts(tdir))
+        shutil.rmtree(tdir, ignore_errors = True)
+        res["arms"].append(keep)
+        ctx["save"]()
+
+
+ITEMS = {"smoke": item_smoke, "c62": item_c62, "c66": item_c66, "bufops": item_bufops}

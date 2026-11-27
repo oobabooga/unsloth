@@ -11,7 +11,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-TITLE = "gfx1151 round 9d: C6-2 transposed_problem / C6-6 Inductor glue + flags (compiled Wan 5B block)"
+TITLE = "gfx1151 round 9d: C6-2 transposed_problem / C6-6 Inductor glue + flags / AMDGCN_USE_BUFFER_OPS render (compiled Wan 5B block)"
 MODE = "regression"
 NEEDS = ["gpu", "rocm", "exclusive_gpu"]
 JUDGES = ("r9d_judge",)
@@ -53,7 +53,7 @@ def gates(obs: dict) -> list:
 
 
 def _needed_mods(items):
-    return ["r9d_items"] if set(items) & {"smoke", "c62", "c66"} else []
+    return ["r9d_items"] if set(items) & {"smoke", "c62", "c66", "bufops"} else []
 
 
 def head_is_worse(base: dict, head: dict) -> tuple:
