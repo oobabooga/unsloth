@@ -759,6 +759,25 @@ def _main_gguf_files(path: Path, *, include_symlinks: bool = False) -> list[Path
     ]
 
 
+def _quant_folder_gguf_files(snapshot: Path, files: list[Path]) -> list[Path]:
+    """Main GGUFs one folder below an HF snapshot, where big repos keep each quant (UD-Q2_K_XL/, distilled/)."""
+    from core.inference.diffusion_lora import is_image_lora_file
+
+    found = []
+    for path in files:
+        try:
+            relative = path.relative_to(snapshot)
+        except ValueError:
+            continue
+        if (
+            len(relative.parts) == 2
+            and _is_main_gguf_filename(relative.as_posix())
+            and not is_image_lora_file(path)
+        ):
+            found.append(path)
+    return found
+
+
 def _format_label(model_format: ModelFormat) -> str:
     if model_format == "gguf":
         return "GGUF"
@@ -897,6 +916,14 @@ def _classify_local_path(
     partial: bool = False,
     active_cache: Optional[bool] = None,
 ) -> list[LocalModelInfo]:
+    # A loose mmproj, MTP drafter or imatrix pairs with weights; it is not a model of its own.
+    if (
+        _is_gguf_filename(scan_path.name)
+        and not _is_main_gguf_filename(scan_path.name)
+        and scan_path.is_file()
+    ):
+        return []
+
     load_path = load_path or scan_path
     files = (
         _iter_hf_cache_model_files(scan_path)
@@ -913,6 +940,8 @@ def _classify_local_path(
         scan_path,
         include_symlinks = include_broken_snapshot_symlinks,
     )
+    if not gguf_files and source == "hf_cache" and scan_path.is_dir():
+        gguf_files = _quant_folder_gguf_files(scan_path, files)
     if gguf_files:
         gguf_size_bytes = _sum_file_sizes(gguf_files)
         variant = (
