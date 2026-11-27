@@ -134,9 +134,17 @@ def main() -> int:
                 F = torch.nn.functional
                 sdpa = F.scaled_dot_product_attention
 
-                def chunked(q, k, v, *args, **kw):  # fp32 math SDPA over all queries at once does not fit
-                    return torch.cat([sdpa(q[..., i:i + 512, :], k, v, *args, **kw)
-                                      for i in range(0, q.shape[-2], 512)], dim = -2)
+                def chunked(*args, **kw):  # fp32 math SDPA over all queries at once does not fit
+                    args = list(args)
+                    q = args.pop(0) if args else kw.pop("query")
+                    k = args.pop(0) if args else kw.pop("key")
+                    v = args.pop(0) if args else kw.pop("value")
+                    m = args.pop(0) if args else kw.pop("attn_mask", None)
+                    outs = []
+                    for i in range(0, q.shape[-2], 512):
+                        mi = m[..., i:i + 512, :] if m is not None and m.dim() >= 2 and m.shape[-2] == q.shape[-2] else m
+                        outs.append(sdpa(q[..., i:i + 512, :], k, v, mi, *args, **kw))
+                    return torch.cat(outs, dim = -2)
                 F.scaled_dot_product_attention = chunked
                 with torch.no_grad():
                     r32 = b32(hs.to(dev), enc.to(dev), temb.to(dev),
