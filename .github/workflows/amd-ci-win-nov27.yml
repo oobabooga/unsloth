@@ -115,9 +115,16 @@ jobs:
         run: |
           $ErrorActionPreference = "Continue"
           foreach ($n in @("19936", "19873")) {
-            & $env:AMD_CI_PY "$env:GITHUB_WORKSPACE\amd_ci\lib\states.py" `
-              --repo "$env:UPSTREAM" --pr $n `
-              --root "$env:AMD_CI_WORK\p$n" --out "$env:AMD_CI_WORK\out\states_$n.json"
+            # GitHub fetches from these boxes have failed transiently ("Empty reply from server"): retry, fresh root each time
+            for ($try = 1; $try -le 4; $try++) {
+              Remove-Item -Recurse -Force -ErrorAction SilentlyContinue "$env:AMD_CI_WORK\p$n"
+              & $env:AMD_CI_PY "$env:GITHUB_WORKSPACE\amd_ci\lib\states.py" `
+                --repo "$env:UPSTREAM" --pr $n `
+                --root "$env:AMD_CI_WORK\p$n" --out "$env:AMD_CI_WORK\out\states_$n.json"
+              if ($LASTEXITCODE -eq 0) { break }
+              Write-Host "states for PR $n failed (attempt $try), retrying in 30 s"
+              Start-Sleep -Seconds 30
+            }
             if ($LASTEXITCODE -ne 0) { Write-Host "FATAL: states for PR $n"; exit $LASTEXITCODE }
             Get-Content "$env:AMD_CI_WORK\out\states_$n.json" -Raw -Encoding UTF8 | Write-Host
           }
