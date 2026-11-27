@@ -131,9 +131,17 @@ def main() -> int:
             refp = ref_dir / f"ref32_{a.dims}_{sh}.pt"
             if not refp.is_file():  # fp32 eager reference, written once (first arm), same seeds in every arm
                 b32 = block.to(dev, torch.float32)
+                F = torch.nn.functional
+                sdpa = F.scaled_dot_product_attention
+
+                def chunked(q, k, v, *args, **kw):  # fp32 math SDPA over all queries at once does not fit
+                    return torch.cat([sdpa(q[..., i:i + 512, :], k, v, *args, **kw)
+                                      for i in range(0, q.shape[-2], 512)], dim = -2)
+                F.scaled_dot_product_attention = chunked
                 with torch.no_grad():
                     r32 = b32(hs.to(dev), enc.to(dev), temb.to(dev),
                               tuple(t.to(dev) for t in rot) if isinstance(rot, tuple) else rot.to(dev))
+                F.scaled_dot_product_attention = sdpa
                 torch.save(r32.float().cpu(), refp)
                 del r32
                 rec["wrote_ref"] = True
