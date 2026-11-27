@@ -40,7 +40,7 @@ env:
   PR: "2864"
   UPSTREAM: "https://github.com/unslothai/unsloth-zoo"
   # Set to "1" for a PR already merged: compares the merge commit to its parent.
-  AMD1_BASE_OVERRIDE: "63b2d61346c6bafcd5a2d9a8ab826e96c63cf8bc"
+  AMD1_BASE_OVERRIDE: "63b2d61342221cec6b16f0d7f87f7432975aa6fe"
   AMD1_HEAD_OVERRIDE: "63453c8a71815dadb7bae85e4715480969bcd8f7"
   MERGED: "0"
   # Set by scaffold.py --patch: base = PATCH_BASE, head = PATCH_BASE plus this diff (relative to the checkout).
