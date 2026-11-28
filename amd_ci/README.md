@@ -396,3 +396,4 @@ Covers the VOID rule, the added-tests-are-not-a-regression rule, absent-test
 handling, that the lint rules fire on the shapes that caused real failures, and
 that Windows is reachable while Docker on Windows is still declared a gap. Run it
 before trusting a change to the toolkit itself.
+# rerun Sat Nov 28 02:22:24 PST 2026
