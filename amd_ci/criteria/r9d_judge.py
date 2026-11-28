@@ -65,6 +65,8 @@ def gates(h: dict, items: list) -> list:
                     ", ".join(f"{r['layout']}:{(r.get('weights') or [[0, 0, 0]])[0][2]}" for r in ok[:4])))
         gem = all((v.get("share") or {}).get("gemm", 0) > 0 for r in ok for v in (r.get("shapes") or {}).values())
         out.append(("c62 engagement: GEMM kernels in every arm's profile", bool(ok) and gem, ""))
+        att = all((v.get("share") or {}).get("attention", 0) > 0 for r in ok for v in (r.get("shapes") or {}).values())
+        out.append(("c62 engagement: fused attention kernel (not math SDPA) in every arm's profile", bool(ok) and att, ""))
     if "bufops" in items:
         b = h.get("bufops") or {}
         ok = [r for r in b.get("arms") or [] if r.get("verdict") == "ok" and len(r.get("renders") or []) >= 2]

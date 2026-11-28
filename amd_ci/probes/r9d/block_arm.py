@@ -23,10 +23,15 @@ import time
 import traceback
 from pathlib import Path
 
+# As Studio (core/inference/__init__.py): AOTriton flash SDPA on gfx1151 needs this, else SDPA falls back to math
+os.environ.setdefault("TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL", "1")
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+
 DIMS = {"wan5b": dict(dim = 3072, ffn = 14336, heads = 24, in_ch = 48, text = 512),
         "tiny": dict(dim = 1024, ffn = 2048, heads = 8, in_ch = 16, text = 64)}
-# latent (frames, h, w) after the Wan 2.2 VAE (4x16x16); patch (1, 2, 2)
-SHAPES = {"s480": (13, 30, 52), "s704": (13, 44, 80), "tiny": (2, 8, 8)}
+# token grid (frames, h, w) after the Wan 2.2 VAE (4x16x16) and patch (1, 2, 2): 832x480x49 -> 13x15x26 = 5070,
+# 1280x704x49 -> 13x22x40 = 11440
+SHAPES = {"s480": (13, 15, 26), "s704": (13, 22, 40), "tiny": (2, 8, 8)}
 
 
 def classify(name: str) -> str:
@@ -91,7 +96,8 @@ def main() -> int:
         import torch._inductor.config as ic
         from diffusers.models.transformers.transformer_wan import WanRotaryPosEmbed, WanTransformerBlock
         import diffusers
-        rec["env"] = {"torch": torch.__version__, "hip": getattr(torch.version, "hip", None),
+        rec["env"] = {"aotriton_experimental": os.environ.get("TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL"),
+                      "torch": torch.__version__, "hip": getattr(torch.version, "hip", None),
                       "diffusers": diffusers.__version__,
                       "arch": getattr(torch.cuda.get_device_properties(0), "gcnArchName", None)}
         if a.flags in ("cdt", "maxat"):
