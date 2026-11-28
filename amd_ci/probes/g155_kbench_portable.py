@@ -51,6 +51,13 @@ except Exception as e:  # noqa
     PREFETCH_PATCH = f"failed: {e}"
 
 
+@triton.jit
+def _rint(x):
+    # HIP libdevice has no rint in every Triton build: round half away from zero (timing probe only;
+    # codes may differ from rint at exact ties)
+    return tl.where(x >= 0, tl.floor(x + 0.5), tl.ceil(x - 0.5))
+
+
 @triton.jit(do_not_specialize = ["M"])
 def mm_kernel(a_ptr, b_ptr, as_ptr, bs_ptr, d_ptr, c_ptr, M, N, K, stride_d,
               HAS_D: tl.constexpr, BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
@@ -180,7 +187,7 @@ def rotq2_kernel(x_ptr, h_ptr, q_ptr, s_ptr, M, K, stride_x, G: tl.constexpr, IN
     for k0 in range(0, K, G):
         x = tl.load(x_ptr + rows[:, None] * stride_x + (k0 + g)[None, :], mask = rmask[:, None], other = 0.0)
         xr = tl.dot(x, H)
-        y = libdevice.rint(xr * mul[:, None])
+        y = _rint(xr * mul[:, None])
         y = tl.minimum(tl.maximum(y, -127.0), 127.0)
         tl.store(q_ptr + rows[:, None] * K + (k0 + g)[None, :], y.to(tl.int8), mask = rmask[:, None])
     tl.store(s_ptr + rows, tl.where(nans > 0, float("nan"), amax * INV_SCALE), mask = rmask)
@@ -202,7 +209,7 @@ def rotq1_kernel(x_ptr, h_ptr, q_ptr, s_ptr, M, K, stride_x, G: tl.constexpr, IN
     xr = tl.reshape(tl.dot(tl.reshape(x, (ROWS * NB, G)), H), (ROWS, NB * G))
     amax = tl.maximum(tl.max(tl.abs(xr), axis = 1), 1e-30)
     nans = tl.sum((xr != xr).to(tl.int32), axis = 1)
-    y = libdevice.rint(xr * (127.0 / amax)[:, None])
+    y = _rint(xr * (127.0 / amax)[:, None])
     y = tl.minimum(tl.maximum(y, -127.0), 127.0).to(tl.int8)
     y3 = tl.reshape(y, (ROWS, NB, G))
     qoffs = rows[:, None, None] * K + (b[None, :, None] * G + g[None, None, :])
@@ -229,7 +236,7 @@ def rowq2_kernel(x_ptr, c_ptr, q_ptr, s_ptr, N, stride_x, BLOCK: tl.constexpr):
         mask = n0 + offs < N
         x = tl.load(x_ptr + row * stride_x + n0 + offs, mask = mask, other = 0.0).to(tl.float32)
         c = tl.load(c_ptr + n0 + offs, mask = mask, other = 0.0)
-        y = libdevice.rint(x * c * mul)
+        y = _rint(x * c * mul)
         y = tl.minimum(tl.maximum(y, -127.0), 127.0)
         tl.store(q_ptr + row * N + n0 + offs, y.to(tl.int8), mask = mask)
     tl.store(s_ptr + row, tl.where(tl.sum(nans, axis = 0) > 0, float("nan"), rmax / 127.0))
@@ -245,7 +252,7 @@ def rowq1_kernel(x_ptr, c_ptr, q_ptr, s_ptr, M, N, stride_x, ROWS: tl.constexpr,
     xc = x * c[None, :]
     rmax = tl.maximum(tl.max(tl.abs(xc), axis = 1), 1e-30)
     nans = tl.sum((xc != xc).to(tl.int32), axis = 1)
-    y = libdevice.rint(xc * (127.0 / rmax)[:, None])
+    y = _rint(xc * (127.0 / rmax)[:, None])
     y = tl.minimum(tl.maximum(y, -127.0), 127.0)
     tl.store(q_ptr + rows[:, None] * N + offs[None, :], y.to(tl.int8), mask = mask)
     tl.store(s_ptr + rows, tl.where(nans > 0, float("nan"), rmax / 127.0), mask = rows < M)
