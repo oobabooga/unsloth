@@ -1,0 +1,3153 @@
+From 71a336dc026ed7d3431e13ea5e8d279075a852e1 Mon Sep 17 00:00:00 2001
+From: Daniel Han <danielhanchen@gmail.com>
+Date: Fri, 27 Nov 2026 21:35:37 -0800
+Subject: [PATCH] Studio ROCm: route the FLUX.2 VAE decoder's measured conv
+ shapes to a vendored Triton conv2d on gfx1151
+
+Per-shape router (C_in, C_out, kernel, plane bucket, bf16) over the 1x1 and
+channel-blocked 3x3 conv2d kernels vendored from ROCm/aiter 6aa39366b7 (MIT).
+MIOpen keeps every other call. Variants are built in a background child
+(meta-device trace of the default 1024^2 decode at load, cold shapes after a
+decode goes quiet), so no decode compiles inline. Linux gfx1151 by default;
+UNSLOTH_DIFFUSION_ROCM_TRITON_CONV2D=0 is the kill switch, =1 opts other gfx11
+archs and Windows in. Engagement counters in the image status.
+---
+ studio/backend/core/inference/diffusion.py    |  32 +
+ .../inference/diffusion_rocm_triton_conv2d.py | 809 ++++++++++++++++++
+ .../core/inference/diffusion_vae_prebuild.py  |   8 +
+ .../inference/rocm_triton_conv2d/__init__.py  |  33 +
+ .../inference/rocm_triton_conv2d/_config.py   | 753 ++++++++++++++++
+ .../rocm_triton_conv2d/_kernel_repr.py        |  86 ++
+ .../inference/rocm_triton_conv2d/conv2d.py    | 288 +++++++
+ .../inference/rocm_triton_conv2d/conv_1x1.py  | 189 ++++
+ .../rocm_triton_conv2d/conv_3x3_cblocked.py   | 190 ++++
+ .../rocm_triton_conv2d/ncx_to_cblocked.py     |  81 ++
+ .../test_diffusion_rocm_triton_conv2d.py      | 541 ++++++++++++
+ 11 files changed, 3010 insertions(+)
+ create mode 100644 studio/backend/core/inference/diffusion_rocm_triton_conv2d.py
+ create mode 100644 studio/backend/core/inference/rocm_triton_conv2d/__init__.py
+ create mode 100644 studio/backend/core/inference/rocm_triton_conv2d/_config.py
+ create mode 100644 studio/backend/core/inference/rocm_triton_conv2d/_kernel_repr.py
+ create mode 100644 studio/backend/core/inference/rocm_triton_conv2d/conv2d.py
+ create mode 100644 studio/backend/core/inference/rocm_triton_conv2d/conv_1x1.py
+ create mode 100644 studio/backend/core/inference/rocm_triton_conv2d/conv_3x3_cblocked.py
+ create mode 100644 studio/backend/core/inference/rocm_triton_conv2d/ncx_to_cblocked.py
+ create mode 100644 studio/backend/tests/test_diffusion_rocm_triton_conv2d.py
+
+diff --git a/studio/backend/core/inference/diffusion.py b/studio/backend/core/inference/diffusion.py
+index adca89271b..f7c879b2cb 100644
+--- a/studio/backend/core/inference/diffusion.py
++++ b/studio/backend/core/inference/diffusion.py
+@@ -1122,6 +1122,18 @@ def _record_fbcache_engagement(pipe: Any) -> None:
+         logger.debug("diffusion.engagement: not recorded (%s)", exc)
+ 
+ 
++def _rocm_triton_conv2d_status(pipe: Any) -> dict:
++    """``rocm_triton_conv2d`` engagement counters, present only when the router wrapped this pipe's VAE (gfx1151)."""
++    router = sys.modules.get(f"{__package__}.diffusion_rocm_triton_conv2d")
++    if router is None:
++        return {}
++    try:
++        stats = router.status(getattr(pipe, "vae", None))
++    except Exception:  # noqa: BLE001 - status is best effort
++        return {}
++    return {} if stats is None else {"rocm_triton_conv2d": stats}
++
++
+ def _render_engagement(pipe: Any) -> Optional[dict]:
+     try:
+         record = _RENDER_ENGAGEMENT.get(pipe) if pipe is not None else None
+@@ -13031,6 +13043,18 @@ class DiffusionBackend:
+                         logger.warning(
+                             "diffusion.vae: non-finite decode retry not installed: %s", exc
+                         )
++                    # ROCm gfx1151: measured VAE conv shapes on the vendored Triton conv2d; an explicit `off` keeps MIOpen.
++                    rocm_conv2d = 0
++                    if getattr(target, "backend", None) == "rocm" and (
++                        speed_mode is None or effective_speed != SPEED_OFF
++                    ):
++                        try:
++                            from . import diffusion_rocm_triton_conv2d
++                            rocm_conv2d = diffusion_rocm_triton_conv2d.install(
++                                getattr(pipe, "vae", None), logger
++                            )
++                        except Exception as exc:  # noqa: BLE001 - optimisation only, MIOpen stays
++                            logger.warning("diffusion.rocm_triton_conv2d: not installed: %s", exc)
+                     # diffusion_autoopt speed layer: plan, hooks, primitive, per-step audit.
+                     speed_applied = autoopt.run_speed_layer(
+                         pipe,
+@@ -13059,6 +13083,8 @@ class DiffusionBackend:
+                     )
+                     if vae_fp16:
+                         speed_applied["vae_fp16_decode"] = True
++                    if rocm_conv2d:
++                        speed_applied["rocm_triton_conv2d"] = True
+                     # After the speed layer, so it wraps the fused / single-frame _decode the layer installed.
+                     try:
+                         from .diffusion_vae_oom import install as install_vae_oom_retry
+@@ -13678,6 +13704,11 @@ class DiffusionBackend:
+                     try:
+                         from . import diffusion_vae_prebuild
+                         diffusion_vae_prebuild.maybe_kick(pipe, compile_ctx, logger)
++                        if rocm_conv2d:
++                            from . import diffusion_rocm_triton_conv2d
++                            diffusion_rocm_triton_conv2d.prebuild(
++                                getattr(pipe, "vae", None), logger
++                            )
+                     except Exception:  # noqa: BLE001 - a prebuild, never a failed load
+                         pass
+                 except BaseException as exc:
+@@ -19096,6 +19127,7 @@ class DiffusionBackend:
+                 model_kind = state.kind,
+                 transformer_quant = state.transformer_quant,
+             ),
++            **_rocm_triton_conv2d_status(state.pipe),
+         }
+ 
+ 
+diff --git a/studio/backend/core/inference/diffusion_rocm_triton_conv2d.py b/studio/backend/core/inference/diffusion_rocm_triton_conv2d.py
+new file mode 100644
+index 0000000000..3625c86197
+--- /dev/null
++++ b/studio/backend/core/inference/diffusion_rocm_triton_conv2d.py
+@@ -0,0 +1,809 @@
++# SPDX-License-Identifier: AGPL-3.0-only
++# Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
++
++"""ROCm gfx1151: route the FLUX.2 / FLUX.3 VAE decoder's measured-winning ``nn.Conv2d`` shapes through the Triton
++conv2d vendored from ROCm/aiter (``rocm_triton_conv2d``) instead of MIOpen.
++
++gfx1151 Linux, klein VAE decode at 1024^2 (bf16, real weights): 1.025 -> 0.608 s, 60.0 dB vs MIOpen; per-conv error vs
++fp32 is 0.66-0.71x MIOpen's. The win is per shape: 3x3 convs with >= 128 input channels on planes of 128^2 and up win
++(1.23-1.89x), as do the two large-plane 1x1 shortcuts (1.18x / 1.19x); the 32-channel ``conv_in`` (0.71x) and
++``post_quant_conv`` (0.81x) lose, so only ``SHAPE_TABLE`` entries route and every other call stays on MIOpen.
++``Conv2d._conv_forward`` is wrapped per instance; OOM / torch._dynamo errors are re-raised, a shape that failed once
++is not retried.
++
++``UNSLOTH_DIFFUSION_ROCM_TRITON_CONV2D``: ``0`` off (MIOpen, byte-identical), ``1`` on for any gfx11 arch, OS and 2D
++VAE class (still only table shapes), unset = ``DEFAULT_ON_ARCHES`` x ``DEFAULT_ON_VAES`` x ``DEFAULT_ON_PLATFORMS``
++(Windows is off until measured there). Image loads with an explicit speed mode ``off`` never install it.
++
++The kernels take H / W / channels as ``tl.constexpr`` (upstream design), so every (layer, plane) is its own compiled
++variant (about 0.6 s each). No decode compiles inline: a call whose variant is not listed in the manifest beside the
++Triton cache stays on MIOpen (``fallback_cold``). ``prebuild`` (from the image load) traces the decoder on the meta
++device at the default 1024^2 latent and compiles those variants in a child process on zeros; a variant first seen
++during a decode (another resolution) is built by a child after the decode goes quiet.
++``UNSLOTH_DIFFUSION_ROCM_TRITON_CONV2D_PREBUILD=0`` (or ``UNSLOTH_DIFFUSION_VAE_PREBUILD=0``) compiles inline instead.
++"""
++
++from __future__ import annotations
++
++import os
++import sys
++import threading
++import time
++from typing import Any, Optional
++
++from . import diffusion_rocm_triton_conv3d as _c3
++
++ENABLE_ENV = "UNSLOTH_DIFFUSION_ROCM_TRITON_CONV2D"
++SELFCHECK_ENV = "UNSLOTH_DIFFUSION_ROCM_TRITON_CONV2D_SELFCHECK"
++PREBUILD_ENV = "UNSLOTH_DIFFUSION_ROCM_TRITON_CONV2D_PREBUILD"
++# Same bound as the conv3d router: bf16 output rounding alone is ~1e-3 rel L2; a broken tile or mask is O(1).
++SELFCHECK_REL_L2 = 1e-2
++DEFAULT_ON_ARCHES: tuple = ("gfx1151",)
++DEFAULT_ON_VAES: tuple = ("AutoencoderKLFlux2",)
++# Windows (triton-windows) is unmeasured: off unless the env forces it on.
++DEFAULT_ON_PLATFORMS: tuple = ("linux",)
++# Measured routes (gfx1151, bf16, N = 1, stride 1, padding k // 2, dilation 1, contiguous NCHW):
++# (C_in, C_out, kernel) -> (min, max) output plane pixels. max = the largest plane measured for that layer, min = a
++# quarter of the smallest (floored at 128^2, below which 3x3 / 1x1 wins were not shown).
++SHAPE_TABLE: dict = {
++    (512, 512, 3): (16384, 262144),  # 1.38x at 128^2, 1.39x at 256^2, 1.30x at 512^2
++    (512, 256, 3): (65536, 262144),  # 1.48x at 512^2
++    (256, 256, 3): (65536, 1048576),  # 1.51x at 512^2, 1.44x at 1024^2
++    (256, 128, 3): (262144, 1048576),  # 1.44x at 1024^2
++    (128, 128, 3): (262144, 1048576),  # 1.89x at 1024^2
++    (128, 3, 3): (262144, 1048576),  # 1.23x at 1024^2
++    (512, 256, 1): (65536, 262144),  # 1.19x at 512^2
++    (256, 128, 1): (262144, 1048576),  # 1.18x at 1024^2
++}
++ROUTE_DTYPES: tuple = ("bfloat16",)
++# Decoder latent side the load prebuilds for: Studio's default 1024^2 output.
++PREBUILD_OUTPUT_SIDE = 1024
++MEM_MARGIN_BYTES = 512 << 20
++MEM_MARGIN_FRACTION = 0.03
++MEM_CHECK_MIN_BYTES = 64 << 20
++_INT32_MAX = 2**31 - 1
++_BLOCK = 64
++
++COUNTS = {
++    "routed": 0,
++    "skipped_table": 0,
++    "fallback_layout": 0,
++    "fallback_memory": 0,
++    "fallback_cold": 0,
++    "fallback_error": 0,
++}
++_TRUE = ("1", "true", "yes", "on")
++_FALSE = ("0", "false", "no", "off")
++_LOCK = threading.Lock()
++_STATE: dict = {}
++_FAILED: set = set()
++_DEVICE_OK: dict = {}
++_READY: set = set()
++_PENDING: dict = {}
++_ATTEMPTS: dict = {}
++_PB: dict = {}
++_PB_LOCK = threading.RLock()
++KICK_DEBOUNCE_S = 3.0
++MANIFEST_POLL_S = 1.0
++MAX_ATTEMPTS = 2
++# The child's HIP context plus the largest 1024^2 operand set (a 256-channel 1024^2 input, its NCHWc pack, output).
++PREBUILD_MIN_FREE = 3 << 30
++PREBUILD_TIMEOUT_S = 900.0
++
++
++def reset_counts() -> None:
++    for k in COUNTS:
++        COUNTS[k] = 0
++
++
++def counts() -> dict:
++    return dict(COUNTS)
++
++
++def _env_mode() -> Optional[bool]:
++    raw = (os.environ.get(ENABLE_ENV) or "").strip().lower()
++    if raw in _TRUE:
++        return True
++    if raw in _FALSE:
++        return False
++    return None
++
++
++def arch_enabled(arch: str) -> bool:
++    arch = (arch or "").split(":")[0].strip().lower()
++    if not arch.startswith("gfx11"):
++        return False
++    mode = _env_mode()
++    if mode is None:
++        return arch in DEFAULT_ON_ARCHES and sys.platform in DEFAULT_ON_PLATFORMS
++    return mode
++
++
++def requested() -> bool:
++    mode = _env_mode()
++    if mode is None:
++        return bool(DEFAULT_ON_ARCHES) and sys.platform in DEFAULT_ON_PLATFORMS
++    return mode
++
++
++def route_for(x_shape, w_shape, stride, padding, dilation, dtype_name: str) -> Optional[str]:
++    """``"1x1"`` / ``"3x3"`` when the call is a measured-winning shape, else None (MIOpen)."""
++    if dtype_name not in ROUTE_DTYPES or len(x_shape) != 4 or len(w_shape) != 4:
++        return None
++    N, C, H, W = (int(v) for v in x_shape)
++    K, Cw, R, S = (int(v) for v in w_shape)
++    if N != 1 or Cw != C or R != S or R not in (1, 3):
++        return None
++    if tuple(stride) != (1, 1) or tuple(dilation) != (1, 1) or tuple(padding) != (R // 2, R // 2):
++        return None
++    bucket = SHAPE_TABLE.get((C, K, R))
++    if bucket is None or not (bucket[0] <= H * W <= bucket[1]):
++        return None
++    return "1x1" if R == 1 else "3x3"
++
++
++def plan_bytes(route: str, x_shape, w_shape, elt: int) -> tuple:
++    """(extra bytes beyond MIOpen's output, largest element count a kernel indexes)."""
++    N, C, H, W = x_shape
++    K = w_shape[0]
++    y = N * K * H * W
++    x = N * C * H * W
++    extra = y * elt
++    biggest = max(x, y)
++    if route == "3x3":
++        c_pad = -(-C // _BLOCK) * _BLOCK
++        blocked = N * c_pad * H * W
++        extra += blocked * elt + K * 9 * c_pad * elt
++        biggest = max(biggest, blocked)
++    return extra, biggest
++
++
++def _on_gpu(t: Any) -> bool:
++    return bool(t.is_cuda)
++
++
++def _device_ok(torch: Any, index: Optional[int]) -> bool:
++    key = index if index is not None else -1
++    ok = _DEVICE_OK.get(key)
++    if ok is None:
++        from .rocm_bf16 import is_rocm_torch
++        ok = bool(is_rocm_torch(torch)) and arch_enabled(_c3._device_arch(torch, index))
++        _DEVICE_OK[key] = ok
++    return ok
++
++
++def _kernels() -> Optional[Any]:
++    with _LOCK:
++        if "mod" in _STATE:
++            return _STATE["mod"]
++        mod = None
++        if not _c3._triton_ok():
++            _STATE["import_error"] = f"Triton older than {_c3.MIN_TRITON} or missing"
++        else:
++            try:
++                from .rocm_triton_conv2d import conv2d as mod
++            except Exception as exc:  # noqa: BLE001 - no Triton: MIOpen stays
++                mod = None
++                _STATE["import_error"] = repr(exc)[:300]
++        _STATE["mod"] = mod
++        return mod
++
++
++def _run(mod: Any, route: str, x, w, b) -> Any:
++    if route == "1x1":
++        return mod.conv2d_1x1(x, w, b, (1, 1), (0, 0))
++    return mod.conv2d_3x3_cblocked(x, w, b, (1, 1), (1, 1), (1, 1))
++
++
++# Self-check cases: 1x1, 3x3 with C a multiple of the 64-channel block, 3x3 with a padded last block.
++_SELFCHECK_CASES = (
++    ("1x1", (1, 64, 6, 7), (48, 64, 1, 1)),
++    ("3x3", (1, 64, 6, 6), (64, 64, 3, 3)),
++    ("3x3", (1, 80, 5, 9), (24, 80, 3, 3)),
++)
++
++
++def _selfcheck(torch: Any, mod: Any, device: Any, dtype: Any) -> bool:
++    key = ("selfcheck", str(device), str(dtype))
++    if key in _STATE:
++        return _STATE[key]
++    ok = True
++    if (os.environ.get(SELFCHECK_ENV) or "").strip().lower() not in _FALSE:
++        import torch.nn.functional as F
++        gen = torch.Generator(device = "cpu").manual_seed(0)
++        try:
++            with torch.no_grad():
++                for route, xs, ws in _SELFCHECK_CASES:
++                    x = torch.randn(xs, generator = gen).to(device = device, dtype = dtype)
++                    w = (torch.randn(ws, generator = gen) * 0.05).to(device = device, dtype = dtype)
++                    b = torch.randn(ws[0], generator = gen).to(device = device, dtype = dtype)
++                    y = _run(mod, route, x, w, b)
++                    ref = F.conv2d(x.float(), w.float(), b.float(), padding = ws[2] // 2)
++                    rel = float((y.float() - ref).norm() / ref.norm())
++                    if not (y.shape == ref.shape and rel < SELFCHECK_REL_L2):
++                        ok = False
++                        _STATE["selfcheck_error"] = f"{xs}x{ws}: rel L2 {rel:.3g}"
++                        break
++        except torch.OutOfMemoryError:
++            raise
++        except Exception as exc:  # noqa: BLE001 - no Triton HIP backend, compile failure, ...
++            ok = False
++            _STATE["selfcheck_error"] = repr(exc)[:300]
++    _STATE[key] = ok
++    return ok
++
++
++def _make_conv_forward(module: Any, original: Any, logger: Any):
++    import torch
++
++    def _conv_forward(input, weight, bias):
++        if (
++            torch.compiler.is_compiling()
++            or not _on_gpu(input)
++            or _c3._capturing(torch)
++            or input.dim() != 4
++            or input.dtype != torch.bfloat16
++            or weight.dtype != input.dtype
++            or (bias is not None and bias.dtype != input.dtype)
++            or module.groups != 1
++            or module.padding_mode != "zeros"
++            or not isinstance(module.padding, tuple)
++            or (torch.is_grad_enabled() and (input.requires_grad or weight.requires_grad))
++            or not _device_ok(torch, input.device.index)
++        ):
++            return original(input, weight, bias)
++        x_shape, w_shape = tuple(input.shape), tuple(weight.shape)
++        route = route_for(
++            x_shape,
++            w_shape,
++            module.stride,
++            module.padding,
++            module.dilation,
++            str(input.dtype).replace("torch.", ""),
++        )
++        if route is None:
++            COUNTS["skipped_table"] += 1
++            return original(input, weight, bias)
++        if not input.is_contiguous() or not weight.is_contiguous():
++            COUNTS["fallback_layout"] += 1  # channels_last was not measured
++            return original(input, weight, bias)
++        mod = _kernels()
++        if mod is None:
++            return original(input, weight, bias)
++        gated = _gated()
++        if gated and not _selfcheck_ready(input):
++            COUNTS["fallback_cold"] += 1
++            return original(input, weight, bias)
++        if not _selfcheck(torch, mod, input.device, input.dtype):
++            return original(input, weight, bias)
++        key = (x_shape, w_shape, input.dtype, input.device.index)
++        if key in _FAILED:
++            COUNTS["fallback_error"] += 1
++            return original(input, weight, bias)
++        extra, biggest = plan_bytes(route, x_shape, w_shape, input.element_size())
++        if biggest > _INT32_MAX:
++            COUNTS["skipped_table"] += 1
++            return original(input, weight, bias)
++        if extra >= MEM_CHECK_MIN_BYTES:
++            free, total = _c3._free_bytes(torch, input.device)
++            if extra + max(MEM_MARGIN_BYTES, int(total * MEM_MARGIN_FRACTION)) > free:
++                COUNTS["fallback_memory"] += 1
++                return original(input, weight, bias)
++        if gated and not _variant_ready(route, input, weight, bias):
++            COUNTS["fallback_cold"] += 1
++            return original(input, weight, bias)
++        try:
++            y = _run(mod, route, input, weight, bias)
++        except Exception as exc:  # noqa: BLE001 - MIOpen for this shape from now on
++            if _c3._reraise(torch, exc):
++                raise
++            _FAILED.add(key)
++            COUNTS["fallback_error"] += 1
++            if logger is not None:
++                logger.warning(
++                    "diffusion.rocm_triton_conv2d: Triton conv2d failed for x=%s w=%s, MIOpen from now on: %s",
++                    x_shape,
++                    w_shape,
++                    repr(exc)[:300],
++                )
++            return original(input, weight, bias)
++        COUNTS["routed"] += 1
++        return y
++
++    _conv_forward._unsloth_triton_conv2d = True
++    return _conv_forward
++
++
++def prebuild_enabled() -> bool:
++    if (os.environ.get(PREBUILD_ENV) or "").strip().lower() in _FALSE:
++        return False
++    try:
++        from . import diffusion_vae_prebuild
++    except Exception:  # noqa: BLE001
++        return False
++    return diffusion_vae_prebuild.enabled()
++
++
++def _source_digest() -> str:
++    import hashlib
++
++    h = hashlib.sha256()
++    root = os.path.join(os.path.dirname(os.path.abspath(__file__)), "rocm_triton_conv2d")
++    for name in sorted(os.listdir(root)):
++        if name.endswith(".py"):
++            with open(os.path.join(root, name), "rb") as f:
++                h.update(name.encode() + b"\0" + f.read())
++    return h.hexdigest()[:16]
++
++
++def _manifest_path() -> Optional[str]:
++    """One manifest per (kernel source, torch, Triton, arch, TRITON_* env), beside the Triton cache."""
++    with _PB_LOCK:
++        if "path" in _PB:
++            return _PB["path"]
++        path = None
++        try:
++            import hashlib
++            import json
++
++            import torch
++            import triton
++
++            from . import diffusion_vae_prebuild
++
++            root = diffusion_vae_prebuild._triton_cache_dir()
++            if root:
++                key = json.dumps(
++                    [
++                        _source_digest(),
++                        str(torch.__version__),
++                        str(triton.__version__),
++                        _c3._device_arch(torch, None).split(":")[0],
++                        sorted((k, v) for k, v in os.environ.items() if k.startswith("TRITON_")),
++                    ]
++                )
++                digest = hashlib.sha256(key.encode()).hexdigest()[:32]
++                path = os.path.join(
++                    root, diffusion_vae_prebuild._MARKER_DIR, f"rocm_conv2d_{digest}.json"
++                )
++        except Exception:  # noqa: BLE001 - no Triton / cache dir: compile inline
++            path = None
++        _PB["path"] = path
++        return path
++
++
++def _gated() -> bool:
++    return prebuild_enabled() and _manifest_path() is not None
++
++
++def _refresh(force: bool = False) -> None:
++    path = _manifest_path()
++    if path is None:
++        return
++    now = time.monotonic()
++    with _PB_LOCK:
++        if not force and now - _PB.get("polled", -1e9) < MANIFEST_POLL_S:
++            return
++        _PB["polled"] = now
++        try:
++            mtime = os.stat(path).st_mtime_ns
++        except OSError:
++            return
++        if not force and mtime == _PB.get("mtime"):
++            return
++        data = _c3._read_manifest(path)
++        _PB["mtime"] = mtime
++        _READY.update(k for k in data.get("keys", []) if isinstance(k, str))
++        _PB.setdefault("selfcheck", {}).update(
++            {k: bool(v) for k, v in (data.get("selfcheck") or {}).items()}
++        )
++
++
++def _index(torch: Any, device: Any) -> int:
++    return int(device.index if device.index is not None else torch.cuda.current_device())
++
++
++def _selfcheck_ready(input: Any) -> bool:
++    import torch
++
++    if ("selfcheck", str(input.device), str(input.dtype)) in _STATE:
++        return True
++    sk = str(input.dtype)
++    if sk not in _PB.get("selfcheck", {}):
++        _refresh()
++    ok = _PB.get("selfcheck", {}).get(sk)
++    if ok is None:
++        _note_pending(
++            "selfcheck|" + sk,
++            {"selfcheck": sk.replace("torch.", ""), "device": _index(torch, input.device)},
++        )
++        return False
++    if not ok:
++        _STATE[("selfcheck", str(input.device), str(input.dtype))] = False
++    return True
++
++
++def variant_key(
++    route: str, x_shape, w_shape, dtype_name: str, has_bias: bool, aligned: bool
++) -> str:
++    """The compiled variants of a call: H / W / channels are constexprs, so the key is the exact shape (stride 1,
++    padding k // 2, dilation 1 are implied by the table) plus bias presence and the input's 16-byte alignment."""
++    import json
++    return json.dumps(
++        [
++            route,
++            [int(v) for v in x_shape],
++            [int(v) for v in w_shape],
++            dtype_name,
++            bool(has_bias),
++            bool(aligned),
++        ]
++    )
++
++
++def _spec(route, x_shape, w_shape, dtype_name, has_bias, aligned, device) -> dict:
++    return {
++        "route": route,
++        "x": [int(v) for v in x_shape],
++        "w": [int(v) for v in w_shape],
++        "dtype": dtype_name,
++        "bias": bool(has_bias),
++        "aligned": bool(aligned),
++        "device": int(device),
++    }
++
++
++def _variant_ready(route: str, input: Any, weight: Any, bias: Any) -> bool:
++    import torch
++
++    dtype_name = str(input.dtype).replace("torch.", "")
++    aligned = input.data_ptr() % 16 == 0
++    vk = variant_key(route, input.shape, weight.shape, dtype_name, bias is not None, aligned)
++    if vk in _READY:
++        return True
++    _refresh()
++    if vk in _READY:
++        return True
++    _note_pending(
++        vk,
++        _spec(
++            route,
++            input.shape,
++            weight.shape,
++            dtype_name,
++            bias is not None,
++            aligned,
++            _index(torch, input.device),
++        ),
++    )
++    return False
++
++
++def _note_pending(vk: str, spec: dict) -> None:
++    with _PB_LOCK:
++        if vk in _PENDING:
++            if _PB.get("timer") is None and not _PB.get("live"):
++                _arm_timer()
++            return
++        if vk in _READY or vk in _PB.get("inflight", ()):
++            return
++        if _ATTEMPTS.get(vk, 0) >= MAX_ATTEMPTS:
++            return
++        _PENDING[vk] = spec
++        _arm_timer()
++
++
++def _arm_timer() -> None:
++    with _PB_LOCK:
++        old = _PB.get("timer")
++        if old is not None:
++            old.cancel()
++        t = threading.Timer(KICK_DEBOUNCE_S, _kick)
++        t.daemon = True
++        _PB["timer"] = t
++        t.start()
++
++
++def _kick(logger: Any = None) -> bool:
++    """Hand the pending variants of one device to a prebuild child (one child at a time). Never raises."""
++    try:
++        import torch
++
++        from . import diffusion_vae_prebuild
++
++        with _PB_LOCK:
++            _PB["timer"] = None
++            logger = logger or _PB.get("logger")
++            if _PB.get("live") or not _PENDING:
++                return False
++            device = next(iter(_PENDING.values()))["device"]
++            free, _total = torch.cuda.mem_get_info(device)
++            if free < PREBUILD_MIN_FREE:
++                return False  # stays pending: the next cold call re-arms
++            batch = {k: s for k, s in _PENDING.items() if s["device"] == device}
++            for k in batch:
++                del _PENDING[k]
++                _ATTEMPTS[k] = _ATTEMPTS.get(k, 0) + 1
++            job = {
++                "name": "rocm conv2d",
++                "owner": "image",
++                "device": device,
++                "manifest": _manifest_path(),
++                "selfcheck": sorted({s["selfcheck"] for s in batch.values() if "selfcheck" in s}),
++                "specs": [dict(s, key = k) for k, s in batch.items() if "x" in s],
++            }
++            _PB["live"] = True
++            _PB["inflight"] = set(batch)
++        ok = diffusion_vae_prebuild._spawn(
++            job,
++            logger,
++            target = (__name__, "_prebuild_child"),
++            timeout = PREBUILD_TIMEOUT_S,
++            on_exit = _child_exit,
++        )
++        if not ok:
++            _child_exit(None)
++        return ok
++    except Exception as exc:  # noqa: BLE001 - a prebuild, never a failed decode
++        with _PB_LOCK:
++            _PB["live"] = False
++            _PB["inflight"] = set()
++        if logger is not None:
++            logger.info(
++                "diffusion.rocm_triton_conv2d: prebuild skipped (%s: %s)", type(exc).__name__, exc
++            )
++        return False
++
++
++def _child_exit(_exitcode: Any = None) -> None:
++    with _PB_LOCK:
++        _PB["live"] = False
++        _PB["inflight"] = set()
++    _refresh(force = True)
++    with _PB_LOCK:
++        for k in [k for k in _PENDING if k in _READY]:
++            del _PENDING[k]
++        if _PENDING:
++            _arm_timer()
++
++
++def cancel_pending() -> None:
++    """Unload: no new child (``diffusion_vae_prebuild.cancel_all`` kills a live one)."""
++    with _PB_LOCK:
++        t = _PB.get("timer")
++        if t is not None:
++            t.cancel()
++        _PB["timer"] = None
++        _PENDING.clear()
++
++
++def trace_decoder_calls(vae: Any, latent_hw: tuple, dtype: Any) -> list:
++    """(x_shape, w_shape, has_bias) of every Conv2d call of a 1-image decode at ``latent_hw``, traced on a
++    weightless meta-device copy of ``vae`` (same class and config): no memory, no kernels, no Studio patches."""
++    import torch
++
++    config = dict(getattr(vae, "config", None) or {})
++    latent = config.get("latent_channels")
++    if not isinstance(latent, int):
++        return []
++    with torch.device("meta"):
++        meta = type(vae).from_config(config)
++    meta = meta.to(dtype = dtype).eval()
++    calls: list = []
++
++    def hook(m, args):
++        x = args[0] if args else None
++        if hasattr(x, "shape"):
++            calls.append((tuple(x.shape), tuple(m.weight.shape), m.bias is not None))
++
++    hooks = [
++        m.register_forward_pre_hook(hook) for m in meta.modules() if isinstance(m, torch.nn.Conv2d)
++    ]
++    try:
++        z = torch.empty((1, latent, *latent_hw), device = "meta", dtype = dtype)
++        with torch.no_grad():
++            pq = getattr(meta, "post_quant_conv", None)
++            if pq is not None:
++                z = pq(z)
++            meta.decoder(z)
++    finally:
++        for h in hooks:
++            h.remove()
++    return calls
++
++
++def _default_latent_hw(vae: Any) -> Optional[tuple]:
++    blocks = (getattr(vae, "config", None) or {}).get("block_out_channels")
++    if not isinstance(blocks, (list, tuple)) or not blocks:
++        return None
++    side = PREBUILD_OUTPUT_SIDE // (2 ** (len(blocks) - 1))
++    return (side, side)
++
++
++def prebuild(vae: Any, logger: Any = None) -> int:
++    """After the image load: queue the default-resolution decode's routed variants (meta-device trace) plus the
++    self-check for a prebuild child and start it. Returns the number of variants queued. Never blocks, never raises."""
++    try:
++        if vae is None or not _gated() or not _installed(vae):
++            return 0
++        import torch
++
++        if _kernels() is None:
++            return 0
++        weight = next(
++            (
++                m.weight
++                for m in vae.modules()
++                if getattr(m.__dict__.get("_conv_forward"), "_unsloth_triton_conv2d", False)
++            ),
++            None,
++        )
++        if weight is None or not _on_gpu(weight) or weight.dtype != torch.bfloat16:
++            return 0
++        if not _device_ok(torch, weight.device.index):
++            return 0
++        device = _index(torch, weight.device)
++        dtype_name = str(weight.dtype).replace("torch.", "")
++        _refresh(force = True)
++        queued: dict = {}
++        sk = str(weight.dtype)
++        if sk not in _PB.get("selfcheck", {}):
++            queued["selfcheck|" + sk] = {"selfcheck": dtype_name, "device": device}
++        hw = _default_latent_hw(vae)
++        calls = trace_decoder_calls(vae, hw, weight.dtype) if hw else []
++        for x_shape, w_shape, has_bias in calls:
++            route = route_for(x_shape, w_shape, (1, 1), (w_shape[2] // 2,) * 2, (1, 1), dtype_name)
++            if route is None:
++                continue
++            vk = variant_key(route, x_shape, w_shape, dtype_name, has_bias, True)
++            if vk in _READY or vk in queued:
++                continue
++            queued[vk] = _spec(route, x_shape, w_shape, dtype_name, has_bias, True, device)
++        with _PB_LOCK:
++            for vk, spec in queued.items():
++                if vk not in _PENDING and _ATTEMPTS.get(vk, 0) < MAX_ATTEMPTS:
++                    _PENDING[vk] = spec
++            if logger is not None:
++                _PB["logger"] = logger
++        n = sum(1 for k in queued if not k.startswith("selfcheck|"))
++        if queued:
++            _kick(logger)
++            if logger is not None:
++                logger.info(
++                    "diffusion.rocm_triton_conv2d: prebuilding %d conv2d variants in a child", n
++                )
++        return n
++    except Exception as exc:  # noqa: BLE001 - a prebuild, never a failed load
++        if logger is not None:
++            logger.info(
++                "diffusion.rocm_triton_conv2d: prebuild skipped (%s: %s)", type(exc).__name__, exc
++            )
++        return 0
++
++
++def _prebuild_child(job: dict) -> None:
++    """Child side: self-check first, then each variant on zeros (no weights); the manifest grows per variant."""
++    import torch
++
++    dev = _c3._child_device(torch, int(job["device"]))
++    mod = _kernels()
++    if mod is None:
++        return
++    path = job["manifest"]
++    for name in job.get("selfcheck", []):
++        dtype = getattr(torch, name)
++        ok = _selfcheck(torch, mod, dev, dtype)
++        _c3._merge_manifest(path, selfcheck = {str(dtype): ok})
++    with torch.no_grad():
++        for spec in job.get("specs", []):
++            dtype = getattr(torch, spec["dtype"])
++            x_shape, w_shape = tuple(spec["x"]), tuple(spec["w"])
++            try:
++                numel = 1
++                for v in x_shape:
++                    numel *= v
++                if spec.get("aligned", True):
++                    x = torch.zeros(x_shape, device = dev, dtype = dtype)
++                else:  # one element past a fresh allocation: the misaligned variant
++                    x = torch.zeros(numel + 8, device = dev, dtype = dtype)[1 : numel + 1].view(x_shape)
++                aligned = x.data_ptr() % 16 == 0
++                if (
++                    variant_key(
++                        spec["route"], x_shape, w_shape, spec["dtype"], spec["bias"], aligned
++                    )
++                    != spec["key"]
++                ):
++                    continue
++                w = torch.zeros(w_shape, device = dev, dtype = dtype)
++                b = torch.zeros(w_shape[0], device = dev, dtype = dtype) if spec["bias"] else None
++                _run(mod, spec["route"], x, w, b)
++                torch.cuda.synchronize(dev)
++                del x, w, b
++            except torch.OutOfMemoryError:
++                torch.cuda.empty_cache()
++                continue
++            except Exception:  # noqa: BLE001 - this variant stays on MIOpen
++                continue
++            _c3._merge_manifest(path, keys = (spec["key"],))
++
++
++def _installed(vae: Any) -> bool:
++    return any(
++        getattr(m.__dict__.get("_conv_forward"), "_unsloth_triton_conv2d", False)
++        for m in getattr(vae, "modules", lambda: [])()
++    )
++
++
++def install(vae: Any, logger: Any = None) -> int:
++    """Wrap every eligible ``nn.Conv2d`` of ``vae`` (per instance). Returns the number wrapped; 0 when off, not ROCm
++    gfx11, not a default VAE (env unset), or Triton is missing. The device is checked again per call."""
++    if vae is None or not requested() or not callable(getattr(vae, "modules", None)):
++        return 0
++    if _env_mode() is None and type(vae).__name__ not in DEFAULT_ON_VAES:
++        return 0
++    try:
++        import torch
++
++        from .rocm_bf16 import is_rocm_torch
++    except Exception:  # noqa: BLE001
++        return 0
++    if not is_rocm_torch(torch) or not torch.cuda.is_available():
++        return 0
++    arch = _c3._device_arch(torch, None)
++    if not arch_enabled(arch):
++        return 0
++    if _kernels() is None:
++        if logger is not None:
++            logger.info(
++                "diffusion.rocm_triton_conv2d: Triton conv2d unavailable (%s)",
++                _STATE.get("import_error"),
++            )
++        return 0
++    n = 0
++    for m in vae.modules():
++        if not isinstance(m, torch.nn.Conv2d) or m.groups != 1 or m.padding_mode != "zeros":
++            continue
++        k = tuple(m.kernel_size)
++        if (m.in_channels, m.out_channels, k[0]) not in SHAPE_TABLE or k[0] != k[1]:
++            continue  # never routable: leave the module untouched
++        current = m._conv_forward
++        if getattr(current, "_unsloth_triton_conv2d", False):
++            continue
++        m._conv_forward = _make_conv_forward(m, current, logger)
++        n += 1
++    if n and logger is not None:
++        logger.info(
++            "diffusion.rocm_triton_conv2d: %d %s Conv2d routed to the Triton conv2d on %s (measured shapes only)",
++            n,
++            type(vae).__name__,
++            arch,
++        )
++    return n
++
++
++def uninstall(vae: Any) -> int:
++    cancel_pending()
++    n = 0
++    for m in getattr(vae, "modules", lambda: [])():
++        fwd = m.__dict__.get("_conv_forward")
++        if getattr(fwd, "_unsloth_triton_conv2d", False):
++            del m.__dict__["_conv_forward"]
++            n += 1
++    if n and _STATE.get("mod") is not None:
++        try:
++            _STATE["mod"].clear_conv2d_weight_pack_caches()
++        except Exception:  # noqa: BLE001
++            pass
++    return n
++
++
++def status(vae: Any) -> Optional[dict]:
++    """Engagement for the load's status (None when nothing is wrapped: the key is then omitted)."""
++    wrapped = sum(
++        1
++        for m in getattr(vae, "modules", lambda: [])()
++        if getattr(m.__dict__.get("_conv_forward"), "_unsloth_triton_conv2d", False)
++    )
++    if not wrapped:
++        return None
++    return {"wrapped": wrapped, "ready_variants": len(_READY), **counts()}
+diff --git a/studio/backend/core/inference/diffusion_vae_prebuild.py b/studio/backend/core/inference/diffusion_vae_prebuild.py
+index d802c03f54..18c7bbe12d 100644
+--- a/studio/backend/core/inference/diffusion_vae_prebuild.py
++++ b/studio/backend/core/inference/diffusion_vae_prebuild.py
+@@ -313,6 +313,14 @@ def cancel_all(owner: Optional[str] = None) -> int:
+                 router.cancel_pending()
+             except Exception:  # noqa: BLE001
+                 pass
++    if owner in (None, "image"):
++        import sys
++        router = sys.modules.get(f"{__package__}.diffusion_rocm_triton_conv2d")
++        if router is not None:
++            try:
++                router.cancel_pending()
++            except Exception:  # noqa: BLE001
++                pass
+     with _LIVE_LOCK:
+         procs = [p for p, (o, _d) in _LIVE.items() if owner is None or o == owner]
+     for proc in procs:
+diff --git a/studio/backend/core/inference/rocm_triton_conv2d/__init__.py b/studio/backend/core/inference/rocm_triton_conv2d/__init__.py
+new file mode 100644
+index 0000000000..b4d2aac155
+--- /dev/null
++++ b/studio/backend/core/inference/rocm_triton_conv2d/__init__.py
+@@ -0,0 +1,33 @@
++# SPDX-License-Identifier: AGPL-3.0-only
++# Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
++#
++# Vendored from ROCm/aiter (https://github.com/ROCm/aiter), commit 6aa39366b7d368d415231643bc10fa0e9114cc32,
++# aiter/ops/triton/conv/ and aiter/ops/triton/_triton_kernels/conv/ (Conv2D 1x1 and 3x3 channel-blocked subset).
++# Changes: package marker; see each file for its own changes.
++# The vendored portions remain under the MIT License below:
++#
++# SPDX-License-Identifier: MIT
++# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
++#
++# MIT License
++#
++# Permission is hereby granted, free of charge, to any person obtaining a copy
++# of this software and associated documentation files (the "Software"), to deal
++# in the Software without restriction, including without limitation the rights
++# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
++# copies of the Software, and to permit persons to whom the Software is
++# furnished to do so, subject to the following conditions:
++#
++# The above copyright notice and this permission notice shall be included in all
++# copies or substantial portions of the Software.
++#
++# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
++# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
++# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
++# SOFTWARE.
++
++"""Triton 1x1 / channel-blocked 3x3 conv2d for AMD RDNA (vendored from ROCm/aiter, MIT). Import ``.conv2d`` lazily: it
++needs Triton. Studio routes the FLUX.2 VAE decoder convs here through ``diffusion_rocm_triton_conv2d``."""
+diff --git a/studio/backend/core/inference/rocm_triton_conv2d/_config.py b/studio/backend/core/inference/rocm_triton_conv2d/_config.py
+new file mode 100644
+index 0000000000..ec9149d029
+--- /dev/null
++++ b/studio/backend/core/inference/rocm_triton_conv2d/_config.py
+@@ -0,0 +1,753 @@
++# SPDX-License-Identifier: AGPL-3.0-only
++# Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
++#
++# Vendored from ROCm/aiter (https://github.com/ROCm/aiter), commit 6aa39366b7d368d415231643bc10fa0e9114cc32,
++# aiter/ops/triton/utils/conv_config_utils.py and aiter/ops/triton/configs/gfx1151/triton/conv/{conv_1x1,conv_3x3_cblocked,conv_prepack}/DEFAULT.json.
++# Changes: the three gfx1151 JSON tables inlined (the NHWC 1x1 pins dropped: NCHW only); the same four-tier walk as get_conv_config(); no per-arch lookup (Studio routes gfx11 only).
++# The vendored portions remain under the MIT License below:
++#
++# SPDX-License-Identifier: MIT
++# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
++#
++# MIT License
++#
++# Permission is hereby granted, free of charge, to any person obtaining a copy
++# of this software and associated documentation files (the "Software"), to deal
++# in the Software without restriction, including without limitation the rights
++# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
++# copies of the Software, and to permit persons to whom the Software is
++# furnished to do so, subject to the following conditions:
++#
++# The above copyright notice and this permission notice shall be included in all
++# copies or substantial portions of the Software.
++#
++# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
++# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
++# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
++# SOFTWARE.
++
++"""Conv2D kernel configs: the gfx1151 tables of ROCm/aiter and the four-tier lookup of aiter's ``get_conv_config()``
++(variant exact shape, exact shape, ``M_LEQ_<n>`` bucket, ``any``)."""
++
++from __future__ import annotations
++
++import functools
++
++CONV_STANDARD_M_BOUNDS: tuple[int, ...] = (
++    4,
++    8,
++    16,
++    32,
++    64,
++    128,
++    256,
++    512,
++    1024,
++    2048,
++    4096,
++    8192,
++    16384,
++    32768,
++    65536,
++    131072,
++    262144,
++)
++
++TABLES = {
++    "CONV-1X1": {
++        "shapes": {
++            "N=1,C=1024,H=14,W=14,K=2048,R=1,S=1,sh=2,sw=2,ph=0,pw=0,dh=1,dw=1": {
++                "BLOCK_M": 64,
++                "BLOCK_N": 64,
++                "BLOCK_K": 64,
++                "GROUP_SIZE_M": 4,
++                "num_warps": 4,
++                "num_stages": 1,
++            },
++            "N=1,C=1024,H=14,W=14,K=256,R=1,S=1,sh=1,sw=1,ph=0,pw=0,dh=1,dw=1": {
++                "BLOCK_M": 64,
++                "BLOCK_N": 64,
++                "BLOCK_K": 64,
++                "GROUP_SIZE_M": 4,
++                "num_warps": 4,
++                "num_stages": 1,
++            },
++            "N=1,C=1024,H=14,W=14,K=512,R=1,S=1,sh=1,sw=1,ph=0,pw=0,dh=1,dw=1": {
++                "BLOCK_M": 64,
++                "BLOCK_N": 64,
++                "BLOCK_K": 64,
++                "GROUP_SIZE_M": 4,
++                "num_warps": 4,
++                "num_stages": 1,
++            },
++            "N=1,C=128,H=256,W=256,K=256,R=1,S=1,sh=1,sw=1,ph=0,pw=0,dh=1,dw=1": {
++                "BLOCK_M": 128,
++                "BLOCK_N": 128,
++                "BLOCK_K": 32,
++                "GROUP_SIZE_M": 4,
++                "num_warps": 8,
++                "num_stages": 1,
++            },
++            "N=1,C=128,H=28,W=28,K=512,R=1,S=1,sh=1,sw=1,ph=0,pw=0,dh=1,dw=1": {
++                "BLOCK_M": 64,
++                "BLOCK_N": 64,
++                "BLOCK_K": 32,
++                "GROUP_SIZE_M": 4,
++                "num_warps": 4,
++                "num_stages": 1,
++            },
++            "N=1,C=2048,H=7,W=7,K=512,R=1,S=1,sh=1,sw=1,ph=0,pw=0,dh=1,dw=1": {
++                "BLOCK_M": 64,
++                "BLOCK_N": 64,
++                "BLOCK_K": 64,
++                "GROUP_SIZE_M": 4,
++                "num_warps": 4,
++                "num_stages": 1,
++            },
++            "N=1,C=256,H=128,W=128,K=512,R=1,S=1,sh=1,sw=1,ph=0,pw=0,dh=1,dw=1": {
++                "BLOCK_M": 64,
++                "BLOCK_N": 64,
++                "BLOCK_K": 64,
++                "GROUP_SIZE_M": 4,
++                "num_warps": 4,
++                "num_stages": 1,
++            },
++            "N=1,C=256,H=14,W=14,K=1024,R=1,S=1,sh=1,sw=1,ph=0,pw=0,dh=1,dw=1": {
++                "BLOCK_M": 64,
++                "BLOCK_N": 64,
++                "BLOCK_K": 64,
++                "GROUP_SIZE_M": 4,
++                "num_warps": 4,
++                "num_stages": 1,
++            },
++            "N=1,C=256,H=512,W=512,K=128,R=1,S=1,sh=1,sw=1,ph=0,pw=0,dh=1,dw=1": {
++                "BLOCK_M": 64,
++                "BLOCK_N": 128,
++                "BLOCK_K": 64,
++                "GROUP_SIZE_M": 8,
++                "num_warps": 4,
++                "num_stages": 1,
++            },
++            "N=1,C=256,H=56,W=56,K=128,R=1,S=1,sh=1,sw=1,ph=0,pw=0,dh=1,dw=1": {
++                "BLOCK_M": 64,
++                "BLOCK_N": 64,
++                "BLOCK_K": 32,
++                "GROUP_SIZE_M": 4,
++                "num_warps": 4,
++                "num_stages": 1,
++            },
++            "N=1,C=256,H=56,W=56,K=512,R=1,S=1,sh=2,sw=2,ph=0,pw=0,dh=1,dw=1": {
++                "BLOCK_M": 64,
++                "BLOCK_N": 64,
++                "BLOCK_K": 64,
++                "GROUP_SIZE_M": 4,
++                "num_warps": 4,
++                "num_stages": 1,
++            },
++            "N=1,C=256,H=56,W=56,K=64,R=1,S=1,sh=1,sw=1,ph=0,pw=0,dh=1,dw=1": {
++                "BLOCK_M": 64,
++                "BLOCK_N": 64,
++                "BLOCK_K": 32,
++                "GROUP_SIZE_M": 4,
++                "num_warps": 4,
++                "num_stages": 1,
++            },
++            "N=1,C=32,H=64,W=64,K=32,R=1,S=1,sh=1,sw=1,ph=0,pw=0,dh=1,dw=1": {
++                "BLOCK_M": 64,
++                "BLOCK_N": 64,
++                "BLOCK_K": 32,
++                "GROUP_SIZE_M": 4,
++                "num_warps": 4,
++                "num_stages": 1,
++            },
++            "N=1,C=512,H=256,W=256,K=256,R=1,S=1,sh=1,sw=1,ph=0,pw=0,dh=1,dw=1": {
++                "BLOCK_M": 64,
++                "BLOCK_N": 128,
++                "BLOCK_K": 64,
++                "GROUP_SIZE_M": 8,
++                "num_warps": 4,
++                "num_stages": 1,
++            },
++            "N=1,C=512,H=28,W=28,K=1024,R=1,S=1,sh=2,sw=2,ph=0,pw=0,dh=1,dw=1": {
++                "BLOCK_M": 64,
++                "BLOCK_N": 64,
++                "BLOCK_K": 64,
++                "GROUP_SIZE_M": 4,
++                "num_warps": 4,
++                "num_stages": 1,
++            },
++            "N=1,C=512,H=28,W=28,K=128,R=1,S=1,sh=1,sw=1,ph=0,pw=0,dh=1,dw=1": {
++                "BLOCK_M": 64,
++                "BLOCK_N": 64,
++                "BLOCK_K": 64,
++                "GROUP_SIZE_M": 4,
++                "num_warps": 4,
++                "num_stages": 1,
++            },
++            "N=1,C=512,H=28,W=28,K=256,R=1,S=1,sh=1,sw=1,ph=0,pw=0,dh=1,dw=1": {
++                "BLOCK_M": 64,
++                "BLOCK_N": 64,
++                "BLOCK_K": 64,
++                "GROUP_SIZE_M": 4,
++                "num_warps": 4,
++                "num_stages": 1,
++            },
++            "N=1,C=512,H=7,W=7,K=2048,R=1,S=1,sh=1,sw=1,ph=0,pw=0,dh=1,dw=1": {
++                "BLOCK_M": 64,
++                "BLOCK_N": 64,
++                "BLOCK_K": 64,
++                "GROUP_SIZE_M": 4,
++                "num_warps": 4,
++                "num_stages": 1,
++            },
++            "N=1,C=64,H=56,W=56,K=256,R=1,S=1,sh=1,sw=1,ph=0,pw=0,dh=1,dw=1": {
++                "BLOCK_M": 64,
++                "BLOCK_N": 64,
++                "BLOCK_K": 32,
++                "GROUP_SIZE_M": 4,
++                "num_warps": 4,
++                "num_stages": 1,
++            },
++            "N=1,C=64,H=56,W=56,K=64,R=1,S=1,sh=1,sw=1,ph=0,pw=0,dh=1,dw=1": {
++                "BLOCK_M": 64,
++                "BLOCK_N": 64,
++                "BLOCK_K": 32,
++                "GROUP_SIZE_M": 4,
++                "num_warps": 4,
++                "num_stages": 1,
++            },
++            "N=1,C=64,H=64,W=64,K=64,R=1,S=1,sh=1,sw=1,ph=0,pw=0,dh=1,dw=1": {
++                "BLOCK_M": 64,
++                "BLOCK_N": 64,
++                "BLOCK_K": 32,
++                "GROUP_SIZE_M": 4,
++                "num_warps": 4,
++                "num_stages": 1,
++            },
++        },
++        "M_LEQ_262144": {
++            "BLOCK_M": 64,
++            "BLOCK_N": 128,
++            "BLOCK_K": 64,
++            "GROUP_SIZE_M": 8,
++            "num_warps": 4,
++            "num_stages": 1,
++        },
++        "M_LEQ_16384": {
++            "BLOCK_M": 64,
++            "BLOCK_N": 64,
++            "BLOCK_K": 64,
++            "GROUP_SIZE_M": 4,
++            "num_warps": 4,
++            "num_stages": 1,
++        },
++        "M_LEQ_4096": {
++            "BLOCK_M": 64,
++            "BLOCK_N": 64,
++            "BLOCK_K": 32,
++            "GROUP_SIZE_M": 4,
++            "num_warps": 4,
++            "num_stages": 1,
++        },
++        "M_LEQ_1024": {
++            "BLOCK_M": 64,
++            "BLOCK_N": 64,
++            "BLOCK_K": 64,
++            "GROUP_SIZE_M": 4,
++            "num_warps": 4,
++            "num_stages": 1,
++        },
++        "any": {
++            "BLOCK_M": 64,
++            "BLOCK_N": 64,
++            "BLOCK_K": 64,
++            "GROUP_SIZE_M": 4,
++            "num_warps": 4,
++            "num_stages": 1,
++        },
++        "shapes_nchw": {
++            "N=1,C=256,H=128,W=128,K=512,R=1,S=1,sh=1,sw=1,ph=0,pw=0,dh=1,dw=1": {
++                "BLOCK_M": 128,
++                "BLOCK_N": 128,
++                "BLOCK_K": 32,
++                "GROUP_SIZE_M": 4,
++                "num_warps": 8,
++                "num_stages": 1,
++            },
++            "N=1,C=256,H=56,W=56,K=512,R=1,S=1,sh=2,sw=2,ph=0,pw=0,dh=1,dw=1": {
++                "BLOCK_M": 64,
++                "BLOCK_N": 64,
++                "BLOCK_K": 32,
++                "GROUP_SIZE_M": 4,
++                "num_warps": 4,
++                "num_stages": 1,
++            },
++            "N=1,C=512,H=256,W=256,K=256,R=1,S=1,sh=1,sw=1,ph=0,pw=0,dh=1,dw=1": {
++                "BLOCK_M": 64,
++                "BLOCK_N": 64,
++                "BLOCK_K": 64,
++                "GROUP_SIZE_M": 4,
++                "num_warps": 2,
++                "num_stages": 1,
++            },
++        },
++    },
++    "CONV-3X3-CBLOCKED": {
++        "shapes": {
++            "N=1,C=128,H=256,W=256,K=256,R=3,S=3,sh=1,sw=1,ph=1,pw=1,dh=1,dw=1": {
++                "BLOCK_M": 64,
++                "BLOCK_N": 64,
++                "BLOCK_K": 64,
++                "GROUP_SIZE_M": 4,
++                "num_warps": 4,
++                "num_stages": 1,
++            },
++            "N=1,C=128,H=28,W=28,K=128,R=3,S=3,sh=1,sw=1,ph=1,pw=1,dh=1,dw=1": {
++                "BLOCK_M": 64,
++                "BLOCK_N": 64,
++                "BLOCK_K": 64,
++                "GROUP_SIZE_M": 4,
++                "num_warps": 4,
++                "num_stages": 1,
++            },
++            "N=1,C=128,H=512,W=512,K=128,R=3,S=3,sh=1,sw=1,ph=1,pw=1,dh=1,dw=1": {
++                "BLOCK_M": 64,
++                "BLOCK_N": 64,
++                "BLOCK_K": 64,
++                "GROUP_SIZE_M": 4,
++                "num_warps": 4,
++                "num_stages": 1,
++            },
++            "N=1,C=128,H=512,W=512,K=3,R=3,S=3,sh=1,sw=1,ph=1,pw=1,dh=1,dw=1": {
++                "BLOCK_M": 64,
++                "BLOCK_N": 64,
++                "BLOCK_K": 64,
++                "GROUP_SIZE_M": 4,
++                "num_warps": 4,
++                "num_stages": 1,
++            },
++            "N=1,C=128,H=513,W=513,K=128,R=3,S=3,sh=2,sw=2,ph=0,pw=0,dh=1,dw=1": {
++                "BLOCK_M": 64,
++                "BLOCK_N": 64,
++                "BLOCK_K": 64,
++                "GROUP_SIZE_M": 4,
++                "num_warps": 4,
++                "num_stages": 1,
++            },
++            "N=1,C=128,H=56,W=56,K=128,R=3,S=3,sh=2,sw=2,ph=1,pw=1,dh=1,dw=1": {
++                "BLOCK_M": 64,
++                "BLOCK_N": 64,
++                "BLOCK_K": 64,
++                "GROUP_SIZE_M": 4,
++                "num_warps": 4,
++                "num_stages": 1,
++            },
++            "N=1,C=16,H=64,W=64,K=512,R=3,S=3,sh=1,sw=1,ph=1,pw=1,dh=1,dw=1": {
++                "BLOCK_M": 64,
++                "BLOCK_N": 64,
++                "BLOCK_K": 64,
++                "GROUP_SIZE_M": 4,
++                "num_warps": 4,
++                "num_stages": 1,
++            },
++            "N=1,C=256,H=128,W=128,K=512,R=3,S=3,sh=1,sw=1,ph=1,pw=1,dh=1,dw=1": {
++                "BLOCK_M": 64,
++                "BLOCK_N": 128,
++                "BLOCK_K": 64,
++                "GROUP_SIZE_M": 8,
++                "num_warps": 4,
++                "num_stages": 1,
++            },
++            "N=1,C=256,H=14,W=14,K=256,R=3,S=3,sh=1,sw=1,ph=1,pw=1,dh=1,dw=1": {
++                "BLOCK_M": 64,
++                "BLOCK_N": 64,
++                "BLOCK_K": 64,
++                "GROUP_SIZE_M": 4,
++                "num_warps": 4,
++                "num_stages": 1,
++            },
++            "N=1,C=256,H=256,W=256,K=256,R=3,S=3,sh=1,sw=1,ph=1,pw=1,dh=1,dw=1": {
++                "BLOCK_M": 64,
++                "BLOCK_N": 128,
++                "BLOCK_K": 64,
++                "GROUP_SIZE_M": 8,
++                "num_warps": 4,
++                "num_stages": 1,
++            },
++            "N=1,C=256,H=257,W=257,K=256,R=3,S=3,sh=2,sw=2,ph=0,pw=0,dh=1,dw=1": {
++                "BLOCK_M": 64,
++                "BLOCK_N": 128,
++                "BLOCK_K": 64,
++                "GROUP_SIZE_M": 8,
++                "num_warps": 4,
++                "num_stages": 1,
++            },
++            "N=1,C=256,H=28,W=28,K=256,R=3,S=3,sh=2,sw=2,ph=1,pw=1,dh=1,dw=1": {
++                "BLOCK_M": 64,
++                "BLOCK_N": 64,
++                "BLOCK_K": 64,
++                "GROUP_SIZE_M": 4,
++                "num_warps": 4,
++                "num_stages": 1,
++            },
++            "N=1,C=256,H=512,W=512,K=128,R=3,S=3,sh=1,sw=1,ph=1,pw=1,dh=1,dw=1": {
++                "BLOCK_M": 64,
++                "BLOCK_N": 128,
++                "BLOCK_K": 64,
++                "GROUP_SIZE_M": 8,
++                "num_warps": 4,
++                "num_stages": 1,
++            },
++            "N=1,C=256,H=512,W=512,K=256,R=3,S=3,sh=1,sw=1,ph=1,pw=1,dh=1,dw=1": {
++                "BLOCK_M": 64,
++                "BLOCK_N": 128,
++                "BLOCK_K": 64,
++                "GROUP_SIZE_M": 8,
++                "num_warps": 4,
++                "num_stages": 1,
++            },
++            "N=1,C=3,H=512,W=512,K=128,R=3,S=3,sh=1,sw=1,ph=1,pw=1,dh=1,dw=1": {
++                "BLOCK_M": 64,
++                "BLOCK_N": 64,
++                "BLOCK_K": 64,
++                "GROUP_SIZE_M": 4,
++                "num_warps": 4,
++                "num_stages": 1,
++            },
++            "N=1,C=32,H=64,W=64,K=512,R=3,S=3,sh=1,sw=1,ph=1,pw=1,dh=1,dw=1": {
++                "BLOCK_M": 64,
++                "BLOCK_N": 64,
++                "BLOCK_K": 64,
++                "GROUP_SIZE_M": 4,
++                "num_warps": 4,
++                "num_stages": 1,
++            },
++            "N=1,C=512,H=128,W=128,K=512,R=3,S=3,sh=1,sw=1,ph=1,pw=1,dh=1,dw=1": {
++                "BLOCK_M": 64,
++                "BLOCK_N": 128,
++                "BLOCK_K": 64,
++                "GROUP_SIZE_M": 8,
++                "num_warps": 4,
++                "num_stages": 1,
++            },
++            "N=1,C=512,H=129,W=129,K=512,R=3,S=3,sh=2,sw=2,ph=0,pw=0,dh=1,dw=1": {
++                "BLOCK_M": 64,
++                "BLOCK_N": 128,
++                "BLOCK_K": 64,
++                "GROUP_SIZE_M": 8,
++                "num_warps": 4,
++                "num_stages": 1,
++            },
++            "N=1,C=512,H=14,W=14,K=512,R=3,S=3,sh=2,sw=2,ph=1,pw=1,dh=1,dw=1": {
++                "BLOCK_M": 64,
++                "BLOCK_N": 64,
++                "BLOCK_K": 64,
++                "GROUP_SIZE_M": 4,
++                "num_warps": 4,
++                "num_stages": 1,
++            },
++            "N=1,C=512,H=256,W=256,K=256,R=3,S=3,sh=1,sw=1,ph=1,pw=1,dh=1,dw=1": {
++                "BLOCK_M": 64,
++                "BLOCK_N": 128,
++                "BLOCK_K": 64,
++                "GROUP_SIZE_M": 8,
++                "num_warps": 4,
++                "num_stages": 1,
++            },
++            "N=1,C=512,H=256,W=256,K=512,R=3,S=3,sh=1,sw=1,ph=1,pw=1,dh=1,dw=1": {
++                "BLOCK_M": 64,
++                "BLOCK_N": 128,
++                "BLOCK_K": 64,
++                "GROUP_SIZE_M": 8,
++                "num_warps": 4,
++                "num_stages": 1,
++            },
++            "N=1,C=512,H=64,W=64,K=32,R=3,S=3,sh=1,sw=1,ph=1,pw=1,dh=1,dw=1": {
++                "BLOCK_M": 64,
++                "BLOCK_N": 64,
++                "BLOCK_K": 64,
++                "GROUP_SIZE_M": 4,
++                "num_warps": 4,
++                "num_stages": 1,
++            },
++            "N=1,C=512,H=64,W=64,K=512,R=3,S=3,sh=1,sw=1,ph=1,pw=1,dh=1,dw=1": {
++                "BLOCK_M": 64,
++                "BLOCK_N": 128,
++                "BLOCK_K": 64,
++                "GROUP_SIZE_M": 8,
++                "num_warps": 4,
++                "num_stages": 1,
++            },
++            "N=1,C=512,H=64,W=64,K=64,R=3,S=3,sh=1,sw=1,ph=1,pw=1,dh=1,dw=1": {
++                "BLOCK_M": 64,
++                "BLOCK_N": 64,
++                "BLOCK_K": 64,
++                "GROUP_SIZE_M": 4,
++                "num_warps": 4,
++                "num_stages": 1,
++            },
++            "N=1,C=512,H=7,W=7,K=512,R=3,S=3,sh=1,sw=1,ph=1,pw=1,dh=1,dw=1": {
++                "BLOCK_M": 64,
++                "BLOCK_N": 64,
++                "BLOCK_K": 64,
++                "GROUP_SIZE_M": 4,
++                "num_warps": 4,
++                "num_stages": 1,
++            },
++            "N=1,C=64,H=56,W=56,K=64,R=3,S=3,sh=1,sw=1,ph=1,pw=1,dh=1,dw=1": {
++                "BLOCK_M": 64,
++                "BLOCK_N": 64,
++                "BLOCK_K": 64,
++                "GROUP_SIZE_M": 4,
++                "num_warps": 4,
++                "num_stages": 1,
++            },
++        },
++        "M_LEQ_16384": {
++            "BLOCK_M": 64,
++            "BLOCK_N": 128,
++            "BLOCK_K": 64,
++            "GROUP_SIZE_M": 8,
++            "num_warps": 4,
++            "num_stages": 1,
++        },
++        "M_LEQ_4096": {
++            "BLOCK_M": 64,
++            "BLOCK_N": 64,
++            "BLOCK_K": 64,
++            "GROUP_SIZE_M": 4,
++            "num_warps": 4,
++            "num_stages": 1,
++        },
++        "any": {
++            "BLOCK_M": 64,
++            "BLOCK_N": 64,
++            "BLOCK_K": 64,
++            "GROUP_SIZE_M": 4,
++            "num_warps": 4,
++            "num_stages": 1,
++        },
++    },
++    "CONV-PREPACK": {
++        "shapes": {
++            "N=1,C=128,H=256,W=256,CB=64": {
++                "BLOCK_C": 32,
++                "BLOCK_M": 128,
++                "waves_per_eu": 2,
++                "num_warps": 8,
++                "num_stages": 1,
++            },
++            "N=1,C=128,H=28,W=28,CB=64": {
++                "BLOCK_C": 32,
++                "BLOCK_M": 64,
++                "num_warps": 4,
++                "num_stages": 1,
++            },
++            "N=1,C=128,H=512,W=512,CB=64": {
++                "BLOCK_C": 32,
++                "BLOCK_M": 128,
++                "waves_per_eu": 2,
++                "num_warps": 8,
++                "num_stages": 1,
++            },
++            "N=1,C=128,H=513,W=513,CB=64": {
++                "BLOCK_C": 64,
++                "BLOCK_M": 64,
++                "num_warps": 8,
++                "num_stages": 1,
++            },
++            "N=1,C=128,H=56,W=56,CB=64": {
++                "BLOCK_C": 32,
++                "BLOCK_M": 128,
++                "waves_per_eu": 2,
++                "num_warps": 8,
++                "num_stages": 1,
++            },
++            "N=1,C=16,H=64,W=64,CB=64": {
++                "BLOCK_C": 64,
++                "BLOCK_M": 32,
++                "num_warps": 4,
++                "num_stages": 1,
++            },
++            "N=1,C=256,H=128,W=128,CB=64": {
++                "BLOCK_C": 32,
++                "BLOCK_M": 128,
++                "waves_per_eu": 2,
++                "num_warps": 8,
++                "num_stages": 1,
++            },
++            "N=1,C=256,H=14,W=14,CB=64": {
++                "BLOCK_C": 32,
++                "BLOCK_M": 32,
++                "num_warps": 4,
++                "num_stages": 1,
++            },
++            "N=1,C=256,H=256,W=256,CB=64": {
++                "BLOCK_C": 32,
++                "BLOCK_M": 128,
++                "waves_per_eu": 2,
++                "num_warps": 8,
++                "num_stages": 1,
++            },
++            "N=1,C=256,H=257,W=257,CB=64": {
++                "BLOCK_C": 64,
++                "BLOCK_M": 64,
++                "num_warps": 8,
++                "num_stages": 1,
++            },
++            "N=1,C=256,H=28,W=28,CB=64": {
++                "BLOCK_C": 32,
++                "BLOCK_M": 32,
++                "num_warps": 4,
++                "num_stages": 1,
++            },
++            "N=1,C=256,H=512,W=512,CB=64": {
++                "BLOCK_C": 32,
++                "BLOCK_M": 128,
++                "waves_per_eu": 2,
++                "num_warps": 8,
++                "num_stages": 1,
++            },
++            "N=1,C=3,H=512,W=512,CB=64": {
++                "BLOCK_C": 32,
++                "BLOCK_M": 128,
++                "waves_per_eu": 2,
++                "num_warps": 8,
++                "num_stages": 1,
++            },
++            "N=1,C=32,H=64,W=64,CB=64": {
++                "BLOCK_C": 32,
++                "BLOCK_M": 128,
++                "waves_per_eu": 2,
++                "num_warps": 8,
++                "num_stages": 1,
++            },
++            "N=1,C=512,H=128,W=128,CB=64": {
++                "BLOCK_C": 32,
++                "BLOCK_M": 128,
++                "waves_per_eu": 2,
++                "num_warps": 8,
++                "num_stages": 1,
++            },
++            "N=1,C=512,H=129,W=129,CB=64": {
++                "BLOCK_C": 32,
++                "BLOCK_M": 128,
++                "waves_per_eu": 2,
++                "num_warps": 8,
++                "num_stages": 1,
++            },
++            "N=1,C=512,H=14,W=14,CB=64": {
++                "BLOCK_C": 32,
++                "BLOCK_M": 32,
++                "num_warps": 4,
++                "num_stages": 1,
++            },
++            "N=1,C=512,H=256,W=256,CB=64": {
++                "BLOCK_C": 32,
++                "BLOCK_M": 128,
++                "waves_per_eu": 2,
++                "num_warps": 8,
++                "num_stages": 1,
++            },
++            "N=1,C=512,H=64,W=64,CB=64": {
++                "BLOCK_C": 32,
++                "BLOCK_M": 128,
++                "waves_per_eu": 2,
++                "num_warps": 8,
++                "num_stages": 1,
++            },
++            "N=1,C=512,H=7,W=7,CB=64": {
++                "BLOCK_C": 32,
++                "BLOCK_M": 128,
++                "waves_per_eu": 2,
++                "num_warps": 8,
++                "num_stages": 1,
++            },
++            "N=1,C=64,H=56,W=56,CB=64": {
++                "BLOCK_C": 32,
++                "BLOCK_M": 64,
++                "num_warps": 4,
++                "num_stages": 1,
++            },
++        },
++        "M_LEQ_131072": {"BLOCK_C": 64, "BLOCK_M": 64, "num_warps": 8, "num_stages": 1},
++        "M_LEQ_65536": {
++            "BLOCK_C": 32,
++            "BLOCK_M": 128,
++            "waves_per_eu": 2,
++            "num_warps": 8,
++            "num_stages": 1,
++        },
++        "M_LEQ_1024": {"BLOCK_C": 32, "BLOCK_M": 32, "num_warps": 4, "num_stages": 1},
++        "M_LEQ_64": {
++            "BLOCK_C": 32,
++            "BLOCK_M": 128,
++            "waves_per_eu": 2,
++            "num_warps": 8,
++            "num_stages": 1,
++        },
++        "any": {"BLOCK_C": 32, "BLOCK_M": 128, "waves_per_eu": 2, "num_warps": 8, "num_stages": 1},
++    },
++}
++
++
++def format_shape_key(
++    N: int,
++    C: int,
++    H: int,
++    W: int,
++    K: int,
++    R: int,
++    S: int,
++    sh: int,
++    sw: int,
++    ph: int,
++    pw: int,
++    dh: int,
++    dw: int,
++) -> str:
++    """Canonical string key for a user-visible conv2d call."""
++    return (
++        f"N={N},C={C},H={H},W={W},K={K},R={R},S={S},"
++        f"sh={sh},sw={sw},ph={ph},pw={pw},dh={dh},dw={dw}"
++    )
++
++
++def format_prepack_shape_key(N: int, C: int, H: int, W: int, CB: int) -> str:
++    """Canonical key for an NCHW-to-NCHWc activation pack."""
++    return f"N={N},C={C},H={H},W={W},CB={CB}"
++
++
++@functools.lru_cache(maxsize = 512)
++def _get_conv_config_cached(
++    config_name: str, shape_key: str | None, M: int | None, variants: tuple[str, ...]
++) -> dict:
++    """Config walk: variant shape entries, generic shape, M bucket, any."""
++    config_dict = TABLES[config_name]
++    if shape_key is not None:
++        for variant in variants:
++            shapes = config_dict.get(f"shapes_{variant}", {})
++            if shape_key in shapes:
++                return shapes[shape_key]
++    shapes = config_dict.get("shapes", {})
++    if shape_key is not None and shape_key in shapes:
++        return shapes[shape_key]
++    if M is not None and M >= 0:
++        for bound in CONV_STANDARD_M_BOUNDS:
++            key = f"M_LEQ_{bound}"
++            if M <= bound and key in config_dict:
++                return config_dict[key]
++    return config_dict["any"]
++
++
++def get_conv_config(
++    config_name: str,
++    shape_key: str | None = None,
++    M: int | None = None,
++    variants: tuple[str, ...] = (),
++) -> dict:
++    """A fresh shallow copy of the config for this call."""
++    return dict(_get_conv_config_cached(config_name, shape_key, M, variants))
+diff --git a/studio/backend/core/inference/rocm_triton_conv2d/_kernel_repr.py b/studio/backend/core/inference/rocm_triton_conv2d/_kernel_repr.py
+new file mode 100644
+index 0000000000..17bc9341a5
+--- /dev/null
++++ b/studio/backend/core/inference/rocm_triton_conv2d/_kernel_repr.py
+@@ -0,0 +1,86 @@
++# SPDX-License-Identifier: AGPL-3.0-only
++# Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
++#
++# Vendored from ROCm/aiter (https://github.com/ROCm/aiter), commit 6aa39366b7d368d415231643bc10fa0e9114cc32,
++# aiter/ops/triton/utils/_triton/kernel_repr.py.
++# Changes: import paths only.
++# The vendored portions remain under the MIT License below:
++#
++# SPDX-License-Identifier: MIT
++# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
++#
++# MIT License
++#
++# Permission is hereby granted, free of charge, to any person obtaining a copy
++# of this software and associated documentation files (the "Software"), to deal
++# in the Software without restriction, including without limitation the rights
++# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
++# copies of the Software, and to permit persons to whom the Software is
++# furnished to do so, subject to the following conditions:
++#
++# The above copyright notice and this permission notice shall be included in all
++# copies or substantial portions of the Software.
++#
++# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
++# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
++# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
++# SOFTWARE.
++def _sanitize_constexpr_value(value):
++    if value is None:
++        return "NONE"
++    if isinstance(value, bool):
++        return str(int(value))
++    if isinstance(value, int):
++        return str(value).replace("-", "NEG_")
++    if isinstance(value, float):
++        if value.is_integer():
++            return str(int(value)).replace("-", "NEG_")
++        return str(value).replace("-", "NEG_").replace("+", "POS_").replace(".", "_")
++
++    if isinstance(value, (list, tuple, set)):
++        items = sorted(value, key = str) if isinstance(value, set) else value
++        sanitized_items = [_sanitize_constexpr_value(item) for item in items]
++        joined = "_".join(sanitized_items)
++        return joined if joined else "NONE"
++
++    if isinstance(value, str):
++        cleaned_value = "".join(ch if ch.isalnum() else "_" for ch in value).strip("_")
++        return cleaned_value.upper() if cleaned_value else "NONE"
++
++    cleaned_value = "".join(ch if ch.isalnum() else "_" for ch in str(value)).strip("_")
++    return cleaned_value.upper() if cleaned_value else "NONE"
++
++
++def make_kernel_repr(
++    base_name,
++    config_keys,
++    name_key = None,
++):
++    # name_key: base name comes from that constexpr kwarg at call time (base_name if empty).
++    def _repr(specialization):
++        constants = specialization.constants
++
++        name = base_name
++        if name_key is not None:
++            override = constants.get(name_key, None)
++            if override:
++                cleaned = "".join(ch if ch.isalnum() or ch == "_" else "_" for ch in str(override))
++                if cleaned:
++                    name = cleaned
++
++        name_parts = []
++        for key in config_keys:
++            value = constants.get(key, None)
++            symbol = _sanitize_constexpr_value(value)
++            name_parts.append(f"{key}_{symbol}")
++
++        if not name_parts:
++            return name
++
++        suffix = "_".join(name_parts)
++        return f"{name}_{suffix}"
++
++    return _repr
+diff --git a/studio/backend/core/inference/rocm_triton_conv2d/conv2d.py b/studio/backend/core/inference/rocm_triton_conv2d/conv2d.py
+new file mode 100644
+index 0000000000..0036a3f6d2
+--- /dev/null
++++ b/studio/backend/core/inference/rocm_triton_conv2d/conv2d.py
+@@ -0,0 +1,288 @@
++# SPDX-License-Identifier: AGPL-3.0-only
++# Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
++#
++# Vendored from ROCm/aiter (https://github.com/ROCm/aiter), commit 6aa39366b7d368d415231643bc10fa0e9114cc32,
++# aiter/ops/triton/conv/conv2d.py, _launch.py, _prepack.py and _utils.py (the 1x1 and channel-blocked 3x3 NCHW routes).
++# Changes: NCHW, zeros padding, no activation, no router: Studio's diffusion_rocm_triton_conv2d picks the route per shape; the weight-pack LRU holds a weak reference to its weight (as in Studio's conv3d vendor); launches run under torch.cuda.device(x.device).
++# The vendored portions remain under the MIT License below:
++#
++# SPDX-License-Identifier: MIT
++# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
++#
++# MIT License
++#
++# Permission is hereby granted, free of charge, to any person obtaining a copy
++# of this software and associated documentation files (the "Software"), to deal
++# in the Software without restriction, including without limitation the rights
++# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
++# copies of the Software, and to permit persons to whom the Software is
++# furnished to do so, subject to the following conditions:
++#
++# The above copyright notice and this permission notice shall be included in all
++# copies or substantial portions of the Software.
++#
++# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
++# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
++# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
++# SOFTWARE.
++
++"""Entry points ``conv2d_1x1`` and ``conv2d_3x3_cblocked``: forward-only drop-ins for ``F.conv2d`` on contiguous NCHW
++fp16 / bf16 operands (groups 1, zeros padding). The 3x3 route packs the input to NCHWc (64-channel blocks) and the
++weight to ``[K_out, 9, C_pad]`` (cached per weight) before the direct kernel."""
++
++import weakref
++from collections import OrderedDict
++
++import torch
++import triton
++
++from .conv_1x1 import _conv2d_1x1_kernel
++from .conv_1x1 import _get_config as _get_config_1x1
++from .conv_3x3_cblocked import _conv2d_3x3_cblocked_kernel, _get_config_cblocked
++from .ncx_to_cblocked import _get_config as _get_config_prepack
++from .ncx_to_cblocked import _ncx_to_cblocked_kernel
++from ._config import format_prepack_shape_key, format_shape_key
++
++# Channel-block and padding granularity for prepacked inputs and weights (the tables were tuned with it).
++BLOCK_K = 64
++
++
++def out_hw(H, W, R, S, stride, padding, dilation):
++    sh, sw = stride
++    ph, pw = padding
++    dh, dw = dilation
++    P = (H + 2 * ph - dh * (R - 1) - 1) // sh + 1
++    Q = (W + 2 * pw - dw * (S - 1) - 1) // sw + 1
++    return P, Q
++
++
++def _round_up_to_block(size: int, block: int) -> int:
++    return ((size + block - 1) // block) * block
++
++
++def _make_mn_grid(M_total, K_out):
++    def grid(meta):
++        return (triton.cdiv(M_total, meta["BLOCK_M"]) * triton.cdiv(K_out, meta["BLOCK_N"]),)
++
++    return grid
++
++
++def _prep_bias(bias):
++    """Unit-stride bias; the epilogues promote fp16 / bf16 bias to fp32 while loading."""
++    if bias is None:
++        return None
++    return bias if bias.stride(0) == 1 else bias.contiguous()
++
++
++def config_1x1(N, C, H, W, K_out, stride, padding):
++    P, Q = out_hw(H, W, 1, 1, stride, padding, (1, 1))
++    shape_key = format_shape_key(
++        N = N, C = C, H = H, W = W, K = K_out, R = 1, S = 1,
++        sh = stride[0], sw = stride[1], ph = padding[0], pw = padding[1], dh = 1, dw = 1,
++    )  # fmt: skip
++    return _get_config_1x1(shape_key = shape_key, M = N * P * Q, variants = ("nchw",))
++
++
++def config_3x3(N, C, H, W, K_out, stride, padding, dilation):
++    P, Q = out_hw(H, W, 3, 3, stride, padding, dilation)
++    shape_key = format_shape_key(
++        N = N, C = C, H = H, W = W, K = K_out, R = 3, S = 3,
++        sh = stride[0], sw = stride[1], ph = padding[0], pw = padding[1], dh = dilation[0], dw = dilation[1],
++    )  # fmt: skip
++    return _get_config_cblocked(shape_key = shape_key, M = N * P * Q)
++
++
++def config_prepack(
++    N,
++    C,
++    H,
++    W,
++    block_c = BLOCK_K,
++):
++    return _get_config_prepack(shape_key = format_prepack_shape_key(N, C, H, W, block_c), M = H * W)
++
++
++# Weight packs: a bounded LRU holding only a weak reference to the source weight, so a pack goes with its module.
++_PACK_CACHE_MAXSIZE = 256
++
++
++class _LRUPackCache:
++    def __init__(self, maxsize: int = _PACK_CACHE_MAXSIZE):
++        self._d: OrderedDict = OrderedDict()
++        self._by_src: dict = {}
++        self._max = max(1, maxsize)
++
++    def get(self, key):
++        entry = self._d.get(key)
++        if entry is None:
++            return None
++        if entry[0]() is None:
++            self._d.pop(key, None)
++            return None
++        self._d.move_to_end(key)
++        return entry
++
++    def put(self, key, src, item):
++        # One live pack per source tensor: a weight moved (offload) or edited in place replaces its old pack.
++        old = self._by_src.get(id(src))
++        if old is not None and old != key:
++            self._d.pop(old, None)
++        self._by_src[id(src)] = key
++        self._d[key] = (weakref.ref(src), item)
++        self._d.move_to_end(key)
++        weakref.finalize(src, self._drop, id(src), key)
++        while len(self._d) > self._max:
++            self._d.popitem(last = False)
++
++    def _drop(self, src_id, key):
++        self._d.pop(key, None)
++        if self._by_src.get(src_id) == key:
++            self._by_src.pop(src_id, None)
++
++    def clear(self):
++        self._d.clear()
++        self._by_src.clear()
++
++    def __len__(self):
++        return len(self._d)
++
++    def nbytes(self) -> int:
++        return sum(item[0].numel() * item[0].element_size() for _ref, item in self._d.values())
++
++
++_PACK_CACHE_3x3 = _LRUPackCache()
++
++
++def clear_conv2d_weight_pack_caches() -> None:
++    _PACK_CACHE_3x3.clear()
++
++
++def conv2d_weight_pack_cache_bytes() -> int:
++    return _PACK_CACHE_3x3.nbytes()
++
++
++def _pack_cache_key(w: torch.Tensor, block: int) -> tuple:
++    """Identity for a packed weight, including aliases and in-place updates."""
++    return (
++        w.data_ptr(),
++        w.device.type,
++        w.device.index,
++        tuple(w.shape),
++        tuple(w.stride()),
++        w.dtype,
++        w._version,
++        block,
++    )
++
++
++def prepack_oihw_to_3x3(w_oihw: torch.Tensor, block_c: int = BLOCK_K):
++    """Pack weights as [K_out, 9, C_pad] for the 3x3 kernel."""
++    K_out, C, R, S = w_oihw.shape
++    assert R == 3 and S == 3
++    C_pad = _round_up_to_block(C, block_c)
++    packed = w_oihw.reshape(K_out, C, 9).permute(0, 2, 1).contiguous()
++    if C_pad != C:
++        packed = torch.cat((packed, packed.new_zeros((K_out, 9, C_pad - C))), dim = -1).contiguous()
++    return packed, C_pad
++
++
++def get_or_make_weight_pack_3x3(w_oihw: torch.Tensor, block_c: int = BLOCK_K):
++    if w_oihw.is_inference():
++        return prepack_oihw_to_3x3(w_oihw, block_c)
++    key = _pack_cache_key(w_oihw, block_c)
++    cached = _PACK_CACHE_3x3.get(key)
++    if cached is not None:
++        return cached[1]
++    packed = prepack_oihw_to_3x3(w_oihw, block_c)
++    _PACK_CACHE_3x3.put(key, w_oihw, packed)
++    return packed
++
++
++def prepack_nchw_to_cblocked(x: torch.Tensor, block_c: int = BLOCK_K):
++    """Materialize contiguous NCHW as [N, C_blocks, H, W, Cb] in one Triton pass."""
++    N, C, H, W = x.shape
++    C_blocks = (C + block_c - 1) // block_c
++    C_pad = _round_up_to_block(C, block_c)
++    x_blocked = torch.empty((N, C_blocks, H, W, block_c), device = x.device, dtype = x.dtype)
++    HW = H * W
++    config = config_prepack(N, C, H, W, block_c)
++
++    def grid(meta):
++        return (triton.cdiv(HW, meta["BLOCK_M"]), triton.cdiv(C_pad, meta["BLOCK_C"]), N)
++
++    _ncx_to_cblocked_kernel[grid](x, x_blocked, C, HW, C_PAD = C_pad, CB = block_c, **config)
++    return x_blocked, C_pad
++
++
++def _check(x, w, bias, R):
++    if x.dtype not in (torch.float16, torch.bfloat16) or w.dtype != x.dtype:
++        raise ValueError(
++            f"conv2d needs fp16 / bf16 operands of one dtype, got {x.dtype} / {w.dtype}"
++        )
++    if not x.is_cuda or w.device != x.device or (bias is not None and bias.device != x.device):
++        raise ValueError("conv2d input, weight and bias must be on one CUDA / ROCm device")
++    if x.dim() != 4 or w.dim() != 4 or w.shape[1] != x.shape[1] or tuple(w.shape[2:]) != (R, R):
++        raise ValueError(f"conv2d shape mismatch: x={tuple(x.shape)} w={tuple(w.shape)}")
++
++
++def conv2d_1x1(
++    x,
++    w_oihw,
++    bias = None,
++    stride = (1, 1),
++    padding = (0, 0),
++):
++    """NCHW 1x1 conv2d (dilation is irrelevant for a 1x1 kernel)."""
++    _check(x, w_oihw, bias, 1)
++    x = x.contiguous()
++    N, C, H, W_in = x.shape
++    K_out = w_oihw.shape[0]
++    sh, sw = stride
++    ph, pw = padding
++    P, Q = out_hw(H, W_in, 1, 1, stride, padding, (1, 1))
++    M_total = N * P * Q
++    with torch.cuda.device(x.device):
++        y = torch.empty((N, K_out, P, Q), device = x.device, dtype = x.dtype)
++        bias = _prep_bias(bias)
++        w = w_oihw.reshape(K_out, C).contiguous()
++        config = config_1x1(N, C, H, W_in, K_out, stride, padding)
++        _conv2d_1x1_kernel[_make_mn_grid(M_total, K_out)](
++            x, w, bias, y, N, C, H, W_in, K_out, P, Q, sh, sw, ph, pw, M_total,
++            HAS_BIAS = bias is not None, ACTIVATION = "none", LAYOUT = "nchw", **config,
++        )  # fmt: skip
++    return y
++
++
++def conv2d_3x3_cblocked(
++    x,
++    w_oihw,
++    bias = None,
++    stride = (1, 1),
++    padding = (1, 1),
++    dilation = (1, 1),
++):
++    """NCHW 3x3 conv2d through the NCHWc input pack and the channel-blocked direct kernel."""
++    _check(x, w_oihw, bias, 3)
++    x = x.contiguous()
++    N, C, H, W_in = x.shape
++    K_out = w_oihw.shape[0]
++    sh, sw = stride
++    ph, pw = padding
++    dh, dw = dilation
++    P, Q = out_hw(H, W_in, 3, 3, stride, padding, dilation)
++    M_total = N * P * Q
++    with torch.cuda.device(x.device):
++        y = torch.empty((N, K_out, P, Q), device = x.device, dtype = x.dtype)
++        bias = _prep_bias(bias)
++        w_3x3, C_pad = get_or_make_weight_pack_3x3(w_oihw, BLOCK_K)
++        x_blocked, _ = prepack_nchw_to_cblocked(x, BLOCK_K)
++        config = config_3x3(N, C, H, W_in, K_out, stride, padding, dilation)
++        _conv2d_3x3_cblocked_kernel[_make_mn_grid(M_total, K_out)](
++            x_blocked, w_3x3, bias, y, N, C, H, W_in, K_out, P, Q, C_pad, BLOCK_K,
++            sh, sw, ph, pw, dh, dw, M_total,
++            HAS_BIAS = bias is not None, ACTIVATION = "none", **config,
++        )  # fmt: skip
++    return y
+diff --git a/studio/backend/core/inference/rocm_triton_conv2d/conv_1x1.py b/studio/backend/core/inference/rocm_triton_conv2d/conv_1x1.py
+new file mode 100644
+index 0000000000..2a870754cf
+--- /dev/null
++++ b/studio/backend/core/inference/rocm_triton_conv2d/conv_1x1.py
+@@ -0,0 +1,189 @@
++# SPDX-License-Identifier: AGPL-3.0-only
++# Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
++#
++# Vendored from ROCm/aiter (https://github.com/ROCm/aiter), commit 6aa39366b7d368d415231643bc10fa0e9114cc32,
++# aiter/ops/triton/_triton_kernels/conv/conv_1x1.py.
++# Changes: import paths; the activation epilogue dropped (Studio launches ACTIVATION="none" only, a no-op upstream too).
++# The vendored portions remain under the MIT License below:
++#
++# SPDX-License-Identifier: MIT
++# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
++#
++# MIT License
++#
++# Permission is hereby granted, free of charge, to any person obtaining a copy
++# of this software and associated documentation files (the "Software"), to deal
++# in the Software without restriction, including without limitation the rights
++# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
++# copies of the Software, and to permit persons to whom the Software is
++# furnished to do so, subject to the following conditions:
++#
++# The above copyright notice and this permission notice shall be included in all
++# copies or substantial portions of the Software.
++#
++# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
++# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
++# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
++# SOFTWARE.
++
++import triton
++import triton.language as tl
++
++from ._config import get_conv_config
++from ._kernel_repr import make_kernel_repr
++
++
++def _get_config(
++    shape_key = None,
++    M = None,
++    variants = (),
++):
++    return get_conv_config("CONV-1X1", shape_key = shape_key, M = M, variants = variants)
++
++
++_conv2d_1x1_kernel_repr = make_kernel_repr(
++    "_conv2d_1x1_kernel",
++    [
++        "BLOCK_M",
++        "BLOCK_N",
++        "BLOCK_K",
++        "GROUP_SIZE_M",
++        "HAS_BIAS",
++        "ACTIVATION",
++        "LAYOUT",
++    ],
++)
++
++
++@triton.jit(repr = _conv2d_1x1_kernel_repr)
++def _conv2d_1x1_kernel(
++    X,
++    W,
++    BIAS,
++    Y,
++    N,
++    C: tl.constexpr,
++    H: tl.constexpr,
++    W_in: tl.constexpr,
++    K_out: tl.constexpr,
++    P: tl.constexpr,
++    Q: tl.constexpr,
++    stride_h,
++    stride_w,
++    pad_h,
++    pad_w,
++    M_total,
++    BLOCK_M: tl.constexpr,
++    BLOCK_N: tl.constexpr,
++    BLOCK_K: tl.constexpr,
++    GROUP_SIZE_M: tl.constexpr,
++    HAS_BIAS: tl.constexpr,
++    ACTIVATION: tl.constexpr,
++    LAYOUT: tl.constexpr,
++):
++    """
++    Specialized 1x1 convolution kernel.
++    - No R*S loop (R=S=1)
++    - Direct channel reduction
++    - Simplified pointer arithmetic
++    LAYOUT: "nchw" or "nhwc"
++    """
++    # W is always [K_out, C] contiguous
++    stride_w_kout: tl.constexpr = C
++    stride_w_c: tl.constexpr = 1
++    if LAYOUT == "nchw":
++        # NCHW: X[N, C, H, W_in], Y[N, K_out, P, Q]
++        stride_x_n: tl.constexpr = C * H * W_in
++        stride_x_c: tl.constexpr = H * W_in
++        stride_x_h: tl.constexpr = W_in
++        stride_x_w: tl.constexpr = 1
++        stride_y_n: tl.constexpr = K_out * P * Q
++        stride_y_k: tl.constexpr = P * Q
++        stride_y_p: tl.constexpr = Q
++        stride_y_q: tl.constexpr = 1
++    else:
++        # NHWC: X[N, H, W_in, C], Y[N, P, Q, K_out]
++        stride_x_n: tl.constexpr = H * W_in * C
++        stride_x_c: tl.constexpr = 1
++        stride_x_h: tl.constexpr = W_in * C
++        stride_x_w: tl.constexpr = C
++        stride_y_n: tl.constexpr = P * Q * K_out
++        stride_y_k: tl.constexpr = 1
++        stride_y_p: tl.constexpr = Q * K_out
++        stride_y_q: tl.constexpr = K_out
++
++    pid = tl.program_id(axis = 0)
++
++    # M = N * P * Q (output spatial), N_dim = K_out (output channels)
++    num_pid_m = tl.cdiv(M_total, BLOCK_M)
++    num_pid_n = tl.cdiv(K_out, BLOCK_N)
++
++    # L2 cache swizzle pattern
++    num_pid_in_group = GROUP_SIZE_M * num_pid_n
++    group_id = pid // num_pid_in_group
++    first_pid_m = group_id * GROUP_SIZE_M
++    group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
++    pid_m = first_pid_m + ((pid % num_pid_in_group) % group_size_m)
++    pid_n = (pid % num_pid_in_group) // group_size_m
++
++    # Compute output tile indices
++    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
++    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
++    offs_k = tl.arange(0, BLOCK_K)
++
++    # Valid output mask
++    m_mask = offs_m < M_total
++    kout_mask = offs_n < K_out
++
++    # Decode (n, p, q) from linear index
++    n_idx = offs_m[:, None] // (P * Q)
++    pq = offs_m[:, None] % (P * Q)
++    p_idx = pq // Q
++    q_idx = pq % Q
++
++    ih = p_idx * stride_h - pad_h
++    iw = q_idx * stride_w - pad_w
++
++    # Check spatial bounds
++    spatial_valid = (ih >= 0) & (ih < H) & (iw >= 0) & (iw < W_in) & (n_idx < N)
++
++    # Base pointers for this output tile
++    x_base = X + n_idx * stride_x_n + ih * stride_x_h + iw * stride_x_w  # [BLOCK_M, 1]
++    w_base = W + offs_n[None, :] * stride_w_kout  # [1, BLOCK_N]
++
++    # Accumulator
++    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype = tl.float32)
++
++    # Channel reduction loop (GEMM-K axis = C, since R=S=1)
++    for k0 in range(0, C, BLOCK_K):
++        k_offs = k0 + offs_k
++        k_mask = k_offs < C
++
++        # Load input: X[n, c, ih, iw] -> shape [BLOCK_M, BLOCK_K]
++        x_ptrs = x_base + k_offs[None, :] * stride_x_c
++        x_tile = tl.load(x_ptrs, mask = spatial_valid & k_mask[None, :], other = 0.0)
++
++        # Load weight: W[k_out, c] -> shape [BLOCK_K, BLOCK_N]
++        w_ptrs = w_base + k_offs[:, None] * stride_w_c
++        w_tile = tl.load(w_ptrs, mask = k_mask[:, None] & kout_mask[None, :], other = 0.0)
++
++        # Accumulate: [BLOCK_M, BLOCK_K] @ [BLOCK_K, BLOCK_N]
++        acc = tl.dot(x_tile, w_tile, acc = acc)
++
++    # Bias
++    if HAS_BIAS:
++        b = tl.load(BIAS + offs_n, mask = kout_mask, other = 0.0).to(tl.float32)
++        acc += b[None, :]
++
++    # Store output: Y[n, k, p, q]
++    y_ptrs = (
++        Y
++        + n_idx * stride_y_n
++        + offs_n[None, :] * stride_y_k
++        + p_idx * stride_y_p
++        + q_idx * stride_y_q
++    )
++    tl.store(y_ptrs, acc, mask = (m_mask[:, None] & kout_mask[None, :]))
+diff --git a/studio/backend/core/inference/rocm_triton_conv2d/conv_3x3_cblocked.py b/studio/backend/core/inference/rocm_triton_conv2d/conv_3x3_cblocked.py
+new file mode 100644
+index 0000000000..b5983c11d1
+--- /dev/null
++++ b/studio/backend/core/inference/rocm_triton_conv2d/conv_3x3_cblocked.py
+@@ -0,0 +1,190 @@
++# SPDX-License-Identifier: AGPL-3.0-only
++# Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
++#
++# Vendored from ROCm/aiter (https://github.com/ROCm/aiter), commit 6aa39366b7d368d415231643bc10fa0e9114cc32,
++# aiter/ops/triton/_triton_kernels/conv/conv_3x3.py (the channel-blocked NCHWc kernel only).
++# Changes: import paths; NHWC and direct NCHW kernels dropped; the activation epilogue dropped (Studio launches ACTIVATION="none" only, a no-op upstream too).
++# The vendored portions remain under the MIT License below:
++#
++# SPDX-License-Identifier: MIT
++# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
++#
++# MIT License
++#
++# Permission is hereby granted, free of charge, to any person obtaining a copy
++# of this software and associated documentation files (the "Software"), to deal
++# in the Software without restriction, including without limitation the rights
++# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
++# copies of the Software, and to permit persons to whom the Software is
++# furnished to do so, subject to the following conditions:
++#
++# The above copyright notice and this permission notice shall be included in all
++# copies or substantial portions of the Software.
++#
++# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
++# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
++# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
++# SOFTWARE.
++
++import triton
++import triton.language as tl
++
++from ._config import get_conv_config
++from ._kernel_repr import make_kernel_repr
++
++
++def _get_config_cblocked(
++    shape_key = None,
++    M = None,
++    variants = (),
++):
++    return get_conv_config("CONV-3X3-CBLOCKED", shape_key = shape_key, M = M, variants = variants)
++
++
++_conv2d_3x3_cblocked_kernel_repr = make_kernel_repr(
++    "_conv2d_3x3_cblocked_kernel",
++    [
++        "BLOCK_M",
++        "BLOCK_N",
++        "BLOCK_K",
++        "GROUP_SIZE_M",
++        "HAS_BIAS",
++        "ACTIVATION",
++    ],
++)
++
++
++@triton.jit(repr = _conv2d_3x3_cblocked_kernel_repr)
++def _conv2d_3x3_cblocked_kernel(
++    X,
++    W,
++    BIAS,
++    Y,
++    N,
++    C: tl.constexpr,
++    H: tl.constexpr,
++    W_in: tl.constexpr,
++    K_out: tl.constexpr,
++    P: tl.constexpr,
++    Q: tl.constexpr,
++    C_pad: tl.constexpr,
++    Cb: tl.constexpr,
++    stride_h,
++    stride_w,
++    pad_h,
++    pad_w,
++    dil_h,
++    dil_w,
++    M_total,
++    BLOCK_M: tl.constexpr,
++    BLOCK_N: tl.constexpr,
++    BLOCK_K: tl.constexpr,
++    GROUP_SIZE_M: tl.constexpr,
++    HAS_BIAS: tl.constexpr,
++    ACTIVATION: tl.constexpr,
++):
++    """Specialized 3x3 kernel for channel-blocked [N, C_blocks, H, W, Cb] input.
++    stride_x_cb=1 is hardcoded so the compiler emits coalesced vector loads."""
++    # X layout: [N, C_blocks, H, W_in, Cb] where C_blocks = C_pad // Cb
++    stride_x_cb: tl.constexpr = 1
++    stride_x_w: tl.constexpr = Cb
++    stride_x_h: tl.constexpr = W_in * Cb
++    stride_x_cblock: tl.constexpr = H * W_in * Cb
++    stride_x_n: tl.constexpr = (C_pad // Cb) * H * W_in * Cb
++    # W layout: [K_out, 9, C_pad] contiguous
++    stride_w_c: tl.constexpr = 1
++    stride_w_rs: tl.constexpr = C_pad
++    stride_w_kout: tl.constexpr = 9 * C_pad
++    # Y layout: [N, K_out, P, Q] contiguous NCHW
++    stride_y_q: tl.constexpr = 1
++    stride_y_p: tl.constexpr = Q
++    stride_y_k: tl.constexpr = P * Q
++    stride_y_n: tl.constexpr = K_out * P * Q
++
++    pid = tl.program_id(axis = 0)
++
++    num_pid_m = tl.cdiv(M_total, BLOCK_M)
++    num_pid_n = tl.cdiv(K_out, BLOCK_N)
++
++    num_pid_in_group = GROUP_SIZE_M * num_pid_n
++    group_id = pid // num_pid_in_group
++    first_pid_m = group_id * GROUP_SIZE_M
++    group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
++    pid_m = first_pid_m + ((pid % num_pid_in_group) % group_size_m)
++    pid_n = (pid % num_pid_in_group) // group_size_m
++
++    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
++    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
++    offs_k = tl.arange(0, BLOCK_K)
++
++    # Valid output mask
++    m_mask = offs_m < M_total
++    kout_mask = offs_n < K_out
++
++    # Decode (n, p, q) from linear index
++    n_idx = offs_m[:, None] // (P * Q)
++    pq = offs_m[:, None] % (P * Q)
++    p_idx = pq // Q
++    q_idx = pq % Q
++    n_valid = n_idx < N
++
++    # Precompute base positions
++    base_ih = p_idx * stride_h - pad_h
++    base_iw = q_idx * stride_w - pad_w
++    stride_x_dh = dil_h * stride_x_h
++    stride_x_dw = dil_w * stride_x_w
++
++    # x_base for channel-blocked layout: X[n, cblock, h, w, k_local]
++    # base pointer accounts for n, h, w
++    x_base = X + n_idx * stride_x_n + base_ih * stride_x_h + base_iw * stride_x_w
++
++    # Weight base: W[K_out, 9, C_pad]
++    w_base = W + offs_n[None, :] * stride_w_kout
++
++    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype = tl.float32)
++
++    for r in tl.static_range(3):
++        ih = base_ih + r * dil_h
++        valid_ih = n_valid & (ih >= 0) & (ih < H)
++        for s in tl.static_range(3):
++            rs_idx = r * 3 + s
++            iw = base_iw + s * dil_w
++            spatial_valid = valid_ih & (iw >= 0) & (iw < W_in)
++
++            for k0 in range(0, C_pad, BLOCK_K):
++                k_offs = k0 + offs_k
++                k_mask = k_offs < C
++
++                # Compute cblock index and local offset within block
++                cblock_idx = k_offs // Cb
++                k_local = k_offs % Cb
++
++                x_ptrs = (
++                    x_base
++                    + cblock_idx[None, :] * stride_x_cblock
++                    + k_local[None, :] * stride_x_cb
++                    + r * stride_x_dh
++                    + s * stride_x_dw
++                )
++                w_ptrs = w_base + rs_idx * stride_w_rs + k_offs[:, None] * stride_w_c
++
++                x_tile = tl.load(x_ptrs, mask = spatial_valid & k_mask[None, :], other = 0.0)
++                w_tile = tl.load(w_ptrs, mask = k_mask[:, None] & kout_mask[None, :], other = 0.0)
++                acc = tl.dot(x_tile, w_tile, acc = acc)
++
++    # Epilogue: bias + activation + store
++    if HAS_BIAS:
++        b = tl.load(BIAS + offs_n, mask = offs_n < K_out, other = 0.0).to(tl.float32)
++        acc += b[None, :]
++
++    y_ptrs = (
++        Y
++        + n_idx * stride_y_n
++        + offs_n[None, :] * stride_y_k
++        + p_idx * stride_y_p
++        + q_idx * stride_y_q
++    )
++    tl.store(y_ptrs, acc, mask = (m_mask[:, None] & kout_mask[None, :]))
+diff --git a/studio/backend/core/inference/rocm_triton_conv2d/ncx_to_cblocked.py b/studio/backend/core/inference/rocm_triton_conv2d/ncx_to_cblocked.py
+new file mode 100644
+index 0000000000..6fea9bbcb8
+--- /dev/null
++++ b/studio/backend/core/inference/rocm_triton_conv2d/ncx_to_cblocked.py
+@@ -0,0 +1,81 @@
++# SPDX-License-Identifier: AGPL-3.0-only
++# Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
++#
++# Vendored from ROCm/aiter (https://github.com/ROCm/aiter), commit 6aa39366b7d368d415231643bc10fa0e9114cc32,
++# aiter/ops/triton/_triton_kernels/conv/ncx_to_cblocked.py (the Conv2D config only).
++# Changes: import paths; the Conv3D config helper dropped.
++# The vendored portions remain under the MIT License below:
++#
++# SPDX-License-Identifier: MIT
++# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
++#
++# MIT License
++#
++# Permission is hereby granted, free of charge, to any person obtaining a copy
++# of this software and associated documentation files (the "Software"), to deal
++# in the Software without restriction, including without limitation the rights
++# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
++# copies of the Software, and to permit persons to whom the Software is
++# furnished to do so, subject to the following conditions:
++#
++# The above copyright notice and this permission notice shall be included in all
++# copies or substantial portions of the Software.
++#
++# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
++# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
++# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
++# SOFTWARE.
++
++import triton
++import triton.language as tl
++
++from ._config import get_conv_config
++from ._kernel_repr import make_kernel_repr
++
++
++def _get_config(
++    shape_key = None,
++    M = None,
++    variants = (),
++):
++    return get_conv_config("CONV-PREPACK", shape_key = shape_key, M = M, variants = variants)
++
++
++_ncx_to_cblocked_kernel_repr = make_kernel_repr(
++    "_ncx_to_cblocked_kernel",
++    ["BLOCK_C", "BLOCK_M", "CB"],
++)
++
++
++@triton.jit(repr = _ncx_to_cblocked_kernel_repr)
++def _ncx_to_cblocked_kernel(
++    X, Y, C, M, C_PAD: tl.constexpr, CB: tl.constexpr, BLOCK_C: tl.constexpr, BLOCK_M: tl.constexpr
++):
++    """Transpose a contiguous [C, spatial] plane to [C/CB, spatial, CB]."""
++    pid_m = tl.program_id(0)
++    pid_c = tl.program_id(1)
++    pid_n = tl.program_id(2)
++
++    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
++    offs_c = pid_c * BLOCK_C + tl.arange(0, BLOCK_C)
++
++    x_ptrs = X + pid_n * C * M + offs_c[:, None] * M + offs_m[None, :]
++    tile = tl.load(
++        x_ptrs,
++        mask = (offs_c[:, None] < C) & (offs_m[None, :] < M),
++        other = 0.0,
++    )
++
++    c_block = offs_c // CB
++    c_local = offs_c % CB
++    y_ptrs = (
++        Y + pid_n * C_PAD * M + c_block[None, :] * M * CB + offs_m[:, None] * CB + c_local[None, :]
++    )
++    tl.store(
++        y_ptrs,
++        tl.trans(tile),
++        mask = (offs_m[:, None] < M) & (offs_c[None, :] < C_PAD),
++    )
+diff --git a/studio/backend/tests/test_diffusion_rocm_triton_conv2d.py b/studio/backend/tests/test_diffusion_rocm_triton_conv2d.py
+new file mode 100644
+index 0000000000..67fba7a2b1
+--- /dev/null
++++ b/studio/backend/tests/test_diffusion_rocm_triton_conv2d.py
+@@ -0,0 +1,541 @@
++# SPDX-License-Identifier: AGPL-3.0-only
++# Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
++
++"""ROCm gfx1151 Triton conv2d for the FLUX.2 / FLUX.3 VAE decoder (vendored from ROCm/aiter): the per-shape routing
++table, gating and kill switch, MIOpen fallbacks, the meta-device prebuild plan and manifest gate, license headers, and
++the vendored kernels' numerics under the Triton interpreter (no GPU)."""
++
++from __future__ import annotations
++
++import os
++import subprocess
++import sys
++import types
++from pathlib import Path
++
++import pytest
++
++torch = pytest.importorskip("torch")
++F = torch.nn.functional
++
++from core.inference import diffusion_rocm_triton_conv2d as R  # noqa: E402
++
++try:  # imported before any fixture fakes a ROCm card
++    import diffusers as _diffusers
++except Exception:  # noqa: BLE001
++    _diffusers = None
++
++BACKEND = Path(__file__).resolve().parents[1]
++PKG = BACKEND / "core" / "inference" / "rocm_triton_conv2d"
++GiB = 1 << 30
++# The FLUX.2 VAE config (black-forest-labs/FLUX.2-dev vae/config.json, shared by FLUX.2 klein and FLUX.3 klein).
++FLUX2_VAE_CONFIG = {
++    "act_fn": "silu",
++    "batch_norm_eps": 0.0001,
++    "batch_norm_momentum": 0.1,
++    "block_out_channels": [128, 256, 512, 512],
++    "down_block_types": ["DownEncoderBlock2D"] * 4,
++    "force_upcast": True,
++    "in_channels": 3,
++    "latent_channels": 32,
++    "layers_per_block": 2,
++    "mid_block_add_attention": True,
++    "norm_num_groups": 32,
++    "out_channels": 3,
++    "patch_size": [2, 2],
++    "sample_size": 1024,
++    "up_block_types": ["UpDecoderBlock2D"] * 4,
++    "use_post_quant_conv": True,
++    "use_quant_conv": True,
++}
++
++
++class _Kernels:
++    """Stand-in for the vendored module: F.conv2d as the kernel (separate tensor), counts launches per route."""
++
++    def __init__(self, fail = None):
++        self.calls = {"1x1": 0, "3x3": 0}
++        self.fail = fail
++
++    def _go(self, route, x, w, b, padding):
++        self.calls[route] += 1
++        if self.fail is not None:
++            raise self.fail
++        return F.conv2d(x, w, b, padding = padding) + 0
++
++    def conv2d_1x1(self, x, w, b, stride, padding):
++        return self._go("1x1", x, w, b, padding)
++
++    def conv2d_3x3_cblocked(self, x, w, b, stride, padding, dilation):
++        return self._go("3x3", x, w, b, padding)
++
++    def clear_conv2d_weight_pack_caches(self):
++        pass
++
++    @property
++    def total(self):
++        return sum(self.calls.values())
++
++
++def _reset():
++    for d in (R._READY, R._PENDING, R._ATTEMPTS, R._DEVICE_OK):
++        d.clear()
++    R._PB.clear()
++    R._FAILED.clear()
++    for k in [k for k in R._STATE if isinstance(k, tuple)]:
++        R._STATE.pop(k)
++    R.reset_counts()
++
++
++@pytest.fixture
++def gpu(monkeypatch):
++    """A gfx1151 ROCm card on Linux with plenty of free memory; CPU tensors stand in for device tensors."""
++    monkeypatch.delenv(R.ENABLE_ENV, raising = False)
++    monkeypatch.setenv(R.SELFCHECK_ENV, "0")
++    monkeypatch.setenv(R.PREBUILD_ENV, "0")  # inline compile; the prebuild gate has its own tests
++    monkeypatch.setattr(sys, "platform", "linux")
++    monkeypatch.setattr(torch.version, "hip", "7.13.0-fake", raising = False)
++    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
++    monkeypatch.setattr(
++        torch.cuda,
++        "get_device_properties",
++        lambda *_a, **_k: types.SimpleNamespace(gcnArchName = "gfx1151:xnack-"),
++    )
++    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
++    monkeypatch.setattr(torch.cuda, "mem_get_info", lambda *_a: (64 * GiB, 128 * GiB))
++    monkeypatch.setattr(R, "_on_gpu", lambda t: True)
++    kernels = _Kernels()
++    monkeypatch.setitem(R._STATE, "mod", kernels)
++    _reset()
++    yield kernels
++    R.cancel_pending()
++    _reset()
++
++
++class AutoencoderKLFlux2(torch.nn.Module):
++    """Same class name as the FLUX.2 VAE: one routable 3x3, one routable 1x1, and the two losing klein shapes."""
++
++    def __init__(self, dtype = torch.bfloat16):
++        super().__init__()
++        g = torch.Generator().manual_seed(0)
++
++        def conv(cin, cout, k):
++            m = torch.nn.Conv2d(cin, cout, k, padding = k // 2).to(dtype)
++            with torch.no_grad():
++                m.weight.copy_(torch.randn(m.weight.shape, generator = g) * 0.05)
++            return m
++
++        self.conv3 = conv(128, 128, 3)
++        self.conv1 = conv(256, 128, 1)
++        self.conv_in = conv(32, 512, 3)
++        self.post_quant_conv = conv(32, 32, 1)
++
++
++def _x(shape, dtype = torch.bfloat16):
++    return torch.randn(shape, generator = torch.Generator().manual_seed(1)).to(dtype)
++
++
++# ---- routing table ----
++
++
++def _klein_calls(side = 128):
++    if _diffusers is None:
++        pytest.skip("diffusers missing")
++    vae = _diffusers.AutoencoderKLFlux2.from_config(FLUX2_VAE_CONFIG)
++    return R.trace_decoder_calls(vae, (side, side), torch.bfloat16)
++
++
++def _routes(calls):
++    return [R.route_for(x, w, (1, 1), (w[2] // 2,) * 2, (1, 1), "bfloat16") for x, w, _b in calls]
++
++
++def test_klein_1024_decode_routes_every_measured_winner_and_keeps_the_two_losers_on_miopen():
++    calls = _klein_calls()
++    routes = _routes(calls)
++    assert len(calls) == 36 and sum(r is not None for r in routes) == 34
++    stays = {(x, w) for (x, w, _b), r in zip(calls, routes) if r is None}
++    assert stays == {
++        ((1, 32, 128, 128), (32, 32, 1, 1)),  # post_quant_conv: 0.81x
++        ((1, 32, 128, 128), (512, 32, 3, 3)),  # conv_in: 0.71x
++    }
++    variants = {
++        R.variant_key(r, x, w, "bfloat16", b, True) for (x, w, b), r in zip(calls, routes) if r
++    }
++    assert len(variants) == 11
++
++
++def test_route_table_rejects_unmeasured_calls():
++    ok = ((1, 128, 1024, 1024), (128, 128, 3, 3))
++    assert R.route_for(*ok, (1, 1), (1, 1), (1, 1), "bfloat16") == "3x3"
++    assert (
++        R.route_for((1, 256, 1024, 1024), (128, 256, 1, 1), (1, 1), (0, 0), (1, 1), "bfloat16")
++        == "1x1"
++    )
++    assert R.route_for(*ok, (1, 1), (1, 1), (1, 1), "float16") is None  # fp16 unmeasured
++    assert (
++        R.route_for((2, 128, 1024, 1024), ok[1], (1, 1), (1, 1), (1, 1), "bfloat16") is None
++    )  # batch 2
++    assert R.route_for(*ok, (2, 2), (1, 1), (1, 1), "bfloat16") is None
++    assert R.route_for(*ok, (1, 1), (0, 0), (1, 1), "bfloat16") is None
++    assert R.route_for(*ok, (1, 1), (1, 1), (2, 2), "bfloat16") is None
++    assert (
++        R.route_for((1, 128, 64, 64), ok[1], (1, 1), (1, 1), (1, 1), "bfloat16") is None
++    )  # plane below bucket
++    assert (
++        R.route_for((1, 128, 2048, 2048), ok[1], (1, 1), (1, 1), (1, 1), "bfloat16") is None
++    )  # above
++    assert (
++        R.route_for((1, 144, 1024, 1024), (4, 144, 3, 3), (1, 1), (1, 1), (1, 1), "bfloat16")
++        is None
++    )
++
++
++def test_other_resolutions_route_inside_the_measured_planes_only():
++    """A 512^2 image routes its large-plane layers; a 2048^2 image keeps the planes above 1024^2 on MIOpen."""
++    small = _routes(_klein_calls(64))
++    big_calls = _klein_calls(256)
++    big = _routes(big_calls)
++    assert 0 < sum(r is not None for r in small) < 34
++    for (x, _w, _b), r in zip(big_calls, big):
++        if x[2] * x[3] > 1048576:
++            assert r is None
++
++
++# ---- gating ----
++
++
++def test_default_on_for_gfx1151_linux_and_the_flux2_vae_only(gpu, monkeypatch):
++    assert R.install(AutoencoderKLFlux2()) == 2  # conv_in / post_quant_conv never wrapped
++    other = torch.nn.Module()
++    other.conv = torch.nn.Conv2d(128, 128, 3, padding = 1)
++    assert R.install(other) == 0
++    monkeypatch.setenv(R.ENABLE_ENV, "1")
++    assert R.install(other) == 1
++
++
++def test_untouched_modules_stay_byte_identical(gpu):
++    vae = AutoencoderKLFlux2()
++    R.install(vae)
++    for name in ("conv_in", "post_quant_conv"):
++        assert "_conv_forward" not in getattr(vae, name).__dict__
++
++
++@pytest.mark.parametrize(
++    "hip, arch, platform, env, wrapped",
++    [
++        (None, "gfx1151", "linux", None, 0),  # CUDA / CPU torch
++        ("7.13", "gfx1100", "linux", None, 0),  # other RDNA3: env opt-in only
++        ("7.13", "gfx1100", "linux", "1", 2),
++        ("7.13", "gfx942", "linux", "1", 0),  # CDNA never
++        ("7.14", "gfx1151", "win32", None, 0),  # Windows unmeasured: off by default
++        ("7.14", "gfx1151", "win32", "1", 2),
++        ("7.13", "gfx1151", "linux", "0", 0),  # kill switch
++    ],
++)
++def test_gate(gpu, monkeypatch, hip, arch, platform, env, wrapped):
++    monkeypatch.setattr(torch.version, "hip", hip, raising = False)
++    monkeypatch.setattr(sys, "platform", platform)
++    monkeypatch.setattr(
++        torch.cuda,
++        "get_device_properties",
++        lambda *_a, **_k: types.SimpleNamespace(gcnArchName = arch),
++    )
++    if env is None:
++        monkeypatch.delenv(R.ENABLE_ENV, raising = False)
++    else:
++        monkeypatch.setenv(R.ENABLE_ENV, env)
++    assert R.install(AutoencoderKLFlux2()) == wrapped
++
++
++def test_kill_switch_after_install_keeps_miopen_per_call(gpu, monkeypatch):
++    vae = AutoencoderKLFlux2()
++    R.install(vae)
++    monkeypatch.setenv(R.ENABLE_ENV, "0")
++    R._DEVICE_OK.clear()
++    with torch.no_grad():
++        vae.conv3(_x((1, 128, 512, 512)))
++    assert gpu.total == 0
++
++
++# ---- per call ----
++
++
++def test_routed_calls_match_stock_and_are_counted(gpu):
++    vae = AutoencoderKLFlux2()
++    R.install(vae)
++    x3, x1 = _x((1, 128, 512, 512)), _x((1, 256, 512, 512))
++    with torch.no_grad():
++        y3, y1 = vae.conv3(x3), vae.conv1(x1)
++        small = vae.conv3(_x((1, 128, 64, 64)))  # below the bucket: MIOpen
++    assert torch.equal(y3, F.conv2d(x3, vae.conv3.weight, vae.conv3.bias, padding = 1))
++    assert torch.equal(y1, F.conv2d(x1, vae.conv1.weight, vae.conv1.bias))
++    assert gpu.calls == {"1x1": 1, "3x3": 1} and small.shape == (1, 128, 64, 64)
++    assert R.COUNTS["routed"] == 2 and R.COUNTS["skipped_table"] == 1
++
++
++def test_stock_when_grad_dtype_compiling_or_channels_last(gpu, monkeypatch):
++    vae = AutoencoderKLFlux2()
++    R.install(vae)
++    x = _x((1, 128, 512, 512))
++    with torch.no_grad():
++        vae.float()
++        vae.conv3(x.float())  # fp32 module: stock
++        vae.to(torch.bfloat16)
++        vae.conv3(x.contiguous(memory_format = torch.channels_last))
++        with monkeypatch.context() as mp:
++            mp.setattr(torch.compiler, "is_compiling", lambda: True)
++            vae.conv3(x)
++    vae.conv3(x.requires_grad_())
++    assert gpu.total == 0 and R.COUNTS["fallback_layout"] == 1
++
++
++def test_launch_failure_falls_back_once_and_oom_reraises(gpu, monkeypatch):
++    vae = AutoencoderKLFlux2()
++    R.install(vae)
++    x = _x((1, 128, 512, 512))
++    gpu.fail = RuntimeError("triton boom")
++    with torch.no_grad():
++        y = vae.conv3(x)
++        vae.conv3(x)
++    assert torch.equal(y, F.conv2d(x, vae.conv3.weight, vae.conv3.bias, padding = 1))
++    assert gpu.calls["3x3"] == 1 and R.COUNTS["fallback_error"] == 2
++    gpu.fail = torch.OutOfMemoryError("oom")
++    with torch.no_grad(), pytest.raises(torch.OutOfMemoryError):
++        vae.conv1(_x((1, 256, 512, 512)))
++
++
++def test_low_free_memory_keeps_miopen(gpu, monkeypatch):
++    vae = AutoencoderKLFlux2()
++    R.install(vae)
++    monkeypatch.setattr(torch.cuda, "mem_get_info", lambda *_a: (256 << 20, 128 * GiB))
++    with torch.no_grad():
++        vae.conv3(_x((1, 128, 1024, 1024)))
++    assert gpu.total == 0 and R.COUNTS["fallback_memory"] == 1
++
++
++def test_uninstall_restores_the_class_forward(gpu):
++    vae = AutoencoderKLFlux2()
++    assert R.install(vae) == 2 and R.status(vae)["wrapped"] == 2
++    assert R.uninstall(vae) == 2 and R.status(vae) is None
++    assert all("_conv_forward" not in m.__dict__ for m in vae.modules())
++
++
++# ---- prebuild gate ----
++
++
++@pytest.fixture
++def cold(gpu, monkeypatch, tmp_path):
++    """The default gate (prebuild on) over an empty Triton cache dir; children recorded, never spawned."""
++    pytest.importorskip("triton")
++    monkeypatch.delenv(R.PREBUILD_ENV, raising = False)
++    monkeypatch.delenv("UNSLOTH_DIFFUSION_VAE_PREBUILD", raising = False)
++    monkeypatch.setenv("TRITON_CACHE_DIR", str(tmp_path / "triton"))
++    monkeypatch.setattr(R, "KICK_DEBOUNCE_S", 3600.0)  # the timer never fires: tests call _kick
++    kicks: list = []
++
++    def spawn(
++        job,
++        logger,
++        target = None,
++        timeout = None,
++        on_exit = None,
++    ):
++        kicks.append((job, target))
++        return True
++
++    from core.inference import diffusion_vae_prebuild as VP
++
++    monkeypatch.setattr(VP, "_spawn", spawn)
++    _reset()
++    gpu.kicks = kicks
++    yield gpu
++
++
++def test_load_prebuild_queues_the_1024_decode_variants_and_the_selfcheck(cold, monkeypatch):
++    if _diffusers is None:
++        pytest.skip("diffusers missing")
++    vae = _diffusers.AutoencoderKLFlux2.from_config(FLUX2_VAE_CONFIG).to(torch.bfloat16)
++    wrapped = R.install(vae)
++    assert wrapped == sum(
++        1
++        for m in vae.modules()
++        if isinstance(m, torch.nn.Conv2d)
++        and (m.in_channels, m.out_channels, m.kernel_size[0]) in R.SHAPE_TABLE
++    )
++    assert R.prebuild(vae) == 11
++    job, target = cold.kicks[0]
++    assert target == (R.__name__, "_prebuild_child") and job["owner"] == "image"
++    assert job["selfcheck"] == ["bfloat16"] and len(job["specs"]) == 11
++    assert all(s["aligned"] and s["x"][0] == 1 for s in job["specs"])
++
++
++def test_cold_call_runs_miopen_then_routes_once_the_manifest_lists_it(cold):
++    vae = AutoencoderKLFlux2()
++    R.install(vae)
++    x = _x((1, 128, 512, 512))
++    with torch.no_grad():
++        y = vae.conv3(x)  # self-check cold
++        vae.conv3(x)
++    assert cold.total == 0 and R.COUNTS["fallback_cold"] == 2
++    assert torch.equal(y, F.conv2d(x, vae.conv3.weight, vae.conv3.bias, padding = 1))
++    path = R._manifest_path()
++    R._c3._merge_manifest(path, selfcheck = {str(torch.bfloat16): True})
++    R._child_exit(0)
++    with torch.no_grad():
++        vae.conv3(x)  # self-check ready, variant cold: queued
++    vk = R.variant_key(
++        "3x3", x.shape, vae.conv3.weight.shape, "bfloat16", True, x.data_ptr() % 16 == 0
++    )
++    assert vk in R._PENDING and cold.total == 0
++    R._kick()
++    assert [s["key"] for s in cold.kicks[-1][0]["specs"]] == [vk]
++    R._c3._merge_manifest(path, keys = (vk,))
++    R._child_exit(0)
++    with torch.no_grad():
++        y2 = vae.conv3(x)
++    assert cold.calls["3x3"] == 1 and R.COUNTS["routed"] == 1 and torch.equal(y, y2)
++
++
++def test_failed_child_selfcheck_keeps_miopen(cold):
++    vae = AutoencoderKLFlux2()
++    R.install(vae)
++    R._c3._merge_manifest(R._manifest_path(), selfcheck = {str(torch.bfloat16): False})
++    with torch.no_grad():
++        vae.conv3(_x((1, 128, 512, 512)))
++        vae.conv3(_x((1, 128, 512, 512)))
++    assert cold.total == 0 and not R._PENDING
++
++
++def test_child_compiles_specs_and_writes_the_manifest(cold, monkeypatch):
++    monkeypatch.setattr(R._c3, "_child_device", lambda _t, _i: torch.device("cpu"))
++    monkeypatch.setattr(torch.cuda, "synchronize", lambda *_a: None)
++    path = R._manifest_path()
++    good = R._spec("3x3", (1, 128, 32, 32), (128, 128, 3, 3), "bfloat16", True, True, 0)
++    good["key"] = R.variant_key("3x3", good["x"], good["w"], "bfloat16", True, True)
++    stale = dict(good, key = "not this call's variant")
++    R._prebuild_child(
++        {"device": 0, "manifest": path, "selfcheck": ["bfloat16"], "specs": [good, stale]}
++    )
++    data = R._c3._read_manifest(path)
++    assert data["keys"] == [good["key"]] and data["selfcheck"] == {str(torch.bfloat16): True}
++    assert cold.calls["3x3"] == 1  # the stale spec never launched
++
++
++def test_opt_out_compiles_inline(cold, monkeypatch):
++    for env in (R.PREBUILD_ENV, "UNSLOTH_DIFFUSION_VAE_PREBUILD"):
++        monkeypatch.setenv(env, "0")
++        vae = AutoencoderKLFlux2()
++        R.install(vae)
++        before = cold.total
++        with torch.no_grad():
++            vae.conv3(_x((1, 128, 512, 512)))
++        assert cold.total == before + 1 and R.prebuild(vae) == 0
++        monkeypatch.delenv(env)
++
++
++def test_image_unload_cancels_pending_conv2d_builds(cold):
++    from core.inference import diffusion_vae_prebuild as VP
++
++    R._PENDING["k"] = {"device": 0}
++    R._arm_timer()
++    VP.cancel_all("video")
++    assert R._PENDING  # a video unload leaves the image router alone
++    VP.cancel_all("image")
++    assert not R._PENDING and R._PB.get("timer") is None
++
++
++# ---- wiring ----
++
++
++def test_image_load_installs_only_unless_speed_is_explicitly_off_and_status_is_conditional():
++    src = (BACKEND / "core" / "inference" / "diffusion.py").read_text(encoding = "utf-8")
++    i = src.index("diffusion_rocm_triton_conv2d.install(")
++    guard = src[src.rindex("rocm_conv2d = 0", 0, i) : i]
++    assert 'getattr(target, "backend", None) == "rocm"' in guard
++    assert "speed_mode is None or effective_speed != SPEED_OFF" in guard
++    assert "diffusion_rocm_triton_conv2d.prebuild(" in src
++    assert "**_rocm_triton_conv2d_status(state.pipe)" in src
++    from core.inference import diffusion as D
++
++    assert D._rocm_triton_conv2d_status(types.SimpleNamespace(vae = torch.nn.Conv2d(1, 1, 1))) == {}
++
++
++# ---- vendored package ----
++
++
++def test_every_vendored_file_carries_both_licenses():
++    files = sorted(PKG.glob("*.py"))
++    assert len(files) == 7
++    for f in files:
++        head = f.read_text(encoding = "utf-8")[:4000]
++        assert head.startswith("# SPDX-License-Identifier: AGPL-3.0-only\n"), f.name
++        assert "# SPDX-License-Identifier: MIT" in head, f.name
++        assert (
++            "MIT License" in head and "Permission is hereby granted, free of charge" in head
++        ), f.name
++        assert "Advanced Micro Devices, Inc. All rights reserved." in head, f.name
++        assert "ROCm/aiter" in head and "6aa39366b7d368d415231643bc10fa0e9114cc32" in head, f.name
++
++
++def test_vendored_package_needs_no_aiter():
++    for f in PKG.glob("*.py"):
++        for line in f.read_text(encoding = "utf-8").splitlines():
++            s = line.strip()
++            if s.startswith(("import ", "from ")):
++                assert "aiter" not in s, (f.name, s)
++
++
++def test_tables_pick_the_measured_kernel_configs():
++    """The configs the gfx1151 profile showed (BLOCK_N 128 / GROUP 8 at 512->512 128^2 and 256^2, 64 / 4 at 512^2)."""
++    pytest.importorskip("triton")
++    from core.inference.rocm_triton_conv2d import conv2d as C
++
++    assert C.config_3x3(1, 512, 128, 128, 512, (1, 1), (1, 1), (1, 1))["BLOCK_N"] == 128
++    assert C.config_3x3(1, 512, 256, 256, 512, (1, 1), (1, 1), (1, 1))["GROUP_SIZE_M"] == 8
++    assert C.config_3x3(1, 512, 512, 512, 512, (1, 1), (1, 1), (1, 1))["BLOCK_N"] == 64
++    assert C.config_1x1(1, 512, 512, 512, 256, (1, 1), (0, 0))["BLOCK_N"] == 128
++
++
++_INTERP = r"""
++import contextlib, os, sys
++os.environ["TRITON_INTERPRET"] = "1"
++import torch, torch.nn.functional as F
++sys.path.insert(0, sys.argv[1])
++from core.inference.rocm_triton_conv2d import conv2d as C
++assert "aiter" not in sys.modules
++torch.cuda.device = lambda d: contextlib.nullcontext()
++C._check = lambda *a: None
++torch.manual_seed(0)
++for route, N, c, H, W, K, bias in [
++    ("1x1", 1, 64, 6, 7, 48, True),
++    ("1x1", 1, 96, 5, 5, 40, False),
++    ("3x3", 1, 64, 6, 6, 64, True),
++    ("3x3", 1, 80, 5, 9, 24, True),
++    ("3x3", 1, 128, 7, 4, 3, False),
++]:
++    x = torch.randn(N, c, H, W, dtype = torch.float16)
++    w = (torch.randn(K, c, 3 if route == "3x3" else 1, 3 if route == "3x3" else 1) * 0.05).half()
++    b = torch.randn(K).half() if bias else None
++    if route == "1x1":
++        y = C.conv2d_1x1(x, w, b)
++        ref = F.conv2d(x.float(), w.float(), b.float() if bias else None)
++    else:
++        y = C.conv2d_3x3_cblocked(x, w, b)
++        ref = F.conv2d(x.float(), w.float(), b.float() if bias else None, padding = 1)
++    rel = float((y.float() - ref).norm() / ref.norm())
++    assert y.dtype == x.dtype and y.shape == ref.shape and rel < 1e-2, (route, c, rel)
++print("INTERP_OK")
++"""
++
++
++def test_vendored_kernels_match_conv2d_under_triton_interpreter():
++    pytest.importorskip("triton")
++    env = {k: v for k, v in os.environ.items() if "TOKEN" not in k}
++    r = subprocess.run(
++        [sys.executable, "-c", _INTERP, str(BACKEND)],
++        capture_output = True,
++        text = True,
++        timeout = 900,
++        env = env,
++    )
++    assert r.returncode == 0 and "INTERP_OK" in r.stdout, (r.stdout + r.stderr)[-3000:]
+-- 
+2.43.0
+
