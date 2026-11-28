@@ -1,0 +1,105 @@
+name: "AMD CI: validate PR 20103"
+
+# Generated from amd_ci/templates/workflow.yml. Edit the PROBE and CRITERIA env
+# values, and the tests/args, rather than the plumbing.
+#
+# Two jobs, because two jobs of this workflow may land on the SAME machine and
+# then share its one GPU:
+#   suites  masks the GPU, so it cannot perturb a measurement running beside it
+#   gpu     is the only job allowed to allocate, and is serialised against every
+#           other run of the same concurrency group
+#
+# They may equally land on different machines: the Linux pool is at least seven
+# (a 24-way matrix ran essentially concurrently across seven distinct hosts).
+# Nothing is shared between them, including the Docker image cache, so a job that
+# pulls an image does not make it available to the next one.
+#
+# This is the LINUX template. For the Windows boxes use
+# `scaffold.py --windows`, which emits templates/workflow_windows.yml.
+#
+# If your change needs no GPU measurement, delete the gpu job. If it needs no
+# test suites, delete suites. Do not delete the gate: it fails rather than
+# skipping, because a skip misreports missing hardware as nothing to see.
+
+on:
+  push:
+    branches: [amd-ci-g22-g21z1-lnx]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  PR: "20103"
+  UPSTREAM: "https://github.com/unslothai/unsloth"
+  # Set to "1" for a PR already merged: compares the merge commit to its parent.
+  AMD1_BASE_OVERRIDE: "3f4a7e5fc52ae85e20cbff8c0d7c17f12a9e7166"
+  AMD1_HEAD_OVERRIDE: "7d692c57614d2468182b8fc32b71242ba3b49650"
+  MERGED: "0"
+  # Set by scaffold.py --patch: base = PATCH_BASE, head = PATCH_BASE plus this diff (relative to the checkout).
+  PATCH_BASE: ""
+  PATCH_FILE: ""
+  PATCH_SHA256: "__PATCH_SHA256__"
+
+jobs:
+
+  gpu:
+    name: "PR 20103 GPU check (shared GPU)"
+    runs-on: [self-hosted, Linux, strix-halo, devlab-dispatch]
+    timeout-minutes: 420
+    # --shared-gpu: no concurrency group, so a co-tenant may share the card.
+    # Correctness only; capability.py reports `exclusive_gpu` as a gap.
+    env:
+      AMD_CI_SHARED_GPU: "1"
+    steps:
+      - uses: actions/checkout@v4
+        with: { persist-credentials: false }
+
+      - name: Preamble
+        run: |
+          source amd_ci/lib/preamble.sh "pr20103-gpu"
+
+      - name: Hardware gate
+        run: |
+          set -euo pipefail
+          python3 amd_ci/lib/gate.py --no-torch --require rocm gpu \
+            --expect-arch gfx1151 --min-gpus 1 \
+            --out "$AMD_CI_WORK/out/host.json" || \
+          echo "note: gate ran before the venv exists; re-gated after install below"
+
+      - name: Resolve states
+        run: |
+          set -euo pipefail
+          ARGS=""
+          [ "$MERGED" = "1" ] && ARGS="--merged"
+          if [ -n "$PATCH_FILE" ]; then ARGS="--patch-base $PATCH_BASE --patch $GITHUB_WORKSPACE/$PATCH_FILE --patch-sha256 $PATCH_SHA256"; fi
+          python3 amd_ci/lib/states.py --repo "$UPSTREAM" --pr "$PR" $ARGS \
+            --root "$AMD_CI_WORK" --out "$AMD_CI_WORK/out/states.json"
+
+      - name: Environment and host gate (no Studio)
+        run: |
+          set -euo pipefail
+          echo "AMD_CI_PY=$(command -v python3)" >> "$GITHUB_ENV"
+          # No torch here, so rocm/gpu read UNDETERMINED: the criteria gates prove the GPU ran.
+          python3 "$GITHUB_WORKSPACE/amd_ci/lib/gate.py" --no-torch --out "$AMD_CI_WORK/out/host.json"
+
+      - name: Differential
+        run: |
+          set +e
+          "$AMD_CI_PY" amd_ci/lib/differential.py \
+            --states "$AMD_CI_WORK/out/states.json" \
+            --probe amd_ci/probes/train5_probe.py \
+            --criteria amd_ci/criteria/amdgate_rocm.py \
+            --out-dir "$AMD_CI_WORK/out/gpu" \
+            --python "$AMD_CI_PY" -- --unit g21z1 --state-repo unsloth --transformers 5.24.0 --trl 1.18.0 --cells env,flm16 --companion-repo https://github.com/unslothai/unsloth-zoo --companion-base c2b1a436e91161dd0d7301283ca9c01e60f7d515 --companion-head 429e00f97fc2d524a033c4e89affe2f09dbb872c --venv "$AMD_CI_WORK/tvenv" --tests tests/test_fp8_no_rowwise_scaled_mm.py --repeat flm16 --extra-pip gguf --companion-tests tests/security/test_media_redirect_body_unread.py tests/security/test_scan_packages_source_encoding.py tests/test_block_swap_cuda_error.py tests/test_block_swap_layer_major.py tests/test_cpu_fast_multinomial.py tests/test_cpu_generate_frozen_bf16.py tests/test_cpu_growable_kv.py tests/test_dataset_num_proc.py tests/test_fast_path_probe_oom.py tests/test_gguf_kernels.py tests/test_llama_cpp_cuda_bundle_for_export.py tests/test_llama_cpp_source_build_fork.py tests/test_lora_base_layer_input_cast.py tests/test_moe_grouped_dense_skips_probe.py tests/test_moe_sonic_launch_device.py tests/test_mxfp4_gemm_arch_gate.py tests/test_packed_experts.py tests/test_packed_experts_fused_cutoff.py tests/test_packed_experts_own_format.py tests/test_responses_only_keeps_pad_to_multiple_of.py tests/test_rocm_sdk_wheel_detection.py tests/test_triton_fp_fusion.py tests/test_trl_metrics_experimental_trainers.py tests/test_vllm_standby_keep_awake.py tests/test_cpu_ce_head_grad_inplace.py tests/test_cpu_dpo_kto_chunked_logps.py tests/test_cpu_orpo_chunked_logps.py tests/test_deepseek_v41_indexer_replay.py tests/test_grpo_packed_verify_raw_logits.py tests/test_grpo_policy_token_caps.py tests/test_grpo_score_centering_packed.py tests/test_inductor_nonowning_inplace.py tests/test_moe_gc_same_routing.py tests/test_moe_grouped_triton_generic.py tests/test_moe_triton_autotune_dims.py tests/test_moe_triton_config_cache_dtype.py tests/test_moe_triton_half_input.py tests/test_routing_replay_sigmoid.py tests/test_speculative_mtp.py tests/test_temporary_patches_imports.py tests/test_vllm_renamed_lora_adapter.py tests/test_block_swap_prefetch.py tests/test_cpu_grad_total_norm.py tests/test_deepseek_v41_vllm_state_dict.py tests/test_grouped_mm_sync_counter.py tests/test_moe_grouped_mm_training_probe.py tests/test_nested_chunk_torch_checkpoint.py tests/test_speculative_losses.py tests/test_triton_ptxas_blackwell_pin.py tests/test_windows_nvrtc_and_lazy_pillow.py tests/test_mla_vllm_state_dict.py tests/test_cpu_threads.py tests/test_vllm_fp8_block_marlin_share.py tests/test_routing_replay_followups.py tests/test_grpo_sampler_kl.py tests/test_load_in_fp8_online.py tests/test_merged_rollout.py tests/test_grpo_tp_cp_fsdp2_collective_forwards_gloo.py tests/test_nvfp4_4over6.py tests/test_moe_stacked_lora_packed_handoff.py tests/test_inductor_single_compile_worker.py tests/test_compile_options_autotune_multi_device.py tests/test_compile_options_no_cuda_knobs.py tests/test_gc_saved_attention.py tests/test_moe_sonic_zero_copy.py tests/test_chunked_logprob.py tests/test_grpo_recompute_fp32_lm_head.py tests/test_grpo_fused_route.py tests/test_grpo_prefix_grouper_pad_in_eos.py tests/test_routing_replay_vllm_contracts.py tests/test_vllm_sleep_cache_reset.py --companion-tests-from-head tests/_torch_version_tag.py tests/security/test_media_redirect_body_unread.py tests/security/test_rl_catch_all_helper_cwd.py tests/security/test_scan_packages_source_encoding.py tests/security/test_windows_nvrtc_probe_never_loads.py !tests/test_block_swap_cuda_error.py !tests/test_block_swap_disk.py !tests/test_block_swap_layer_major.py tests/test_cpu_chunked_logprobs_dtype_mismatch.py tests/test_cpu_fast_multinomial.py tests/test_cpu_fp32_rollout_avx2.py !tests/test_cpu_generate_frozen_bf16.py !tests/test_cpu_gguf_tokenizer.py tests/test_cpu_growable_kv.py tests/test_cpu_rollout_threads.py !tests/test_dataset_num_proc.py tests/test_device_map_planner_moe_lora_reserve.py !tests/test_fast_path_probe_oom.py !tests/test_gdn_causal_conv1d.py tests/test_gguf_kernels.py tests/test_grpo_score_centering_turns.py tests/test_llama_cpp_cuda_bundle_for_export.py !tests/test_llama_cpp_prebuilt.py tests/test_llama_cpp_source_build_fork.py !tests/test_llama_cpp_source_checkout_reuse.py !tests/test_lora_base_layer_input_cast.py !tests/test_moe_backend_pre_sm80_prefers_loop.py tests/test_moe_grouped_dense_skips_probe.py !tests/test_moe_grouped_mm_probe_all_devices.py tests/test_moe_sonic_launch_device.py !tests/test_mxfp4_decode_mode_trace_safe.py !tests/test_mxfp4_gemm_arch_gate.py tests/test_mxfp4_gemm_old_triton_gate.py !tests/test_packed_experts.py tests/test_packed_experts_fused.py tests/test_packed_experts_fused_cutoff.py !tests/test_packed_experts_moe.py tests/test_packed_experts_own_format.py tests/test_probe_oom_no_latch.py tests/test_responses_only_keeps_pad_to_multiple_of.py tests/test_responses_only_tool_roles.py !tests/test_rocm_sdk_wheel_detection.py !tests/test_speculative_dspark.py !tests/test_triton_fp_fusion.py tests/test_triton_local_tl_global.py tests/test_trl_metrics_experimental_trainers.py tests/test_vllm_convert_without_bitsandbytes.py tests/test_vllm_standby_keep_awake.py !tests/_tiny_qwen3.py !tests/test_cpu_ce_head_cast_once.py !tests/test_cpu_ce_head_grad_inplace.py !tests/test_cpu_ce_softcap.py !tests/test_cpu_dpo_kto_chunked_logps.py !tests/test_cpu_gguf_load_trainable.py !tests/test_cpu_orpo_chunked_logps.py !tests/test_csm_merge_frame_padding.py !tests/test_deepseek_v41_indexer_replay.py !tests/test_grpo_packed_grad_oom_recovery.py !tests/test_grpo_packed_verify_raw_logits.py !tests/test_grpo_pad_is_eos_mask.py !tests/test_grpo_policy_token_caps.py !tests/test_grpo_score_centering.py !tests/test_grpo_score_centering_packed.py !tests/test_higher_precision_layernorm_scope.py !tests/test_inductor_nonowning_inplace.py !tests/test_mixed_gpu_operand_device.py !tests/test_moe_gc_same_routing.py !tests/test_moe_grouped_mm_probe_not_at_import.py !tests/test_moe_grouped_triton_generic.py !tests/test_moe_rocm_gfx1151_prefers_unsloth_triton.py !tests/test_moe_triton_autotune_dims.py !tests/test_moe_triton_compute_dtype.py !tests/test_moe_triton_config_cache_dtype.py !tests/test_moe_triton_down_lora_roworder.py !tests/test_moe_triton_half_input.py !tests/test_responses_only_tool_results.py !tests/test_routing_replay_sigmoid.py !tests/test_safetensors_pread.py !tests/test_speculative_mtp.py !tests/test_speculative_trainer.py !tests/test_temporary_patches_imports.py !tests/test_triton_moe_transposed_dims.py !tests/test_vllm_renamed_lora_adapter.py !tests/test_block_swap.py !tests/test_block_swap_prefetch.py !tests/test_cpu_frozen_fp32_fit.py !tests/test_cpu_grad_total_norm.py !tests/test_cpu_threads_omp_binding.py !tests/test_deepseek_v41_vllm_state_dict.py !tests/test_forced_float32_undo_families.py !tests/test_grouped_mm_sync_counter.py !tests/test_grpo_packed_verify_envelope.py !tests/test_moe_grouped_mm_training_probe.py !tests/test_moe_triton_backend_cpu_tensors.py !tests/test_nested_chunk_torch_checkpoint.py !tests/test_qwen4_exp_vllm_state_dict.py !tests/test_speculative_losses.py !tests/test_torch215_nested_reduction_parity.py !tests/test_triton_ptxas_blackwell_pin.py !tests/test_vllm_untruncated_logprobs.py !tests/test_windows_nvrtc_and_lazy_pillow.py !tests/test_routing_replay_weights.py !tests/test_mla_vllm_state_dict.py !tests/test_vllm_stacked_moe_lora_flag.py !tests/test_cpu_threads.py !tests/test_cpu_threads_cap.py !tests/test_vllm_fp8_block_marlin_share.py !tests/test_routing_replay_r2.py !tests/test_routing_replay_followups.py !tests/test_vllm_bnb_plugin_resolve.py !tests/test_grpo_sampler_kl.py !tests/test_fused_linear_top1_half_logits.py !tests/test_load_in_fp8_online.py !tests/test_cpu_compile_windows_threads.py !tests/test_merged_rollout.py !tests/test_grpo_zero_advantage_skip.py !tests/test_grpo_tp_cp_fsdp2_collective_forwards_gloo.py !tests/test_vllm_nvfp4_a16_rollout.py !tests/test_nvfp4_4over6.py !tests/test_grpo_rollout_correction.py !tests/test_moe_stacked_lora_packed_handoff.py !tests/test_oom_does_not_latch_fast_paths.py !tests/test_inductor_single_compile_worker.py !tests/test_torch215_inductor_workarounds.py !tests/test_compile_options_autotune_multi_device.py !tests/test_cpu_full_finetuning_ram_warning.py !tests/test_compile_options_no_cuda_knobs.py !tests/test_gpt_oss_recompile_limit.py !tests/test_gc_saved_attention.py !tests/test_aot_cache_custom_autograd_function.py !tests/test_moe_sonic_zero_copy.py !tests/test_tiling_expert_parallel_gloo.py !tests/test_chunked_logprob.py !tests/test_fp32_out_head_no_copy.py !tests/test_grpo_recompute_fp32_lm_head.py !tests/test_vllm_fp32_lm_head.py !tests/test_grpo_fused_route.py !tests/test_grpo_scorer_offload_routing.py !tests/test_grpo_prefix_grouper_pad_in_eos.py !tests/test_routing_replay.py !tests/test_routing_replay_vllm_contracts.py !tests/test_cpu_cpo_chunked_logps.py !tests/test_vllm_sleep_cache_reset.py !tests/test_cpu_packing.py --tests-from-head !tests/test_fp8_no_rowwise_scaled_mm.py
+          cat "$AMD_CI_WORK/out/gpu/VERDICT.md" >> "$GITHUB_STEP_SUMMARY"
+          # A finding keeps the job green; a NON-result (VOID / INCONCLUSIVE) does not.
+          python3 "$GITHUB_WORKSPACE/amd_ci/lib/announce.py" "$AMD_CI_WORK/out/gpu"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: pr20103-gpu
+          path: ${{ env.AMD_CI_WORK }}/out
+          retention-days: 7
+          if-no-files-found: warn
