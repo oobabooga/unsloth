@@ -23,7 +23,7 @@ name: "AMD CI: validate PR 20096"
 
 on:
   push:
-    branches: [amd-ci-pr20096]
+    branches: [amd-ci-pr20096b]
   workflow_dispatch:
 
 permissions:
