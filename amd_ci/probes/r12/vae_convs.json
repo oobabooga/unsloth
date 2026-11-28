@@ -1,0 +1,1358 @@
+{
+ "qwen21": [
+  {
+   "x": [
+    1,
+    64,
+    64,
+    64
+   ],
+   "w": [
+    64,
+    64,
+    1,
+    1
+   ],
+   "stride": [
+    1,
+    1
+   ],
+   "padding": [
+    0,
+    0
+   ],
+   "dilation": [
+    1,
+    1
+   ],
+   "groups": 1,
+   "bias": true,
+   "padding_mode": "zeros",
+   "count": 1
+  },
+  {
+   "x": [
+    1,
+    64,
+    66,
+    66
+   ],
+   "w": [
+    1152,
+    64,
+    3,
+    3
+   ],
+   "stride": [
+    1,
+    1
+   ],
+   "padding": [
+    0,
+    0
+   ],
+   "dilation": [
+    1,
+    1
+   ],
+   "groups": 1,
+   "bias": true,
+   "padding_mode": "zeros",
+   "count": 1
+  },
+  {
+   "x": [
+    1,
+    1152,
+    66,
+    66
+   ],
+   "w": [
+    1152,
+    1152,
+    3,
+    3
+   ],
+   "stride": [
+    1,
+    1
+   ],
+   "padding": [
+    0,
+    0
+   ],
+   "dilation": [
+    1,
+    1
+   ],
+   "groups": 1,
+   "bias": true,
+   "padding_mode": "zeros",
+   "count": 10
+  },
+  {
+   "x": [
+    1,
+    1152,
+    64,
+    64
+   ],
+   "w": [
+    3456,
+    1152,
+    1,
+    1
+   ],
+   "stride": [
+    1,
+    1
+   ],
+   "padding": [
+    0,
+    0
+   ],
+   "dilation": [
+    1,
+    1
+   ],
+   "groups": 1,
+   "bias": true,
+   "padding_mode": "zeros",
+   "count": 1
+  },
+  {
+   "x": [
+    1,
+    1152,
+    64,
+    64
+   ],
+   "w": [
+    1152,
+    1152,
+    1,
+    1
+   ],
+   "stride": [
+    1,
+    1
+   ],
+   "padding": [
+    0,
+    0
+   ],
+   "dilation": [
+    1,
+    1
+   ],
+   "groups": 1,
+   "bias": true,
+   "padding_mode": "zeros",
+   "count": 1
+  },
+  {
+   "x": [
+    1,
+    1152,
+    128,
+    128
+   ],
+   "w": [
+    1152,
+    1152,
+    3,
+    3
+   ],
+   "stride": [
+    1,
+    1
+   ],
+   "padding": [
+    1,
+    1
+   ],
+   "dilation": [
+    1,
+    1
+   ],
+   "groups": 1,
+   "bias": true,
+   "padding_mode": "zeros",
+   "count": 1
+  },
+  {
+   "x": [
+    1,
+    1152,
+    130,
+    130
+   ],
+   "w": [
+    1152,
+    1152,
+    3,
+    3
+   ],
+   "stride": [
+    1,
+    1
+   ],
+   "padding": [
+    0,
+    0
+   ],
+   "dilation": [
+    1,
+    1
+   ],
+   "groups": 1,
+   "bias": true,
+   "padding_mode": "zeros",
+   "count": 6
+  },
+  {
+   "x": [
+    1,
+    1152,
+    256,
+    256
+   ],
+   "w": [
+    1152,
+    1152,
+    3,
+    3
+   ],
+   "stride": [
+    1,
+    1
+   ],
+   "padding": [
+    1,
+    1
+   ],
+   "dilation": [
+    1,
+    1
+   ],
+   "groups": 1,
+   "bias": true,
+   "padding_mode": "zeros",
+   "count": 1
+  },
+  {
+   "x": [
+    1,
+    1152,
+    256,
+    256
+   ],
+   "w": [
+    576,
+    1152,
+    1,
+    1
+   ],
+   "stride": [
+    1,
+    1
+   ],
+   "padding": [
+    0,
+    0
+   ],
+   "dilation": [
+    1,
+    1
+   ],
+   "groups": 1,
+   "bias": true,
+   "padding_mode": "zeros",
+   "count": 1
+  },
+  {
+   "x": [
+    1,
+    1152,
+    258,
+    258
+   ],
+   "w": [
+    576,
+    1152,
+    3,
+    3
+   ],
+   "stride": [
+    1,
+    1
+   ],
+   "padding": [
+    0,
+    0
+   ],
+   "dilation": [
+    1,
+    1
+   ],
+   "groups": 1,
+   "bias": true,
+   "padding_mode": "zeros",
+   "count": 1
+  },
+  {
+   "x": [
+    1,
+    576,
+    258,
+    258
+   ],
+   "w": [
+    576,
+    576,
+    3,
+    3
+   ],
+   "stride": [
+    1,
+    1
+   ],
+   "padding": [
+    0,
+    0
+   ],
+   "dilation": [
+    1,
+    1
+   ],
+   "groups": 1,
+   "bias": true,
+   "padding_mode": "zeros",
+   "count": 5
+  },
+  {
+   "x": [
+    1,
+    576,
+    512,
+    512
+   ],
+   "w": [
+    576,
+    576,
+    3,
+    3
+   ],
+   "stride": [
+    1,
+    1
+   ],
+   "padding": [
+    1,
+    1
+   ],
+   "dilation": [
+    1,
+    1
+   ],
+   "groups": 1,
+   "bias": true,
+   "padding_mode": "zeros",
+   "count": 1
+  },
+  {
+   "x": [
+    1,
+    576,
+    512,
+    512
+   ],
+   "w": [
+    288,
+    576,
+    1,
+    1
+   ],
+   "stride": [
+    1,
+    1
+   ],
+   "padding": [
+    0,
+    0
+   ],
+   "dilation": [
+    1,
+    1
+   ],
+   "groups": 1,
+   "bias": true,
+   "padding_mode": "zeros",
+   "count": 1
+  },
+  {
+   "x": [
+    1,
+    576,
+    514,
+    514
+   ],
+   "w": [
+    288,
+    576,
+    3,
+    3
+   ],
+   "stride": [
+    1,
+    1
+   ],
+   "padding": [
+    0,
+    0
+   ],
+   "dilation": [
+    1,
+    1
+   ],
+   "groups": 1,
+   "bias": true,
+   "padding_mode": "zeros",
+   "count": 1
+  },
+  {
+   "x": [
+    1,
+    288,
+    514,
+    514
+   ],
+   "w": [
+    288,
+    288,
+    3,
+    3
+   ],
+   "stride": [
+    1,
+    1
+   ],
+   "padding": [
+    0,
+    0
+   ],
+   "dilation": [
+    1,
+    1
+   ],
+   "groups": 1,
+   "bias": true,
+   "padding_mode": "zeros",
+   "count": 5
+  },
+  {
+   "x": [
+    1,
+    288,
+    1024,
+    1024
+   ],
+   "w": [
+    288,
+    288,
+    3,
+    3
+   ],
+   "stride": [
+    1,
+    1
+   ],
+   "padding": [
+    1,
+    1
+   ],
+   "dilation": [
+    1,
+    1
+   ],
+   "groups": 1,
+   "bias": true,
+   "padding_mode": "zeros",
+   "count": 1
+  },
+  {
+   "x": [
+    1,
+    288,
+    1024,
+    1024
+   ],
+   "w": [
+    144,
+    288,
+    1,
+    1
+   ],
+   "stride": [
+    1,
+    1
+   ],
+   "padding": [
+    0,
+    0
+   ],
+   "dilation": [
+    1,
+    1
+   ],
+   "groups": 1,
+   "bias": true,
+   "padding_mode": "zeros",
+   "count": 1
+  },
+  {
+   "x": [
+    1,
+    288,
+    1026,
+    1026
+   ],
+   "w": [
+    144,
+    288,
+    3,
+    3
+   ],
+   "stride": [
+    1,
+    1
+   ],
+   "padding": [
+    0,
+    0
+   ],
+   "dilation": [
+    1,
+    1
+   ],
+   "groups": 1,
+   "bias": true,
+   "padding_mode": "zeros",
+   "count": 1
+  },
+  {
+   "x": [
+    1,
+    144,
+    1026,
+    1026
+   ],
+   "w": [
+    144,
+    144,
+    3,
+    3
+   ],
+   "stride": [
+    1,
+    1
+   ],
+   "padding": [
+    0,
+    0
+   ],
+   "dilation": [
+    1,
+    1
+   ],
+   "groups": 1,
+   "bias": true,
+   "padding_mode": "zeros",
+   "count": 5
+  },
+  {
+   "x": [
+    1,
+    144,
+    1026,
+    1026
+   ],
+   "w": [
+    4,
+    144,
+    3,
+    3
+   ],
+   "stride": [
+    1,
+    1
+   ],
+   "padding": [
+    0,
+    0
+   ],
+   "dilation": [
+    1,
+    1
+   ],
+   "groups": 1,
+   "bias": true,
+   "padding_mode": "zeros",
+   "count": 1
+  }
+ ],
+ "flux2": [
+  {
+   "x": [
+    1,
+    32,
+    128,
+    128
+   ],
+   "w": [
+    32,
+    32,
+    1,
+    1
+   ],
+   "stride": [
+    1,
+    1
+   ],
+   "padding": [
+    0,
+    0
+   ],
+   "dilation": [
+    1,
+    1
+   ],
+   "groups": 1,
+   "bias": true,
+   "padding_mode": "zeros",
+   "count": 1
+  },
+  {
+   "x": [
+    1,
+    32,
+    128,
+    128
+   ],
+   "w": [
+    512,
+    32,
+    3,
+    3
+   ],
+   "stride": [
+    1,
+    1
+   ],
+   "padding": [
+    1,
+    1
+   ],
+   "dilation": [
+    1,
+    1
+   ],
+   "groups": 1,
+   "bias": true,
+   "padding_mode": "zeros",
+   "count": 1
+  },
+  {
+   "x": [
+    1,
+    512,
+    128,
+    128
+   ],
+   "w": [
+    512,
+    512,
+    3,
+    3
+   ],
+   "stride": [
+    1,
+    1
+   ],
+   "padding": [
+    1,
+    1
+   ],
+   "dilation": [
+    1,
+    1
+   ],
+   "groups": 1,
+   "bias": true,
+   "padding_mode": "zeros",
+   "count": 10
+  },
+  {
+   "x": [
+    1,
+    512,
+    256,
+    256
+   ],
+   "w": [
+    512,
+    512,
+    3,
+    3
+   ],
+   "stride": [
+    1,
+    1
+   ],
+   "padding": [
+    1,
+    1
+   ],
+   "dilation": [
+    1,
+    1
+   ],
+   "groups": 1,
+   "bias": true,
+   "padding_mode": "zeros",
+   "count": 7
+  },
+  {
+   "x": [
+    1,
+    512,
+    512,
+    512
+   ],
+   "w": [
+    512,
+    512,
+    3,
+    3
+   ],
+   "stride": [
+    1,
+    1
+   ],
+   "padding": [
+    1,
+    1
+   ],
+   "dilation": [
+    1,
+    1
+   ],
+   "groups": 1,
+   "bias": true,
+   "padding_mode": "zeros",
+   "count": 1
+  },
+  {
+   "x": [
+    1,
+    512,
+    512,
+    512
+   ],
+   "w": [
+    256,
+    512,
+    3,
+    3
+   ],
+   "stride": [
+    1,
+    1
+   ],
+   "padding": [
+    1,
+    1
+   ],
+   "dilation": [
+    1,
+    1
+   ],
+   "groups": 1,
+   "bias": true,
+   "padding_mode": "zeros",
+   "count": 1
+  },
+  {
+   "x": [
+    1,
+    256,
+    512,
+    512
+   ],
+   "w": [
+    256,
+    256,
+    3,
+    3
+   ],
+   "stride": [
+    1,
+    1
+   ],
+   "padding": [
+    1,
+    1
+   ],
+   "dilation": [
+    1,
+    1
+   ],
+   "groups": 1,
+   "bias": true,
+   "padding_mode": "zeros",
+   "count": 5
+  },
+  {
+   "x": [
+    1,
+    512,
+    512,
+    512
+   ],
+   "w": [
+    256,
+    512,
+    1,
+    1
+   ],
+   "stride": [
+    1,
+    1
+   ],
+   "padding": [
+    0,
+    0
+   ],
+   "dilation": [
+    1,
+    1
+   ],
+   "groups": 1,
+   "bias": true,
+   "padding_mode": "zeros",
+   "count": 1
+  },
+  {
+   "x": [
+    1,
+    256,
+    1024,
+    1024
+   ],
+   "w": [
+    256,
+    256,
+    3,
+    3
+   ],
+   "stride": [
+    1,
+    1
+   ],
+   "padding": [
+    1,
+    1
+   ],
+   "dilation": [
+    1,
+    1
+   ],
+   "groups": 1,
+   "bias": true,
+   "padding_mode": "zeros",
+   "count": 1
+  },
+  {
+   "x": [
+    1,
+    256,
+    1024,
+    1024
+   ],
+   "w": [
+    128,
+    256,
+    3,
+    3
+   ],
+   "stride": [
+    1,
+    1
+   ],
+   "padding": [
+    1,
+    1
+   ],
+   "dilation": [
+    1,
+    1
+   ],
+   "groups": 1,
+   "bias": true,
+   "padding_mode": "zeros",
+   "count": 1
+  },
+  {
+   "x": [
+    1,
+    128,
+    1024,
+    1024
+   ],
+   "w": [
+    128,
+    128,
+    3,
+    3
+   ],
+   "stride": [
+    1,
+    1
+   ],
+   "padding": [
+    1,
+    1
+   ],
+   "dilation": [
+    1,
+    1
+   ],
+   "groups": 1,
+   "bias": true,
+   "padding_mode": "zeros",
+   "count": 5
+  },
+  {
+   "x": [
+    1,
+    256,
+    1024,
+    1024
+   ],
+   "w": [
+    128,
+    256,
+    1,
+    1
+   ],
+   "stride": [
+    1,
+    1
+   ],
+   "padding": [
+    0,
+    0
+   ],
+   "dilation": [
+    1,
+    1
+   ],
+   "groups": 1,
+   "bias": true,
+   "padding_mode": "zeros",
+   "count": 1
+  },
+  {
+   "x": [
+    1,
+    128,
+    1024,
+    1024
+   ],
+   "w": [
+    3,
+    128,
+    3,
+    3
+   ],
+   "stride": [
+    1,
+    1
+   ],
+   "padding": [
+    1,
+    1
+   ],
+   "dilation": [
+    1,
+    1
+   ],
+   "groups": 1,
+   "bias": true,
+   "padding_mode": "zeros",
+   "count": 1
+  }
+ ],
+ "flux1_zimage": [
+  {
+   "x": [
+    1,
+    16,
+    128,
+    128
+   ],
+   "w": [
+    512,
+    16,
+    3,
+    3
+   ],
+   "stride": [
+    1,
+    1
+   ],
+   "padding": [
+    1,
+    1
+   ],
+   "dilation": [
+    1,
+    1
+   ],
+   "groups": 1,
+   "bias": true,
+   "padding_mode": "zeros",
+   "count": 1
+  },
+  {
+   "x": [
+    1,
+    512,
+    128,
+    128
+   ],
+   "w": [
+    512,
+    512,
+    3,
+    3
+   ],
+   "stride": [
+    1,
+    1
+   ],
+   "padding": [
+    1,
+    1
+   ],
+   "dilation": [
+    1,
+    1
+   ],
+   "groups": 1,
+   "bias": true,
+   "padding_mode": "zeros",
+   "count": 10
+  },
+  {
+   "x": [
+    1,
+    512,
+    256,
+    256
+   ],
+   "w": [
+    512,
+    512,
+    3,
+    3
+   ],
+   "stride": [
+    1,
+    1
+   ],
+   "padding": [
+    1,
+    1
+   ],
+   "dilation": [
+    1,
+    1
+   ],
+   "groups": 1,
+   "bias": true,
+   "padding_mode": "zeros",
+   "count": 7
+  },
+  {
+   "x": [
+    1,
+    512,
+    512,
+    512
+   ],
+   "w": [
+    512,
+    512,
+    3,
+    3
+   ],
+   "stride": [
+    1,
+    1
+   ],
+   "padding": [
+    1,
+    1
+   ],
+   "dilation": [
+    1,
+    1
+   ],
+   "groups": 1,
+   "bias": true,
+   "padding_mode": "zeros",
+   "count": 1
+  },
+  {
+   "x": [
+    1,
+    512,
+    512,
+    512
+   ],
+   "w": [
+    256,
+    512,
+    3,
+    3
+   ],
+   "stride": [
+    1,
+    1
+   ],
+   "padding": [
+    1,
+    1
+   ],
+   "dilation": [
+    1,
+    1
+   ],
+   "groups": 1,
+   "bias": true,
+   "padding_mode": "zeros",
+   "count": 1
+  },
+  {
+   "x": [
+    1,
+    256,
+    512,
+    512
+   ],
+   "w": [
+    256,
+    256,
+    3,
+    3
+   ],
+   "stride": [
+    1,
+    1
+   ],
+   "padding": [
+    1,
+    1
+   ],
+   "dilation": [
+    1,
+    1
+   ],
+   "groups": 1,
+   "bias": true,
+   "padding_mode": "zeros",
+   "count": 5
+  },
+  {
+   "x": [
+    1,
+    512,
+    512,
+    512
+   ],
+   "w": [
+    256,
+    512,
+    1,
+    1
+   ],
+   "stride": [
+    1,
+    1
+   ],
+   "padding": [
+    0,
+    0
+   ],
+   "dilation": [
+    1,
+    1
+   ],
+   "groups": 1,
+   "bias": true,
+   "padding_mode": "zeros",
+   "count": 1
+  },
+  {
+   "x": [
+    1,
+    256,
+    1024,
+    1024
+   ],
+   "w": [
+    256,
+    256,
+    3,
+    3
+   ],
+   "stride": [
+    1,
+    1
+   ],
+   "padding": [
+    1,
+    1
+   ],
+   "dilation": [
+    1,
+    1
+   ],
+   "groups": 1,
+   "bias": true,
+   "padding_mode": "zeros",
+   "count": 1
+  },
+  {
+   "x": [
+    1,
+    256,
+    1024,
+    1024
+   ],
+   "w": [
+    128,
+    256,
+    3,
+    3
+   ],
+   "stride": [
+    1,
+    1
+   ],
+   "padding": [
+    1,
+    1
+   ],
+   "dilation": [
+    1,
+    1
+   ],
+   "groups": 1,
+   "bias": true,
+   "padding_mode": "zeros",
+   "count": 1
+  },
+  {
+   "x": [
+    1,
+    128,
+    1024,
+    1024
+   ],
+   "w": [
+    128,
+    128,
+    3,
+    3
+   ],
+   "stride": [
+    1,
+    1
+   ],
+   "padding": [
+    1,
+    1
+   ],
+   "dilation": [
+    1,
+    1
+   ],
+   "groups": 1,
+   "bias": true,
+   "padding_mode": "zeros",
+   "count": 5
+  },
+  {
+   "x": [
+    1,
+    256,
+    1024,
+    1024
+   ],
+   "w": [
+    128,
+    256,
+    1,
+    1
+   ],
+   "stride": [
+    1,
+    1
+   ],
+   "padding": [
+    0,
+    0
+   ],
+   "dilation": [
+    1,
+    1
+   ],
+   "groups": 1,
+   "bias": true,
+   "padding_mode": "zeros",
+   "count": 1
+  },
+  {
+   "x": [
+    1,
+    128,
+    1024,
+    1024
+   ],
+   "w": [
+    3,
+    128,
+    3,
+    3
+   ],
+   "stride": [
+    1,
+    1
+   ],
+   "padding": [
+    1,
+    1
+   ],
+   "dilation": [
+    1,
+    1
+   ],
+   "groups": 1,
+   "bias": true,
+   "padding_mode": "zeros",
+   "count": 1
+  }
+ ]
+}
