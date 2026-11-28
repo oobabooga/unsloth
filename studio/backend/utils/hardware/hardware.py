@@ -5541,6 +5541,8 @@ def _reconcile_cuda_integrated_memory(
             # A row torch does not enumerate, e.g. an NVIDIA NPU with no memory telemetry.
             continue
         total_gb = td["total_gb"]
+        # The framebuffer free counter covers only part of a unified pool.
+        dev.pop("vram_free_bytes", None)
         cli_total_gb = dev.get("vram_total_gb")
         cli_used_gb = dev.get("vram_used_gb")
         if not _integrated_total_is_understated(cli_total_gb, total_gb):
@@ -7603,6 +7605,7 @@ def _vulkan_inference_device(row: Dict[str, Any], apply_igpu_host_reserve_mib) -
         "memory_total_gb": round(budget_mib / 1024, 2),
         "vram_used_gb": round(used_mib / 1024, 2) if used_mib is not None else None,
         "vram_free_gb": round(free_mib / 1024, 2),
+        **({"vram_free_bytes": row["free_mib"] * 1024**2} if not shared_memory else {}),
         "vram_utilization_pct": round((used_mib / total_mib) * 100, 1)
         if used_mib is not None and total_mib > 0
         else None,
@@ -7696,7 +7699,15 @@ def _installed_llama_backend() -> Optional[str]:
 
 
 # Readings the utilization probes already return, passed through for the Live monitor's detailed view.
-LIVE_GPU_TELEMETRY_KEYS = ("gpu_utilization_pct", "temperature_c", "power_draw_w", "power_limit_w")
+LIVE_GPU_TELEMETRY_KEYS = (
+    "gpu_utilization_pct",
+    "temperature_c",
+    "power_draw_w",
+    "power_limit_w",
+    "vram_free_bytes",
+    "pcie_link_width",
+    "pcie_link_gen",
+)
 
 
 def _smi_inference_device(
@@ -8458,6 +8469,14 @@ def safe_thread_num_proc(desired: Optional[int] = None) -> int:
     return max(1, desired)
 
 
+def _in_multi_gpu_rank() -> bool:
+    """This process is a rank of a Studio multi-GPU run (core.training.parallel_launch sets the world size)."""
+    try:
+        return int(os.environ.get("UNSLOTH_STUDIO_PARALLEL_WORLD", "1") or 1) > 1
+    except ValueError:
+        return False
+
+
 def dataset_map_num_proc(
     desired: Optional[int] = None, *, serial_as_none: bool = True
 ) -> Optional[int]:
@@ -8468,6 +8487,11 @@ def dataset_map_num_proc(
             return _bounded_by_the_shared_policy(desired, serial_as_none)
         # None is safe at either layer here: workers are unusable on a spawn platform, so every auto-sizer that reads a config None vetoes too. A 1 would be worse -- only the SFT map site is rewritten, so DPO/KTO/CPO/ORPO/Reward/PRM would hand it to Dataset.map and get a Pool(1) whose child re-imports the user's __main__ (#3211 / #3397).
         return None
+
+    if _in_multi_gpu_rank() and not _num_proc_override_is_set():
+        # A rank of a Studio multi-GPU run already holds CUDA and NCCL threads; a worker forked from it can deadlock
+        # on a lock one of those threads held, and the other ranks then wait at the next collective until it times out.
+        return None if serial_as_none else 1
 
     if get_device() == DeviceType.XPU:
         try:

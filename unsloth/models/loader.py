@@ -22,6 +22,7 @@ from ._utils import (
     DISABLE_SDPA_MODEL_NAMES,
 )
 from ._custom_dtype import register_custom_dtype
+from ..bnb_shim import refuse_int8 as bnb_shim_refuse_int8, vllm_blocked as bnb_shim_vllm_blocked
 from .granite import FastGraniteModel
 from .llama import FastLlamaModel, logger, _vllm_will_load_weights, restore_transformers_family
 from .mistral import FastMistralModel
@@ -54,6 +55,7 @@ from .mistral_format import (
 from .lora_init import adapter_used_fast_pissa, fast_lora_init, record_fast_pissa
 from ..tokenizers_v1 import tokenizers_v1_on_return
 from .mapper import bf16_repo_loads_16bit
+from .gguf_packed import gguf_packed_config_scope
 from .loader_utils import (
     DEFAULT_DEVICE_MAP,
     deepspeed_zero3_device_map,
@@ -1380,6 +1382,7 @@ class FastLanguageModel(FastLlamaModel):
     @mistral_format_redirect
     @track_explicit_4bit_request
     @_load_probe_memo_scope
+    @gguf_packed_config_scope
     def from_pretrained(
         model_name = "unsloth/Llama-3.2-1B-Instruct",
         max_seq_length = 2048,
@@ -1417,12 +1420,20 @@ class FastLanguageModel(FastLlamaModel):
     ):
         from ._utils import _unsloth_load_begins, gguf_drop_bitsandbytes
         from .._gguf_load import require_gguf_package
+        from .gguf_packed import check_gguf_packed_request
 
         _unsloth_load_begins()
         require_gguf_package(kwargs.get("gguf_file"))
         rope_scaling = _fold_rope_parameters(rope_scaling, kwargs)
+        _gguf_packed = check_gguf_packed_request(
+            kwargs,
+            full_finetuning = full_finetuning,
+            fast_inference = fast_inference,
+            load_in_fp8 = load_in_fp8,
+            qat_scheme = qat_scheme,
+        )
         load_in_4bit, load_in_8bit = gguf_drop_bitsandbytes(
-            kwargs.get("gguf_file"), load_in_4bit, load_in_8bit
+            kwargs.get("gguf_file"), load_in_4bit, load_in_8bit, gguf_packed = _gguf_packed
         )
         quantization_config = kwargs.get("quantization_config", None)
         if quantization_config is not None:
@@ -1440,6 +1451,7 @@ class FastLanguageModel(FastLlamaModel):
                 load_in_4bit = False
 
         # Fail before any weights load.
+        bnb_shim_refuse_int8(load_in_8bit)
         check_tiling_available(unsloth_tiled_mlp)
         # Login to allow private models. Before normalization: dtype is also derived below from a 4bit config's compute dtype, which is not a request for the whole model.
         user_float32 = _requested_float32(dtype)
@@ -1537,6 +1549,20 @@ class FastLanguageModel(FastLlamaModel):
         # Same fallback as FastModel, before requiring vLLM: it cannot run below compute capability 7.
         if fast_inference and DEVICE_TYPE == "cuda" and torch.cuda.get_device_capability()[0] < 7:
             print("Unsloth: vLLM does not work on older GPUs - will switch to Unsloth inference!")
+            fast_inference = False
+            _drop_vllm_engine_kwargs(kwargs)
+        if fast_inference and bnb_shim_vllm_blocked(
+            model_name,
+            load_in_4bit,
+            load_in_8bit,
+            load_in_16bit,
+            full_finetuning,
+            kwargs.get("quantization_config"),
+        ):
+            print(
+                "Unsloth: vLLM loads bitsandbytes 4-bit weights with its native library, which is "
+                "unavailable - will switch to Unsloth inference!"
+            )
             fast_inference = False
             _drop_vllm_engine_kwargs(kwargs)
         if fast_inference:
@@ -2398,6 +2424,7 @@ class FastModel(FastBaseModel):
     @mistral_format_redirect
     @track_explicit_4bit_request
     @_load_probe_memo_scope
+    @gguf_packed_config_scope
     def from_pretrained(
         model_name = "unsloth/Llama-3.2-11B-Vision-Instruct-bnb-4bit",
         max_seq_length = 2048,
@@ -2442,12 +2469,20 @@ class FastModel(FastBaseModel):
     ):
         from ._utils import _unsloth_load_begins, gguf_drop_bitsandbytes
         from .._gguf_load import require_gguf_package
+        from .gguf_packed import check_gguf_packed_request
 
         _unsloth_load_begins()
         require_gguf_package(kwargs.get("gguf_file"))
         rope_scaling = _fold_rope_parameters(rope_scaling, kwargs)
+        _gguf_packed = check_gguf_packed_request(
+            kwargs,
+            full_finetuning = full_finetuning,
+            fast_inference = fast_inference,
+            load_in_fp8 = load_in_fp8,
+            qat_scheme = qat_scheme,
+        )
         load_in_4bit, load_in_8bit = gguf_drop_bitsandbytes(
-            kwargs.get("gguf_file"), load_in_4bit, load_in_8bit
+            kwargs.get("gguf_file"), load_in_4bit, load_in_8bit, gguf_packed = _gguf_packed
         )
         user_config = kwargs.pop("config", None)
         fp8_lora = None
@@ -2482,6 +2517,7 @@ class FastModel(FastBaseModel):
                 load_in_4bit = False
 
         # Fail before any weights load.
+        bnb_shim_refuse_int8(load_in_8bit)
         check_tiling_available(unsloth_tiled_mlp)
         # Login to allow private models. Before normalization: dtype is also derived below from a 4bit config's compute dtype, which is not a request for the whole model.
         user_float32 = _requested_float32(dtype)
@@ -2591,6 +2627,20 @@ class FastModel(FastBaseModel):
         # Same fallback as FastLanguageModel, before requiring vLLM: zoo's vLLM loader raises on compute capability < 7.
         if fast_inference and DEVICE_TYPE == "cuda" and torch.cuda.get_device_capability()[0] < 7:
             print("Unsloth: vLLM does not work on older GPUs - will switch to Unsloth inference!")
+            fast_inference = False
+            _drop_vllm_engine_kwargs(kwargs)
+        if fast_inference and bnb_shim_vllm_blocked(
+            model_name,
+            load_in_4bit,
+            load_in_8bit,
+            load_in_16bit,
+            full_finetuning,
+            kwargs.get("quantization_config"),
+        ):
+            print(
+                "Unsloth: vLLM loads bitsandbytes 4-bit weights with its native library, which is "
+                "unavailable - will switch to Unsloth inference!"
+            )
             fast_inference = False
             _drop_vllm_engine_kwargs(kwargs)
         if fast_inference:

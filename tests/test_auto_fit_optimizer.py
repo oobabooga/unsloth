@@ -27,6 +27,8 @@ def _load(name, rel):
 def af(monkeypatch):
     monkeypatch.delenv("UNSLOTH_AUTO_FIT_OPTIMIZER", raising = False)
     monkeypatch.delenv("UNSLOTH_OFFLOAD_OPTIMIZER_STATE", raising = False)
+    monkeypatch.delenv("UNSLOTH_AUTO_FIT_CLIP", raising = False)
+    monkeypatch.delenv("UNSLOTH_AUTO_FIT_EXACT_CLIP", raising = False)
     return _load("_test_auto_fit", "unsloth/optimizers/auto_fit.py")
 
 
@@ -139,42 +141,419 @@ def test_in_backward_is_bitwise_the_standard_adamw_step(af, sr, monkeypatch, cli
     assert _weights_equal(standard, head)
 
 
-def test_each_gradient_is_freed_inside_backward(af):
-    """At most the gradient being stepped (and a tied one still accumulating) is alive during backward."""
+@pytest.mark.parametrize("batch_bytes", [None, 0])
+def test_each_gradient_is_freed_inside_backward(af, batch_bytes):
+    """Ready gradients wait for their batch's step: at most the largest weight's size of them is alive next to the
+    one arriving (batch_bytes = 0: only the one being stepped, plus a tied one still accumulating)."""
     model = _tiny_model().float()
     base = torch.optim.AdamW(model.parameters(), lr = 1e-3)
-    wrapper = af.InBackwardOptimizer(base)
+    wrapper = af.InBackwardOptimizer(base, batch_bytes = batch_bytes)
     params = [p for p in model.parameters() if p.requires_grad]
-    live = []
+    size = lambda q: q.numel() * q.element_size()
+    live, live_bytes = [], []
+
+    def record(_p):
+        alive = [q for q in params if q.grad is not None]
+        live.append(len(alive))
+        live_bytes.append(sum(size(q) for q in alive))
+
     for p in params:
-        p.register_post_accumulate_grad_hook(
-            lambda _p: live.append(sum(q.grad is not None for q in params))
-        )
+        p.register_post_accumulate_grad_hook(record)
     ids = torch.randint(0, 96, (2, 12))
     with wrapper.armed():
         model(input_ids = ids, labels = ids).loss.backward()
+    assert all(p.grad is None for p in params)  # all stepped by the end of backward
     wrapper.step()
     assert all(p.grad is None for p in params)
-    # Our hook ran first and freed the previous gradients: only this one's (plus the tied head's) remain.
-    assert max(live) <= 2, live
+    largest = max(size(p) for p in params)
+    if batch_bytes == 0:
+        # Our hook ran first and freed the previous gradients: only this one's (plus the tied head's) remain.
+        assert max(live) <= 2, live
+    else:
+        assert max(live_bytes) <= 2 * largest < sum(size(p) for p in params), live_bytes
+        assert max(live) > 2  # batched
     assert len(base.state) == len(params)
 
 
-def test_per_tensor_clipping(af):
-    """max_grad_norm clips each gradient by its own norm (torch's coefficient with that norm)."""
+def _clip_step(wrapper, params, grads, batches):
+    """One step whose gradients arrive in `batches` (one backward graph task each, as one checkpointed block's
+    backward). With SGD at lr 1 and no weight decay, the coefficient each weight was clipped by is -delta / grad."""
+    before = [p.detach().clone() for p in params]
+    with wrapper.armed():
+        for batch in batches:
+            sum((params[i] * grads[i]).sum() for i in batch).backward()
+    wrapper.step()
+    return [((before[i] - params[i].detach()) / grads[i]).mean().item() for i in range(len(params))]
+
+
+def _oracle(steps, max_norm, mode):
+    """float64 reference of every weight's coefficient: torch's max / (norm + 1e-6), at most 1, with the norm each
+    mode uses for a batch stepped once the earlier batches (and it) have arrived."""
+    out, prev_sq, prev_total = [], None, None
+    for grads, batches in steps:
+        sq = [float((g.double() ** 2).sum()) for g in grads]
+        total = sum(sq)
+        coef = [None] * len(grads)
+        seen = seen_prev = 0.0
+        for batch in batches:
+            seen += sum(sq[i] for i in batch)
+            if prev_sq is not None:
+                seen_prev += sum(prev_sq[i] for i in batch)
+            for i in batch:
+                if mode == "per_tensor":
+                    norm = sq[i] ** 0.5
+                elif mode == "exact" or prev_total is None:
+                    norm = (total if mode == "exact" else seen) ** 0.5
+                elif mode == "lagged":
+                    norm = max(seen, prev_total) ** 0.5
+                else:
+                    norm = max(seen, seen * prev_total / seen_prev) ** 0.5
+                coef[i] = min(1.0, max_norm / (norm + 1e-6))
+        out.append(coef)
+        prev_sq, prev_total = sq, total
+    return out
+
+
+def _clip_case(seed = 0, scales = (1.0, 0.4, 2.5)):
+    g = torch.Generator().manual_seed(seed)
+    shapes = [(5, 3), (7,), (4, 4), (2,), (6, 2), (3,)]
+    steps = []
+    for k, scale in enumerate(scales):
+        grads = [
+            torch.randn(s, generator = g, dtype = torch.float64) * scale * (1 + i)
+            for i, s in enumerate(shapes)
+        ]
+        order = list(range(len(shapes)))[::-1] if k % 2 else list(range(len(shapes)))
+        steps.append((grads, [order[:2], order[2:3], order[3:]]))
+    return shapes, steps
+
+
+@pytest.mark.parametrize("mode", ["estimate", "lagged", "per_tensor"])
+def test_clip_coefficients_match_the_fp64_oracle(af, mode):
+    """Batches stepped mid-backward clip with the mode's norm: estimate = this step's squares so far x the previous
+    step's total / its squares over the same tensors (never below the norm seen so far), lagged = the previous
+    total, per_tensor = each tensor's own. Without a previous step: the norm seen so far."""
+    shapes, steps = _clip_case()
+    params = [torch.nn.Parameter(torch.zeros(s, dtype = torch.float64)) for s in shapes]
+    wrapper = af.InBackwardOptimizer(
+        torch.optim.SGD(params, lr = 1.0), max_grad_norm = 1.0, clip = mode, batch_bytes = 1 << 30
+    )
+    got = [_clip_step(wrapper, params, grads, batches) for grads, batches in steps]
+    want = _oracle(steps, 1.0, mode)
+    for step_got, step_want in zip(got, want):
+        for a, b in zip(step_got, step_want):
+            assert abs(a - b) <= 1e-12 * max(1.0, abs(b)), (mode, step_got, step_want)
+    exact = _oracle(steps, 1.0, "exact")
+    assert any(
+        abs(a - b) > 1e-3 for a, b in zip(got[1], exact[1])
+    )  # an estimate, not the exact norm
+    # Never clipped less than the norm already seen implies (and so never less than each tensor's own norm).
+    prefix = _oracle([(steps[1][0], steps[1][1])], 1.0, "estimate")[0]
+    assert all(a <= b + 1e-12 for a, b in zip(got[1], prefix)) or mode == "per_tensor"
+
+
+def test_estimate_is_exact_when_gradients_keep_their_relative_sizes(af):
+    """Gradients that scale together from one step to the next (any order of arrival) are clipped by exactly the
+    global norm in every batch, the first ones included."""
+    shapes, steps = _clip_case(scales = (1.0, 1.0, 1.0))
+    base = steps[0][0]
+    steps = [
+        ([g * alpha for g in base], batches) for alpha, (_, batches) in zip((1.0, 3.0, 0.2), steps)
+    ]
+    params = [torch.nn.Parameter(torch.zeros(s, dtype = torch.float64)) for s in shapes]
+    wrapper = af.InBackwardOptimizer(
+        torch.optim.SGD(params, lr = 1.0), max_grad_norm = 1.0, batch_bytes = 1 << 30
+    )
+    assert wrapper.clip == "estimate"  # the default
+    got = [_clip_step(wrapper, params, grads, batches) for grads, batches in steps]
+    exact = _oracle(steps, 1.0, "exact")
+    for step_got, step_want in zip(got[1:], exact[1:]):
+        assert max(abs(a - b) for a, b in zip(step_got, step_want)) < 1e-12
+    assert (
+        max(abs(a - b) for a, b in zip(got[0], exact[0])) > 1e-3
+    )  # no previous step: only the norm seen so far
+
+
+def test_measuring_pass_gives_the_exact_global_coefficient(af):
+    """measuring(): nothing is stepped, every gradient is freed as it arrives; the next pass clips every batch by the
+    exact global norm, and the logged norm is the global pre-clip norm."""
+    shapes, steps = _clip_case()
+    params = [torch.nn.Parameter(torch.zeros(s, dtype = torch.float64)) for s in shapes]
+    wrapper = af.InBackwardOptimizer(
+        torch.optim.SGD(params, lr = 1.0), max_grad_norm = 1.0, clip = "exact", batch_bytes = 1 << 30
+    )
+    exact = _oracle(steps, 1.0, "exact")
+    for (grads, batches), want in zip(steps, exact):
+        assert wrapper.wants_measure()
+        before = [p.detach().clone() for p in params]
+        with wrapper.measuring():
+            for batch in batches:
+                sum((params[i] * grads[i]).sum() for i in batch).backward()
+                assert all(params[i].grad is None for i in batch)
+        assert all(torch.equal(p.detach(), b) for p, b in zip(params, before))  # nothing stepped
+        got = _clip_step(wrapper, params, grads, batches)
+        assert max(abs(a - b) for a, b in zip(got, want)) < 1e-12
+        norm = sum(float((g**2).sum()) for g in grads) ** 0.5
+    assert wrapper.measured_steps == 3
+    assert abs(wrapper._prev_total.item() ** 0.5 - norm) < 1e-9
+
+
+@pytest.mark.parametrize("mode", ["estimate", "exact", "lagged", "per_tensor"])
+def test_clipping_below_max_grad_norm_is_bitwise_the_unclipped_step(af, mode):
+    shapes, steps = _clip_case(scales = (1e-3, 2e-3, 5e-4))
+    params = [torch.nn.Parameter(torch.zeros(s, dtype = torch.float64)) for s in shapes]
+    wrapper = af.InBackwardOptimizer(
+        torch.optim.SGD(params, lr = 1.0), max_grad_norm = 1.0, clip = mode, batch_bytes = 1 << 30
+    )
+    for grads, batches in steps:
+        before = [p.detach().clone() for p in params]
+        _clip_step(wrapper, params, grads, batches)
+        assert all(torch.equal(p.detach(), b - g) for p, b, g in zip(params, before, grads))
+
+
+def test_reported_norm_is_the_global_pre_clip_norm(af):
     a = torch.nn.Parameter(torch.zeros(4))
     b = torch.nn.Parameter(torch.zeros(3))
-    base = torch.optim.SGD([a, b], lr = 1.0)
-    wrapper = af.InBackwardOptimizer(base, max_grad_norm = 1.0)
-    ga = torch.tensor([3.0, 4.0, 0.0, 0.0])  # norm 5 -> clipped to 1
-    gb = torch.tensor([0.3, 0.4, 0.0])  # norm 0.5 -> untouched
+    wrapper = af.InBackwardOptimizer(
+        torch.optim.SGD([a, b], lr = 1.0), max_grad_norm = 1.0, batch_bytes = 1 << 30
+    )
+    ga = torch.tensor([3.0, 4.0, 0.0, 0.0])
+    gb = torch.tensor([0.3, 0.4, 0.0])
     with wrapper.armed():
-        ((a * ga).sum() + (b * gb).sum()).backward()
-    assert torch.allclose(a.detach(), -ga / (5 + 1e-6), atol = 1e-7)
-    assert torch.equal(b.detach(), -gb)
-    assert abs(wrapper.total_norm().item() - (25 + 0.25) ** 0.5) < 1e-5  # pre-clip global norm
+        (
+            (a * ga).sum() + (b * gb).sum()
+        ).backward()  # one batch: the whole step, so the exact global norm
+    norm = (25 + 0.25) ** 0.5
+    assert torch.allclose(a.detach(), -ga / (norm + 1e-6), atol = 1e-7)
+    assert torch.allclose(b.detach(), -gb / (norm + 1e-6), atol = 1e-7)
+    assert abs(wrapper.total_norm().item() - norm) < 1e-5
     wrapper.step()
     assert wrapper.total_norm().item() == 0.0
+
+
+def test_clip_mode_from_the_environment(af, monkeypatch):
+    for value, mode in (
+        ("", "estimate"),
+        ("exact", "exact"),
+        ("LAGGED", "lagged"),
+        ("per_tensor", "per_tensor"),
+    ):
+        monkeypatch.setenv("UNSLOTH_AUTO_FIT_CLIP", value)
+        assert af.clip_mode() == mode
+    monkeypatch.delenv("UNSLOTH_AUTO_FIT_CLIP")
+    monkeypatch.setenv("UNSLOTH_AUTO_FIT_EXACT_CLIP", "1")
+    assert af.clip_mode() == "exact"
+
+
+def _max_diff(a, b):
+    return max(
+        (x.float() - y.float()).abs().max().item()
+        for x, y in zip(a.state_dict().values(), b.state_dict().values())
+    )
+
+
+def _fp32_model(dropout = 0.0):
+    model = _tiny_model().float()
+    model.config.attention_dropout = dropout
+    for layer in model.model.layers:
+        layer.self_attn.attention_dropout = dropout
+    return model
+
+
+@pytest.mark.parametrize("dropout", [0.0, 0.3])
+def test_exact_clip_matches_the_standard_clipped_step(af, sr, monkeypatch, dropout, tmp_path):
+    """UNSLOTH_AUTO_FIT_CLIP=exact: a gradient-only pass measures the global norm, then the in-backward step clips
+    with it: the standard clip_grad_norm_ step up to float32 rounding, with dropout drawing the same masks."""
+    monkeypatch.setenv("UNSLOTH_AUTO_FIT_CLIP", "exact")
+    base = _fp32_model(dropout)
+    standard = copy.deepcopy(base)
+    reference = _train(af, sr, standard, monkeypatch, "0", 0.05, tmp_path = tmp_path)
+    head = copy.deepcopy(base)
+    trainer = _train(af, sr, head, monkeypatch, "in_backward", 0.05, tmp_path = tmp_path)
+    wrapper = trainer._unsloth_in_backward_optimizer
+    assert wrapper.measured_steps == 4
+    norms = [h["grad_norm"] for h in reference.state.log_history if "grad_norm" in h]
+    assert min(norms) > 0.05 * 4  # clipping engaged on every step
+    assert _max_diff(base, head) > 1e-3
+    assert _max_diff(standard, head) < 2e-6, _max_diff(standard, head)
+    got = [h["grad_norm"] for h in trainer.state.log_history if "grad_norm" in h]
+    assert all(abs(a - b) <= 1e-4 * b for a, b in zip(got, norms))
+    losses = lambda t: [h["loss"] for h in t.state.log_history if "loss" in h]
+    assert all(abs(a - b) <= 1e-4 for a, b in zip(losses(trainer), losses(reference)))
+
+
+def test_estimated_clip_tracks_the_standard_clipped_step(af, sr, monkeypatch, tmp_path):
+    """Default: only the first step is measured (no previous step to estimate from); later steps estimate the
+    global norm. Much closer to the standard step than clipping each tensor by its own norm."""
+    base = _fp32_model()
+    standard = copy.deepcopy(base)
+    _train(af, sr, standard, monkeypatch, "0", 0.05, steps = 6, tmp_path = tmp_path)
+    diffs = {}
+    for mode in ("estimate", "per_tensor"):
+        monkeypatch.setenv("UNSLOTH_AUTO_FIT_CLIP", mode)
+        head = copy.deepcopy(base)
+        trainer = _train(af, sr, head, monkeypatch, "in_backward", 0.05, steps = 6, tmp_path = tmp_path)
+        assert trainer._unsloth_in_backward_optimizer.measured_steps == (
+            1 if mode == "estimate" else 0
+        )
+        diffs[mode] = _max_diff(standard, head)
+    assert diffs["estimate"] * 2 < diffs["per_tensor"], diffs
+
+
+def test_measuring_pass_leaves_no_trace(af):
+    """The gradient-only pass restores the random state and the trainer's counters and logged metrics."""
+
+    class Trainer:
+        pass
+
+    from collections import defaultdict
+
+    trainer = Trainer()
+    trainer._total_train_tokens = 10
+    train = defaultdict(list, {"num_tokens": [10], "loss": [1.0]})
+    trainer._metrics = {"train": train, "eval": defaultdict(list)}
+    torch.manual_seed(5)
+    want = torch.rand(3)
+    torch.manual_seed(5)
+    with af._repeatable(trainer, None):
+        torch.rand(7)
+        trainer._total_train_tokens += 5
+        trainer._metrics["train"]["num_tokens"] = [15]
+        trainer._metrics["train"]["loss"].append(2.0)
+        trainer._metrics["train"]["entropy"].append(0.5)
+    assert torch.equal(torch.rand(3), want)
+    assert trainer._total_train_tokens == 10
+    assert trainer._metrics == {"train": {"num_tokens": [10], "loss": [1.0]}, "eval": {}}
+    assert (
+        trainer._metrics["train"] is train
+    )  # TRL appends to a missing key: still a defaultdict(list)
+    trainer._metrics["train"]["entropy"].append(0.1)
+
+
+def test_trainers_that_generate_inside_the_step_are_not_repeated(
+    af, sr, monkeypatch, capsys, tmp_path
+):
+    """GRPO / RLOO sample completions in _prepare_inputs (online trainers in training_step): running the step twice
+    would draw new samples, so exact falls back to the estimate and the first step is not measured."""
+    from transformers import Trainer
+
+    class GRPOTrainer(Trainer):
+        pass
+
+    class SFTTrainer(Trainer):
+        def training_step(self, *args, **kwargs):
+            return super().training_step(*args, **kwargs)
+
+    assert af._can_repeat_step(object.__new__(SFTTrainer))
+    assert not af._can_repeat_step(object.__new__(GRPOTrainer))
+
+    class Sampling(Trainer):
+        def _prepare_inputs(self, inputs):
+            return super()._prepare_inputs(inputs)
+
+    assert not af._can_repeat_step(object.__new__(Sampling))
+    model = _fp32_model()
+    base = torch.optim.SGD(model.parameters(), lr = 1e-3)
+    trainer = object.__new__(GRPOTrainer)
+    trainer.training_step = lambda *a, **k: None
+    wrapper = af.InBackwardOptimizer(base, max_grad_norm = 1.0, clip = "exact")
+    af._arm_training_step(trainer, wrapper)
+    assert wrapper.clip == "estimate" and not wrapper.calibrate
+    assert "generates its inputs" in capsys.readouterr().out
+
+
+class _NormNet(torch.nn.Module):
+    """A forward that updates buffers in place (BatchNorm running statistics)."""
+
+    def __init__(self):
+        super().__init__()
+        torch.manual_seed(0)
+        self.a = torch.nn.Linear(6, 8)
+        self.norm = torch.nn.BatchNorm1d(8)
+        self.b = torch.nn.Linear(8, 1)
+
+    def forward(self, x, labels):
+        return {
+            "loss": (self.b(torch.relu(self.norm(self.a(x)))).squeeze(-1) - labels).square().mean()
+        }
+
+
+def test_measuring_pass_restores_buffers_the_forward_updates(af, sr, monkeypatch, tmp_path):
+    """BatchNorm's running statistics see each batch once, as in the standard step, not once per pass."""
+    from datasets import Dataset
+    from transformers import Trainer, TrainingArguments
+
+    g = torch.Generator().manual_seed(2)
+    rows = [{"x": torch.randn(6, generator = g).tolist(), "labels": float(i % 3)} for i in range(16)]
+    results = {}
+    for mode in ("0", "in_backward"):
+        monkeypatch.setenv("UNSLOTH_AUTO_FIT_OPTIMIZER", mode)
+        monkeypatch.setenv("UNSLOTH_AUTO_FIT_CLIP", "exact")
+        model = _NormNet()
+        args = TrainingArguments(
+            output_dir = str(tmp_path),
+            per_device_train_batch_size = 4,
+            max_steps = 3,
+            learning_rate = 1e-2,
+            max_grad_norm = 0.01,
+            report_to = [],
+            use_cpu = True,
+            save_strategy = "no",
+            seed = 0,
+            dataloader_num_workers = 0,
+            disable_tqdm = True,
+        )
+        trainer = Trainer(model = model, args = args, train_dataset = Dataset.from_list(rows))
+        af.install_auto_fit_optimizer(trainer)
+        trainer.train()
+        if mode != "0":
+            assert trainer._unsloth_in_backward_optimizer.measured_steps == 3
+        results[mode] = model
+    standard, head = results["0"], results["in_backward"]
+    assert int(head.norm.num_batches_tracked) == int(standard.norm.num_batches_tracked) == 3
+    assert torch.allclose(head.norm.running_mean, standard.norm.running_mean, atol = 1e-6)
+    assert torch.allclose(head.norm.running_var, standard.norm.running_var, atol = 1e-6)
+    assert _max_diff(standard, head) < 1e-5
+
+
+def _lora_model():
+    from peft import LoraConfig, get_peft_model
+
+    model = _fp32_model()
+    model._unsloth_full_finetuning = False
+    return get_peft_model(
+        model, LoraConfig(r = 4, lora_alpha = 8, target_modules = ["q_proj", "v_proj", "down_proj"])
+    )
+
+
+@pytest.mark.skipif(importlib.util.find_spec("peft") is None, reason = "needs peft")
+@pytest.mark.parametrize("clip", [0.0, 0.05])
+def test_forced_in_backward_on_lora_is_the_standard_step(af, sr, monkeypatch, clip, tmp_path):
+    """LoRA / QLoRA never engage automatically (the adapter gradients are a few MB: nothing to gain), but forcing
+    the in-backward step on a LoRA model steps only the adapters, as the standard step does."""
+    monkeypatch.setenv("UNSLOTH_AUTO_FIT_CLIP", "exact")
+    torch.manual_seed(0)
+    base = _lora_model()
+    for name, p in base.named_parameters():
+        if "lora_B" in name:
+            torch.nn.init.normal_(
+                p, std = 0.02
+            )  # B starts at zero: make every adapter receive a gradient
+    standard = copy.deepcopy(base)
+    _train(af, sr, standard, monkeypatch, "0", clip, tmp_path = tmp_path)
+    head = copy.deepcopy(base)
+    trainer = _train(af, sr, head, monkeypatch, "in_backward", clip, tmp_path = tmp_path)
+    wrapper = trainer._unsloth_in_backward_optimizer
+    trainable = [p for p in head.parameters() if p.requires_grad]
+    assert trainable and all("lora_" in n for n, p in head.named_parameters() if p.requires_grad)
+    assert wrapper.hook_steps == 4 * len(trainable) and wrapper.late_steps == 0
+    frozen = [n for n, p in base.named_parameters() if not p.requires_grad]
+    hs, bs = dict(head.named_parameters()), dict(base.named_parameters())
+    assert all(torch.equal(hs[n], bs[n]) for n in frozen)
+    if clip == 0:
+        assert _weights_equal(standard, head)
+    else:
+        assert _max_diff(standard, head) < 2e-6
 
 
 def test_second_backward_before_step_raises(af):
@@ -649,3 +1028,175 @@ def test_resuming_keeps_the_optimizer_family(af, sr, monkeypatch, tmp_path):
     assert type(resumed._unsloth_in_backward_optimizer.optimizer) is torch.optim.SGD
     assert resumed.state.global_step == 3
     del first
+
+
+def test_reentrant_checkpointing_steps_one_batch_per_block(af, monkeypatch):
+    """Each checkpointed block's backward is its own graph task: its gradients (and the head's, ready before it)
+    are stepped together when it ends, not one launch sequence per weight."""
+    x = torch.randn(4, 8)
+    model = _Blocks(False)
+    wrapper = af.InBackwardOptimizer(
+        torch.optim.AdamW(model.parameters(), lr = 1e-2), batch_bytes = 1 << 20
+    )
+    batches = []
+    step_params = wrapper._step_params
+    monkeypatch.setattr(
+        wrapper, "_step_params", lambda params: (batches.append(len(params)), step_params(params))
+    )
+    with wrapper.armed():
+        model(x).backward()
+        assert all(p.grad is None for p in model.parameters())  # stepped inside backward
+    wrapper.step()
+    assert [b for b in batches if b] == [4, 2]  # head + block b, then block a
+    assert wrapper.hook_steps == 6 and wrapper.late_steps == 0
+
+
+class _Trial(torch.nn.Module):
+    """A block whose first call also runs a throwaway forward under Unsloth's block-trial flag (as compiled
+    decoder blocks check their region on the first call), then the real one."""
+
+    def __init__(self, flag):
+        super().__init__()
+        torch.manual_seed(0)
+        self.flag = flag
+        self.proj = torch.nn.Linear(8, 8)
+        self.head = torch.nn.Linear(8, 1)
+
+    def forward(self, x):
+        self.flag[0] = True
+        try:
+            with torch.enable_grad():
+                self.proj(x.detach().requires_grad_())  # the trial: no gradient reaches the weight
+        finally:
+            self.flag[0] = False
+        return self.head(torch.tanh(self.proj(x))).square().mean()
+
+
+def test_a_block_trial_forward_is_not_a_reuse(af, monkeypatch):
+    """Unsloth's first-call block trial ran every block's modules twice on step 1, so every layer's gradient was
+    kept until optimizer.step() (all layer gradients alive at once on the first step)."""
+    import sys
+    import types
+
+    flag = [False]
+    monkeypatch.setitem(
+        sys.modules, "unsloth.models._block_compile", types.SimpleNamespace(_IN_TRIAL = flag)
+    )
+    x = torch.randn(4, 8)
+    standard, head = _Trial(flag), _Trial(flag)
+    opt = torch.optim.AdamW(standard.parameters(), lr = 1e-2)
+    wrapper = af.InBackwardOptimizer(torch.optim.AdamW(head.parameters(), lr = 1e-2), model = head)
+    for _ in range(2):
+        standard(x).backward()
+        opt.step()
+        opt.zero_grad()
+        with wrapper.armed():
+            head(x).backward()
+        wrapper.step()
+    assert _weights_equal(standard, head)
+    assert wrapper.deferred_steps == 0 and wrapper.hook_steps == 2 * 4
+
+
+def test_reuse_counting_does_not_break_a_compiled_block(af, monkeypatch):
+    """The reuse counter's forward pre-hooks sit on every module that holds a weight, including the ones inside
+    Unsloth's compiled decoder blocks: they must compile to nothing instead of splitting the graph."""
+    import sys
+
+    pytest.importorskip("torch._dynamo")
+    monkeypatch.setitem(sys.modules, af.__name__, af)  # dynamo imports the hook's module by name
+
+    class Block(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.a = torch.nn.Linear(8, 8)
+            self.b = torch.nn.Linear(8, 8)
+
+        def forward(self, x):
+            return self.b(torch.tanh(self.a(x)))
+
+    torch.manual_seed(0)
+    model = torch.nn.Sequential(Block(), torch.nn.Linear(8, 1))
+    wrapper = af.InBackwardOptimizer(torch.optim.SGD(model.parameters(), lr = 1e-2), model = model)
+    torch._dynamo.reset()
+    compiled = torch.compile(model[0], backend = "eager", fullgraph = True)
+    x = torch.randn(4, 8)
+    with wrapper.armed():
+        model[1](compiled(x)).square().mean().backward()  # fullgraph: a graph break raises
+    wrapper.step()
+    assert wrapper.hook_steps == 6 and wrapper.deferred_steps == 0
+    torch._dynamo.reset()
+
+
+def test_deferred_weights_are_stepped_in_bounded_batches(af, monkeypatch):
+    """The weights left for optimizer.step() (a looped block's) are stepped in batches of at most batch_bytes, so a
+    multi-tensor step's temporaries never span every deferred weight at once."""
+    x = torch.randn(4, 8)
+    standard, head = _Looped(), _Looped()
+    opt = torch.optim.AdamW(standard.parameters(), lr = 1e-2)
+    weight = head.block.proj.weight
+    wrapper = af.InBackwardOptimizer(
+        torch.optim.AdamW(head.parameters(), lr = 1e-2),
+        model = head,
+        batch_bytes = weight.numel() * weight.element_size(),
+    )
+    sizes = []
+    step_params = wrapper._step_params
+    monkeypatch.setattr(
+        wrapper,
+        "_step_params",
+        lambda params: (
+            sizes.append(
+                sum(p.grad.numel() * p.grad.element_size() for p in params if p.grad is not None)
+            ),
+            step_params(params),
+        ),
+    )
+    for _ in range(2):
+        standard(x).backward()
+        opt.step()
+        opt.zero_grad()
+        with wrapper.armed():
+            head(x).backward()
+        wrapper.step()
+    assert _weights_equal(standard, head)
+    assert wrapper.deferred_steps == 2 * 2
+    assert max(sizes) <= wrapper.batch_bytes
+
+
+def test_ready_batches_never_exceed_batch_bytes(af, monkeypatch):
+    """A gradient that would push the waiting batch past batch_bytes steps that batch first; only a weight larger
+    than batch_bytes is stepped alone, so a multi-tensor update never spans more than the planner budgets."""
+    model = _tiny_model().float()
+    params = [p for p in model.parameters() if p.requires_grad]
+    size = lambda q: q.numel() * q.element_size()
+    limit = 3 * max(size(p) for p in params if p.dim() == 2 and p.shape[0] != 96)
+    wrapper = af.InBackwardOptimizer(
+        torch.optim.AdamW(model.parameters(), lr = 1e-3), batch_bytes = limit
+    )
+    batches = []
+    step_params = wrapper._step_params
+    monkeypatch.setattr(
+        wrapper,
+        "_step_params",
+        lambda ps: (batches.append([size(p) for p in ps if p.grad is not None]), step_params(ps)),
+    )
+    ids = torch.randint(0, 96, (2, 12))
+    with wrapper.armed():
+        model(input_ids = ids, labels = ids).loss.backward()
+    wrapper.step()
+    batches = [b for b in batches if b]
+    assert len(batches) > 1 and any(len(b) > 1 for b in batches)
+    assert all(sum(b) <= limit or len(b) == 1 for b in batches), batches
+
+
+def test_planner_budgets_the_batch_workspace(af, monkeypatch):
+    """While a batch steps, the gradient that arrived is alive too, and torch's foreach AdamW without the one-pass
+    kernel adds a moment-sized temporary over the batch: one more largest weight in the in-backward budget."""
+    model = _plan_model()
+    largest = max(p.numel() * p.element_size() for p in model.parameters())
+    monkeypatch.delenv("UNSLOTH_BF16_STOCHASTIC_ROUNDING", raising = False)
+    one_pass = af.plan_auto_fit(_Trainer(optim = "adamw_torch"), model, usable_bytes = 0)
+    monkeypatch.setenv("UNSLOTH_BF16_STOCHASTIC_ROUNDING", "0")
+    foreach = af.plan_auto_fit(_Trainer(optim = "adamw_torch"), model, usable_bytes = 0)
+    assert foreach["in_backward"] - one_pass["in_backward"] == largest
+    assert one_pass["in_backward"] - one_pass["states"] - (256 << 20) == 2 * largest
