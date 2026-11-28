@@ -119,13 +119,52 @@ def sh(cmd, timeout = 600, cwd = None, env = None) -> dict:
 
 
 _LIBDIRS: dict = {}
+_ROCM_DIRS: list = []
+ROCM_LIBS = ("libhipblas.so", "libamdhip64.so", "librocblas.so", "libhipblaslt.so")
+
+
+def rocm_lib_dirs() -> list:
+    """Dirs under /opt holding the HIP runtime / BLAS libs (the runner's ROCm is not on the default loader path)."""
+    if _ROCM_DIRS:
+        return _ROCM_DIRS
+    found = set()
+    for top in sorted(Path("/opt").glob("rocm*")):
+        for dirpath, dirnames, filenames in os.walk(top):
+            if dirpath.count(os.sep) - str(top).count(os.sep) >= 5:
+                dirnames[:] = []
+            if any(f.startswith(ROCM_LIBS) for f in filenames):
+                found.add(dirpath)
+    _ROCM_DIRS.extend(sorted(found) or ["/opt/rocm/lib"])
+    return _ROCM_DIRS
+
+
+def extract(zpath: Path, dest: Path) -> dict:
+    """unzip keeps the bundle's symlinks (zipfile.extractall writes them as tiny text files: 'file too short')."""
+    if shutil.which("unzip"):
+        r = sh(["unzip", "-q", "-o", str(zpath), "-d", str(dest)], timeout = 600)
+        if r["rc"] == 0:
+            return {"via": "unzip"}
+    links = 0
+    with zipfile.ZipFile(zpath) as z:
+        for info in z.infolist():
+            target = dest / info.filename
+            if (info.external_attr >> 16) & 0o170000 == 0o120000:
+                target.parent.mkdir(parents = True, exist_ok = True)
+                if target.is_symlink() or target.exists():
+                    target.unlink()
+                os.symlink(z.read(info).decode("utf-8"), target)
+                links += 1
+            else:
+                z.extract(info, dest)
+    return {"via": "zipfile", "symlinks": links}
 
 
 def bin_env(binary: Path) -> dict:
     env = dict(os.environ)
     if binary not in _LIBDIRS:
         root = binary.parent.parent if binary.parent.name == "bin" else binary.parent
-        _LIBDIRS[binary] = sorted({str(p.parent) for p in root.rglob("*.so*")} | {str(binary.parent)})[:40]
+        _LIBDIRS[binary] = sorted({str(p.parent) for p in root.rglob("*.so*")} | {str(binary.parent)})[:40] + \
+            rocm_lib_dirs()
     libdirs = _LIBDIRS[binary]
     env["LD_LIBRARY_PATH"] = ":".join(libdirs + [env.get("LD_LIBRARY_PATH", "")])
     return env
@@ -135,7 +174,8 @@ def try_binary(binary: Path) -> dict:
     binary.chmod(0o755)
     r = sh([str(binary), "--list-devices"], timeout = 120, env = bin_env(binary))
     out = r.get("out", "")
-    r["ldd"] = sh(["ldd", str(binary)], timeout = 30).get("out", "")[-1500:]
+    r["ldd"] = sh(["ldd", str(binary)], timeout = 30, env = bin_env(binary)).get("out", "")[-1500:]
+    r["ld_library_path"] = bin_env(binary)["LD_LIBRARY_PATH"][:1500]
     r["gpu_listed"] = r["rc"] == 0 and bool(re.search(r"Vulkan\d|ROCm\d|HIP\d|CUDA\d|Radeon|gfx11", out))
     return r
 
@@ -154,8 +194,7 @@ def get_binary(shared: Path, tag: str, commit: str) -> dict:
         att["sha256"] = sha256(shared / asset)
         bdir = shared / f"bundle_{backend}"
         try:
-            with zipfile.ZipFile(shared / asset) as z:
-                z.extractall(bdir)
+            att["extract"] = extract(shared / asset, bdir)
         except Exception as e:  # noqa: BLE001
             att["error"] = f"unzip: {e}"
             out["attempts"].append(att)
@@ -166,7 +205,7 @@ def get_binary(shared: Path, tag: str, commit: str) -> dict:
             out["attempts"].append(att)
             continue
         for f in bdir.rglob("*"):
-            if f.is_file():
+            if f.is_file() and not f.is_symlink():
                 f.chmod(0o755)
         att["binary"] = str(clis[0])
         att["list_devices"] = try_binary(clis[0])
