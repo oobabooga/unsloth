@@ -1,0 +1,105 @@
+name: "AMD CI: validate PR 20103"
+
+# Generated from amd_ci/templates/workflow.yml. Edit the PROBE and CRITERIA env
+# values, and the tests/args, rather than the plumbing.
+#
+# Two jobs, because two jobs of this workflow may land on the SAME machine and
+# then share its one GPU:
+#   suites  masks the GPU, so it cannot perturb a measurement running beside it
+#   gpu     is the only job allowed to allocate, and is serialised against every
+#           other run of the same concurrency group
+#
+# They may equally land on different machines: the Linux pool is at least seven
+# (a 24-way matrix ran essentially concurrently across seven distinct hosts).
+# Nothing is shared between them, including the Docker image cache, so a job that
+# pulls an image does not make it available to the next one.
+#
+# This is the LINUX template. For the Windows boxes use
+# `scaffold.py --windows`, which emits templates/workflow_windows.yml.
+#
+# If your change needs no GPU measurement, delete the gpu job. If it needs no
+# test suites, delete suites. Do not delete the gate: it fails rather than
+# skipping, because a skip misreports missing hardware as nothing to see.
+
+on:
+  push:
+    branches: [amd-ci-g22-g21u1-lnx]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  PR: "20103"
+  UPSTREAM: "https://github.com/unslothai/unsloth"
+  # Set to "1" for a PR already merged: compares the merge commit to its parent.
+  AMD1_BASE_OVERRIDE: "3f4a7e5fc52ae85e20cbff8c0d7c17f12a9e7166"
+  AMD1_HEAD_OVERRIDE: "7d692c57614d2468182b8fc32b71242ba3b49650"
+  MERGED: "0"
+  # Set by scaffold.py --patch: base = PATCH_BASE, head = PATCH_BASE plus this diff (relative to the checkout).
+  PATCH_BASE: ""
+  PATCH_FILE: ""
+  PATCH_SHA256: "__PATCH_SHA256__"
+
+jobs:
+
+  gpu:
+    name: "PR 20103 GPU check (shared GPU)"
+    runs-on: [self-hosted, Linux, strix-halo, devlab-dispatch]
+    timeout-minutes: 420
+    # --shared-gpu: no concurrency group, so a co-tenant may share the card.
+    # Correctness only; capability.py reports `exclusive_gpu` as a gap.
+    env:
+      AMD_CI_SHARED_GPU: "1"
+    steps:
+      - uses: actions/checkout@v4
+        with: { persist-credentials: false }
+
+      - name: Preamble
+        run: |
+          source amd_ci/lib/preamble.sh "pr20103-gpu"
+
+      - name: Hardware gate
+        run: |
+          set -euo pipefail
+          python3 amd_ci/lib/gate.py --no-torch --require rocm gpu \
+            --expect-arch gfx1151 --min-gpus 1 \
+            --out "$AMD_CI_WORK/out/host.json" || \
+          echo "note: gate ran before the venv exists; re-gated after install below"
+
+      - name: Resolve states
+        run: |
+          set -euo pipefail
+          ARGS=""
+          [ "$MERGED" = "1" ] && ARGS="--merged"
+          if [ -n "$PATCH_FILE" ]; then ARGS="--patch-base $PATCH_BASE --patch $GITHUB_WORKSPACE/$PATCH_FILE --patch-sha256 $PATCH_SHA256"; fi
+          python3 amd_ci/lib/states.py --repo "$UPSTREAM" --pr "$PR" $ARGS \
+            --root "$AMD_CI_WORK" --out "$AMD_CI_WORK/out/states.json"
+
+      - name: Environment and host gate (no Studio)
+        run: |
+          set -euo pipefail
+          echo "AMD_CI_PY=$(command -v python3)" >> "$GITHUB_ENV"
+          # No torch here, so rocm/gpu read UNDETERMINED: the criteria gates prove the GPU ran.
+          python3 "$GITHUB_WORKSPACE/amd_ci/lib/gate.py" --no-torch --out "$AMD_CI_WORK/out/host.json"
+
+      - name: Differential
+        run: |
+          set +e
+          "$AMD_CI_PY" amd_ci/lib/differential.py \
+            --states "$AMD_CI_WORK/out/states.json" \
+            --probe amd_ci/probes/train5_probe.py \
+            --criteria amd_ci/criteria/amdgate_rocm.py \
+            --out-dir "$AMD_CI_WORK/out/gpu" \
+            --python "$AMD_CI_PY" -- --unit g21u1 --state-repo unsloth --transformers 5.24.0 --trl 1.18.0 --cells env,flm16 --companion-repo https://github.com/unslothai/unsloth-zoo --companion-base c2b1a436e91161dd0d7301283ca9c01e60f7d515 --companion-head 429e00f97fc2d524a033c4e89affe2f09dbb872c --venv "$AMD_CI_WORK/tvenv" --tests tests/diffusion/test_diffusion_gemma.py tests/python/test_adapter_probe_no_exist.py tests/python/test_fused_linear_online_dpo.py tests/python/test_prebuilt_cuda_wheels_arm.py tests/python/test_windows_uv_managed_python.py tests/saving/test_gguf_requant_keeps_prior_export.py tests/saving/test_save_method_lora_routing.py tests/test_bf16_stochastic_rounding.py tests/test_block_swap_shaped.py tests/test_custom_op_annotations.py tests/test_dora_native_fp8.py tests/test_dpo_vision_grid_rows.py tests/test_ep_converter_expert_stacks_gloo.py tests/test_ep_replica_buckets_gloo.py tests/test_fp8_dequant_max_rows.py tests/test_fp8_pre_sm89_byte_dequant.py tests/test_fp8_rowwise_direct_route.py tests/test_fsdp2_native_ga_trainable_units_gloo.py tests/test_fsdp2_replicated_grad_sync_gloo.py tests/test_fused_dpo_trl1_single_pass.py tests/test_generic_decode_graphs_release_for_training.py tests/test_gguf_reference_dequant.py tests/test_inkling2_packed_experts_gloo.py tests/test_int4_fast_self_check_eager.py tests/test_large_head_attention.py tests/test_lora_gguf_export_errors.py tests/test_nf4_triton_gemv.py tests/test_onthefly_fp4.py tests/test_parallel_cp_compose_gloo.py tests/test_pp_native_fused_ce.py tests/test_rl_train_wrapper_keeps_instance_train.py tests/test_sync_load_when_quantizing.py tests/test_triton_kernel_binaries.py tests/utils/test_lora_ga_save_conversion.py tests/test_async_grpo_patch.py tests/test_ep_checkpoint_integrity_gloo.py tests/test_float8_training.py tests/test_gdn_reload_routing.py tests/test_grouped_gemm_fp32_ieee.py tests/test_mlx_bf16_gpu_family.py tests/test_parallel_capabilities_ep.py tests/test_parallel_ref_adapter_gloo.py tests/test_remote_moe_grouped_probe_oom.py tests/test_save_lora_fsdp2_pp_gloo.py tests/test_tp_env_gloo.py tests/test_vllm_standby_sleep_rloo_online_dpo.py tests/python/test_grpo_ddp_model_config.py tests/test_ci_repo_cpu_shards.py tests/test_ep_chunked_checkpoint_pristine.py tests/test_forced_float32_parallel_scaler_gloo.py tests/test_fp8_fbgemm_probe_device.py tests/test_fsdp2_native_block_cudagraphs_flex_gloo.py tests/test_fsdp2_native_unsharded_int_mesh_gloo.py tests/test_grpo_packed_nograd_oom_recovery.py tests/test_grpo_packing_verify_outlier.py tests/test_qwen4_exp_fast_inference_gate.py tests/test_torch_config_thread_cache_invalidate.py tests/test_triton_runs_on_device.py tests/test_token_balance_partition.py tests/test_nf4_dequant_cache.py tests/test_online_dpo_vllm_init.py tests/test_grpo_packing_shape_noise.py tests/test_grpo_scalerl_resampling.py tests/test_grpo_move_model_to_vllm_sync.py tests/python/test_grpo_head_hooks.py tests/test_ulysses_inkling2_bias.py tests/test_block_compile_cpp_wrapper.py tests/test_fsdp2_native_ckpt_write_failure_gloo.py tests/test_pp_env_gloo.py tests/test_grpo_hidden_states_env_restored.py tests/test_ulysses_whole_sequence_mask.py tests/test_device_index_names_type.py tests/test_triton_fp_fusion.py tests/test_tp_padding_free_auto_off.py tests/test_grpo_image_column_normalisation.py tests/test_grpo_vllm_is_default_on.py tests/test_ep_x_cp_gloo.py tests/test_ep_inkling2_gloo.py tests/test_split_layer_rope_tables.py tests/test_parallel_inkling2_prequantized_gloo.py --repeat flm16 --extra-pip gguf --tests-from-head !tests/_layer_major_ddp_worker.py tests/_onthefly_fp4_case.py tests/_shared/torch_version_tag.py tests/_shared/transformers5_loading.py !tests/diffusion/test_diffusion_gemma.py !tests/diffusion/test_diffusion_infer.py !tests/diffusion/test_diffusion_masked.py tests/python/test_adapter_probe_no_exist.py !tests/python/test_docker_run_local_models.py !tests/python/test_docker_update_helpers.py !tests/python/test_fused_linear_online_dpo.py !tests/python/test_macos_torch213_pins.py tests/python/test_online_dpo_mm_token_type_ids.py !tests/python/test_prebuilt_cuda_wheels_arm.py !tests/python/test_prebuilt_cuda_wheels_windows.py !tests/python/test_windows_python_venv_hardening.py !tests/python/test_windows_uv_managed_python.py !tests/python/test_windows_xformers_installer.py !tests/saving/test_gguf_intermediate_keeps_prior_export.py tests/saving/test_gguf_requant_keeps_prior_export.py tests/saving/test_lora_gguf_adapter_scale.py tests/saving/test_residual_lora_reload_merge.py !tests/saving/test_save_method_lora_routing.py !tests/test_adapter_vocab_growth.py tests/test_auto_fit_optimizer.py !tests/test_bf16_stochastic_rounding.py tests/test_bf16_stochastic_rounding_dtensor_gloo.py !tests/test_block_cudagraphs_gpu.py !tests/test_block_swap_shaped.py tests/test_clean_gpu_cache_cpu.py !tests/test_context_parallel_split_generation.py tests/test_custom_op_annotations.py tests/test_device_stats_inductor_cache_key.py tests/test_distillation_teacher_tokenizer.py tests/test_dora_native_fp8.py !tests/test_dpo_prefix_share.py tests/test_dpo_vision_collator_pixel_rows.py !tests/test_dpo_vision_grid_rows.py tests/test_dpo_vision_mm_token_type_ids.py !tests/test_ep_collective_safety_gloo.py tests/test_ep_converter_expert_stacks_gloo.py !tests/test_ep_expert_lists_gloo.py !tests/test_ep_expert_shapes_gloo.py !tests/test_ep_replica_buckets_gloo.py !tests/test_ep_sharded_load_gloo.py !tests/test_fastlanguagemodel_new_tokens_tied.py !tests/test_fp8_dequant_max_rows.py !tests/test_fp8_lora.py !tests/test_fp8_no_rowwise_scaled_mm.py !tests/test_fp8_pre_sm89_byte_dequant.py !tests/test_fp8_pre_sm89_dequant_fallback.py !tests/test_fp8_rowwise_compile_guards.py !tests/test_fp8_rowwise_direct_route.py !tests/test_fp8_rowwise_gemv_blackwell_gate.py !tests/test_fp8_torchao_import_route.py tests/test_fsdp2_native_ga_trainable_units_gloo.py tests/test_fsdp2_native_packed_experts_gloo.py !tests/test_fsdp2_native_sharded_load_gloo.py !tests/test_fsdp2_replicated_grad_sync_gloo.py tests/test_fsdp2_stacked_expert_keys.py tests/test_fsdp2_submesh_bnb_optimizer_gloo.py tests/test_fused_dpo_trl1_single_pass.py !tests/test_gemv_rows_cap_table.py !tests/test_generic_decode_graphs.py tests/test_generic_decode_graphs_release_for_training.py tests/test_gguf_packed_inkling2.py tests/test_gguf_packed_lora.py tests/test_gguf_reference_dequant.py !tests/test_gguf_windows_export_routing.py !tests/test_import_keeps_plain_model_backends.py tests/test_inkling2_packed_experts_gloo.py tests/test_inkling2_packed_experts_inert_notice.py !tests/test_installer_system32_guard.py tests/test_int4_fast_self_check_eager.py tests/test_int8_lora_cuda.py tests/test_int8_lora_recipe.py !tests/test_large_head_attention.py !tests/test_layer_major_ga.py !tests/test_layer_major_ga_ddp.py !tests/test_lora_gguf_export_errors.py !tests/test_merged_hub_destination.py !tests/test_moe_load_logging.py !tests/test_nf4_triton_gemv.py !tests/test_offloaded_parameter_hint.py !tests/test_on_policy_distillation.py tests/test_onthefly_fp4.py !tests/test_oom_does_not_latch_fast_paths.py !tests/test_optimized_precision_conflicts.py !tests/test_parallel_cp_compose_gloo.py !tests/test_parallel_env.py tests/test_portable_resume_state_offload.py !tests/test_pp_native_fused_ce.py !tests/test_prefetch_snapshot_scope.py tests/test_qat_scheme_new_model_path.py tests/test_rl_train_wrapper_keeps_instance_train.py !tests/test_rloo_fused_logprobs.py tests/test_rocm_torch_gates.py !tests/test_sync_load_when_quantizing.py !tests/test_token_budget_batches.py !tests/test_tp_native_gloo.py !tests/test_triton_kernel_binaries.py !tests/test_triton_runtime_size_args.py !tests/test_uma_safetensors_load.py !tests/utils/test_lora_ga_save_conversion.py !tests/python/test_prebuilt_cuda_wheels_flash_attn_varlen.py !tests/saving/test_torchao_staging_dir_cleanup.py !tests/test_async_grpo_patch.py !tests/test_capability_probe_oom_no_latch.py !tests/test_decode_gqa_in_place.py !tests/test_ep_checkpoint_integrity_gloo.py !tests/test_ep_moe_families_gloo.py !tests/test_ep_packed_checkpoint_load_gloo.py !tests/test_float8_training.py !tests/test_frozen_tower_input_grads.py !tests/test_fsdp2_native_offloaded_optimizer_save_nccl.py !tests/test_gdn_reload_routing.py !tests/test_gguf_load_fixes.py !tests/test_gguf_load_trainable.py !tests/test_grouped_gemm_fp32_ieee.py !tests/test_grpo_routing_replay_trainer_hooks.py !tests/test_kernels_utils_no_import_stream_query.py !tests/test_mlx_bf16_gpu_family.py !tests/test_packed_expert_loader.py !tests/test_parallel_auto.py !tests/test_parallel_capabilities_ep.py !tests/test_parallel_cp_pipeline_gloo.py !tests/test_parallel_deepseek_v41_gloo.py !tests/test_parallel_ref_adapter_gloo.py !tests/test_pp_moe_aux_gloo.py !tests/test_pp_moe_router_aux_trl118_gloo.py !tests/test_remote_moe_grouped_probe_oom.py !tests/test_rl_skip_ref_adapter.py !tests/test_rl_vllm_lora_rounding_scope.py !tests/test_save_lora_fsdp2_pp_gloo.py !tests/test_setup_master_root.py !tests/test_tp_dpo_peft_ref_adapter_gloo.py !tests/test_tp_env_gloo.py !tests/test_tp_native_oracle.py !tests/test_ulysses_deepseek_position_gather.py !tests/test_vllm_standby_sleep_rloo_online_dpo.py !tests/test_windows_safetensors_pread.py !tests/_grpo_dispatch_source.py !tests/_opd_collective_worker.py !tests/_shared/rank_zygote.py !tests/_shared/shard_durations.json !tests/_shared/shard_split.py !tests/python/test_dpo_vision_model_detection.py !tests/python/test_grpo_ddp_model_config.py !tests/test_bf16_stochastic_rounding_ddp_gloo.py !tests/test_bf16_stochastic_rounding_fused_gpu.py !tests/test_ci_repo_cpu_shards.py !tests/test_deepseek_v41_fast_inference_gate.py !tests/test_distributed_store_codec.py !tests/test_ep_chunked_checkpoint_pristine.py !tests/test_ep_list_sharded_load_gloo.py !tests/test_ep_packed_experts_gloo.py !tests/test_forced_float32_parallel_scaler_gloo.py !tests/test_fp8_block_gemv.py !tests/test_fp8_fbgemm_block_shapes.py !tests/test_fp8_fbgemm_probe_device.py !tests/test_fp8_rowwise_backend.py !tests/test_fsdp2_exports_gloo.py !tests/test_fsdp2_native_block_cudagraphs_flex_gloo.py !tests/test_fsdp2_native_block_cudagraphs_gloo.py !tests/test_fsdp2_native_dcp_store_lifetime_gloo.py !tests/test_fsdp2_native_unsharded_int_mesh_gloo.py !tests/test_fsdp2_save_store_lifetime_gloo.py !tests/test_grpo_max_num_seqs_warning.py !tests/test_grpo_packed_nograd_oom_recovery.py !tests/test_grpo_packing_moe_noise.py !tests/test_grpo_packing_verify_envelope.py !tests/test_grpo_packing_verify_outlier.py !tests/test_nccl_default_env.py !tests/test_preference_image_dedup.py !tests/test_qwen4_exp_fast_inference_gate.py !tests/test_rank_zygote_gloo.py !tests/test_shard_split.py !tests/test_torch_config_thread_cache_invalidate.py !tests/test_tp_checkpoint_replica_offload_gloo.py !tests/test_tp_native_scaler_fused_gloo.py !tests/test_triton_runs_on_device.py !tests/utils/test_xformers_capability_gate.py !tests/test_grpo_vllm_lora_rounding.py !tests/test_token_balance_partition.py !tests/test_gc_skip_auto.py !tests/test_block_swap_install.py !tests/test_nf4_dequant_cache.py !tests/test_qat_weight_memo.py !tests/test_grpo_partial_rollout.py !tests/test_online_dpo_vllm_init.py !tests/test_pp_adjacent_stage_warmup.py !tests/test_tp_env_trainer_init_install.py !tests/test_grpo_packing_shape_noise.py !tests/test_dpo_top1_half_logits.py !tests/test_fsdp2_generate_full_params_gloo.py !tests/test_grpo_scalerl_resampling.py !tests/test_lora_scale_warning.py !tests/test_flash_adamw_triton_globals.py !tests/test_grpo_move_model_to_vllm_sync.py !tests/test_rloo_move_model_to_vllm_sync.py !tests/test_pp_moe_aux_off_gloo.py !tests/python/test_grpo_head_hooks.py !tests/test_layout_portable_resume_gloo.py !tests/test_ep_expert_rows_gloo.py !tests/test_ulysses_inkling2_bias.py !tests/test_functorch_config_thread_mirror.py !tests/test_pp_schedules_gloo.py !tests/test_block_compile_cpp_wrapper.py !tests/test_block_compile.py !tests/utils/test_q_galore.py !tests/test_fsdp2_native_ckpt_write_failure_gloo.py !tests/test_ep_composition_guards.py !tests/test_cp_router_aux_gloo.py !tests/test_pp_env_gloo.py !tests/test_moe_empty_route_guards.py !tests/test_remote_moe_shims.py !tests/test_grpo_hidden_states_env_restored.py !tests/test_vllm_sync_moe_reload.py !tests/test_cp_tp_checkpoint_pristine.py !tests/test_ulysses_whole_sequence_mask.py !tests/test_ulysses_flash_packed_host_reads.py !tests/test_async_grpo_fast_inference.py !tests/test_device_index_names_type.py !tests/test_grpo_persistent_tma_gate.py !tests/test_mfu_logging.py !tests/test_triton_fp_fusion.py !tests/test_trl_cap_sites.py !tests/test_vllm_generation_quantized_sync_refused.py !tests/test_tp_padding_free_auto_off.py !tests/test_lora_quant_survival.py !tests/test_st_unpadding_cache_kwarg.py !tests/test_grpo_image_column_normalisation.py !tests/test_attention_dispatch_saved_attention.py !tests/test_grpo_untruncated_rollout_logprobs.py !tests/test_grpo_vllm_is_default_on.py !tests/test_grpo_vllm_is_mode_default.py !tests/test_optimizer_state_offload_ring_oom.py !tests/test_ep_x_cp_gloo.py !tests/test_ep_context_parallel_refusal.py !tests/test_ep_inherited_env.py !tests/test_ep_inkling2_gloo.py !tests/test_token_balance_ddp_default.py !tests/test_fsdp2_native_float32_decay_gloo.py !tests/test_split_layer_rope_tables.py !tests/test_parallel_capabilities_evidence.py !tests/test_is_big_gpu_matches_torch.py !tests/test_parallel_inkling2_prequantized_gloo.py !tests/_tiny_fixture_revisions.py
+          cat "$AMD_CI_WORK/out/gpu/VERDICT.md" >> "$GITHUB_STEP_SUMMARY"
+          # A finding keeps the job green; a NON-result (VOID / INCONCLUSIVE) does not.
+          python3 "$GITHUB_WORKSPACE/amd_ci/lib/announce.py" "$AMD_CI_WORK/out/gpu"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: pr20103-gpu
+          path: ${{ env.AMD_CI_WORK }}/out
+          retention-days: 7
+          if-no-files-found: warn
