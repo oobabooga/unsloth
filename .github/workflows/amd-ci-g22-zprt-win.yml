@@ -167,7 +167,7 @@ jobs:
             --probe "$env:GITHUB_WORKSPACE/amd_ci/probes/train5_probe.py" `
             --criteria "$env:GITHUB_WORKSPACE/amd_ci/criteria/amdgate_rocm.py" `
             --out-dir "$env:AMD_CI_WORK\out\windows" `
-            --python "$env:AMD_CI_PY" -- --unit zprt --state-repo zoo --transformers 5.24.0 --trl 1.18.0 --cells env,flm16 --companion-repo https://github.com/unslothai/unsloth --companion-base 45621894d212bfeb788b9144fd0c7c0f32a2b422 --companion-head 45621894d212bfeb788b9144fd0c7c0f32a2b422 --use-current --tests tests/test_mxfp4_gemm_old_triton_gate.py tests/test_probe_oom_no_latch.py tests/test_dataset_num_proc.py tests/test_speculative_dspark.py --repeat flm16 --test-timeout 1800 --no-rerun-timed-out --head-files amd_ci/patches/zprt_head.json
+            --python "$env:AMD_CI_PY" -- --unit zprt --state-repo zoo --transformers 5.24.0 --trl 1.18.0 --cells env,flm16 --companion-repo https://github.com/unslothai/unsloth --companion-base 45621894d212bfeb788b9144fd0c7c0f32a2b422 --companion-head 45621894d212bfeb788b9144fd0c7c0f32a2b422 --use-current --tests tests/test_mxfp4_gemm_old_triton_gate.py tests/test_probe_oom_no_latch.py tests/test_dataset_num_proc.py tests/test_speculative_dspark.py tests/test_gguf_kernels_launch_contract.py --repeat flm16 --test-timeout 1800 --no-rerun-timed-out --head-files amd_ci/patches/zprt_head.json
           Get-Content "$env:AMD_CI_WORK\out\windows\VERDICT.md" |
             Add-Content -Path $env:GITHUB_STEP_SUMMARY
           # A finding keeps the job green; a NON-result (VOID / INCONCLUSIVE) does not.
